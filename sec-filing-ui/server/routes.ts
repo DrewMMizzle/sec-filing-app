@@ -9,15 +9,15 @@ import fs from "fs";
 import { fileURLToPath } from "url";
 
 const SEC_COMPANY_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json";
-const SEC_USER_AGENT = "DotAdda ameister@dotadda.com";
+const SEC_USER_AGENT = process.env.SEC_USER_AGENT || "DotAdda ameister@dotadda.com";
 
 // Works in both ESM (dev via tsx) and CJS (prod via esbuild)
 const __filename_compat = typeof __filename !== "undefined" ? __filename : fileURLToPath(import.meta.url);
 const __dirname_compat = path.dirname(__filename_compat);
-const PIPELINE_ROOT = path.resolve(__dirname_compat, "../../sec-pdf-pipeline");
+const PIPELINE_ROOT = process.env.PIPELINE_ROOT || path.resolve(__dirname_compat, "../../sec-pdf-pipeline");
 
 // App-managed PDF storage directory (inside sec-filing-ui project)
-const PDF_STORAGE_DIR = path.resolve(__dirname_compat, "..", "pdfs");
+const PDF_STORAGE_DIR = process.env.PDF_STORAGE_DIR || path.resolve(__dirname_compat, "..", "pdfs");
 if (!fs.existsSync(PDF_STORAGE_DIR)) {
   fs.mkdirSync(PDF_STORAGE_DIR, { recursive: true });
 }
