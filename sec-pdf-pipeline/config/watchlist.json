@@ -1,0 +1,37 @@
+[
+  {
+    "cik": "0000320193",
+    "ticker": "AAPL",
+    "filing_types": ["10-K", "10-Q", "8-K"]
+  },
+  {
+    "cik": "0000789019",
+    "ticker": "MSFT",
+    "filing_types": ["10-K", "10-Q", "8-K"]
+  },
+  {
+    "cik": "0000101829",
+    "ticker": "RTX",
+    "filing_types": ["10-K", "10-Q", "8-K", "DEF 14A"]
+  },
+  {
+    "cik": "0000060714",
+    "ticker": "LMT",
+    "filing_types": ["10-K", "10-Q", "8-K", "DEF 14A"]
+  },
+  {
+    "cik": "0000040533",
+    "ticker": "GD",
+    "filing_types": ["10-K", "10-Q", "8-K"]
+  },
+  {
+    "cik": "0000012927",
+    "ticker": "BA",
+    "filing_types": ["10-K", "10-Q", "8-K"]
+  },
+  {
+    "cik": "0001133421",
+    "ticker": "NOC",
+    "filing_types": ["10-K", "10-Q", "8-K", "DEF 14A"]
+  }
+]
