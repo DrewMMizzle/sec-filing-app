@@ -1,7 +1,7 @@
-# Use full Node 20 on Bookworm (not slim) — has Python3 pre-installed
+# Multi-runtime: Node 20 + Python 3.11 + Chromium for PDF rendering
 FROM node:20-bookworm
 
-# Install Python venv support and pip
+# Install Python venv support
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-pip \
     python3-venv \
@@ -32,7 +32,9 @@ ENV NODE_ENV=production
 ENV PORT=5000
 ENV PIPELINE_ROOT=/app/sec-pdf-pipeline
 ENV PDF_STORAGE_DIR=/app/data/pdfs
-ENV DATABASE_PATH=/app/data/data.db
+
+# DATABASE_URL is provided by Railway's Postgres plugin (not set here)
+# e.g. DATABASE_URL=postgres://user:pass@host:5432/railway
 
 RUN mkdir -p /app/data/pdfs
 

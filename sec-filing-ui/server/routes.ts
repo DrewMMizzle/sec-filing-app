@@ -1,6 +1,6 @@
 import type { Express } from "express";
 import type { Server } from "http";
-import { storage } from "./storage";
+import { storage, initDatabase } from "./storage";
 import { insertWatchlistSchema, insertTickerSchema } from "@shared/schema";
 import { z } from "zod";
 import { spawn } from "child_process";
@@ -16,70 +16,75 @@ const __filename_compat = typeof __filename !== "undefined" ? __filename : fileU
 const __dirname_compat = path.dirname(__filename_compat);
 const PIPELINE_ROOT = process.env.PIPELINE_ROOT || path.resolve(__dirname_compat, "../../sec-pdf-pipeline");
 
-// App-managed PDF storage directory (inside sec-filing-ui project)
+// App-managed PDF storage directory
 const PDF_STORAGE_DIR = process.env.PDF_STORAGE_DIR || path.resolve(__dirname_compat, "..", "pdfs");
 if (!fs.existsSync(PDF_STORAGE_DIR)) {
   fs.mkdirSync(PDF_STORAGE_DIR, { recursive: true });
 }
 
-export function registerRoutes(server: Server, app: Express): void {
+export async function registerRoutes(server: Server, app: Express): Promise<void> {
+  // Initialize database tables + indexes
+  await initDatabase();
+
   // ─── Watchlists ──────────────────────────────────────────
 
-  app.get("/api/watchlists", (_req, res) => {
-    const lists = storage.getWatchlists();
-    const result = lists.map((wl) => ({
-      ...wl,
-      tickerCount: storage.getTickersByWatchlist(wl.id).length,
-    }));
+  app.get("/api/watchlists", async (_req, res) => {
+    const lists = await storage.getWatchlists();
+    const result = await Promise.all(
+      lists.map(async (wl) => ({
+        ...wl,
+        tickerCount: (await storage.getTickersByWatchlist(wl.id)).length,
+      })),
+    );
     res.json(result);
   });
 
-  app.get("/api/watchlists/:id", (req, res) => {
+  app.get("/api/watchlists/:id", async (req, res) => {
     const id = Number(req.params.id);
-    const wl = storage.getWatchlist(id);
+    const wl = await storage.getWatchlist(id);
     if (!wl) return res.status(404).json({ error: "Watchlist not found" });
-    const tickers = storage.getTickersByWatchlist(id);
+    const tickers = await storage.getTickersByWatchlist(id);
     res.json({ ...wl, tickers });
   });
 
-  app.post("/api/watchlists", (req, res) => {
+  app.post("/api/watchlists", async (req, res) => {
     const parsed = insertWatchlistSchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
     try {
-      const wl = storage.createWatchlist(parsed.data);
+      const wl = await storage.createWatchlist(parsed.data);
       res.status(201).json(wl);
     } catch (e: any) {
-      if (e.message?.includes("UNIQUE constraint")) {
+      if (e.message?.includes("unique") || e.message?.includes("duplicate")) {
         return res.status(409).json({ error: "A watchlist with that name already exists" });
       }
       throw e;
     }
   });
 
-  app.patch("/api/watchlists/:id", (req, res) => {
+  app.patch("/api/watchlists/:id", async (req, res) => {
     const id = Number(req.params.id);
     const { name } = req.body;
     if (!name || typeof name !== "string") {
       return res.status(400).json({ error: "name is required" });
     }
-    const updated = storage.renameWatchlist(id, name.trim());
+    const updated = await storage.renameWatchlist(id, name.trim());
     if (!updated) return res.status(404).json({ error: "Watchlist not found" });
     res.json(updated);
   });
 
-  app.delete("/api/watchlists/:id", (req, res) => {
+  app.delete("/api/watchlists/:id", async (req, res) => {
     const id = Number(req.params.id);
-    storage.deleteWatchlist(id);
+    await storage.deleteWatchlist(id);
     res.status(204).send();
   });
 
   // ─── Tickers ─────────────────────────────────────────────
 
-  app.get("/api/watchlists/:id/tickers", (req, res) => {
+  app.get("/api/watchlists/:id/tickers", async (req, res) => {
     const id = Number(req.params.id);
-    const wl = storage.getWatchlist(id);
+    const wl = await storage.getWatchlist(id);
     if (!wl) return res.status(404).json({ error: "Watchlist not found" });
-    const tickers = storage.getTickersByWatchlist(id);
+    const tickers = await storage.getTickersByWatchlist(id);
     const result = tickers.map((t) => ({
       ...t,
       filingTypes: JSON.parse(t.filingTypes) as string[],
@@ -89,7 +94,7 @@ export function registerRoutes(server: Server, app: Express): void {
 
   app.post("/api/watchlists/:id/tickers", async (req, res) => {
     const watchlistId = Number(req.params.id);
-    const wl = storage.getWatchlist(watchlistId);
+    const wl = await storage.getWatchlist(watchlistId);
     if (!wl) return res.status(404).json({ error: "Watchlist not found" });
 
     const { ticker, filingTypes } = req.body;
@@ -124,7 +129,7 @@ export function registerRoutes(server: Server, app: Express): void {
         ? filingTypes
         : ["10-K", "10-Q", "8-K"];
 
-      const newTicker = storage.addTicker({
+      const newTicker = await storage.addTicker({
         watchlistId,
         ticker: officialTicker,
         cik,
@@ -141,48 +146,48 @@ export function registerRoutes(server: Server, app: Express): void {
     }
   });
 
-  app.delete("/api/tickers/:id", (req, res) => {
+  app.delete("/api/tickers/:id", async (req, res) => {
     const id = Number(req.params.id);
-    storage.removeTicker(id);
+    await storage.removeTicker(id);
     res.status(204).send();
   });
 
-  app.patch("/api/tickers/:id/filing-types", (req, res) => {
+  app.patch("/api/tickers/:id/filing-types", async (req, res) => {
     const id = Number(req.params.id);
     const { filingTypes } = req.body;
     if (!Array.isArray(filingTypes)) {
       return res.status(400).json({ error: "filingTypes must be an array" });
     }
-    const updated = storage.updateTickerFilingTypes(id, JSON.stringify(filingTypes));
+    const updated = await storage.updateTickerFilingTypes(id, JSON.stringify(filingTypes));
     if (!updated) return res.status(404).json({ error: "Ticker not found" });
     res.json({ ...updated, filingTypes });
   });
 
   // ─── Export watchlist.json ───────────────────────────────
 
-  app.get("/api/export-watchlist", (_req, res) => {
-    const data = storage.exportWatchlistJson();
+  app.get("/api/export-watchlist", async (_req, res) => {
+    const data = await storage.exportWatchlistJson();
     res.json(data);
   });
 
   // ─── All unique tickers across watchlists ────────────────
 
-  app.get("/api/all-tickers", (_req, res) => {
-    const data = storage.getAllTickers();
+  app.get("/api/all-tickers", async (_req, res) => {
+    const data = await storage.getAllTickers();
     res.json(data);
   });
 
   // ─── Filings: list, stats, fetch, download, manage ────────
 
   // Filing stats summary (must come before /:accession routes)
-  app.get("/api/filings/stats", (_req, res) => {
-    const stats = storage.getFilingStats();
+  app.get("/api/filings/stats", async (_req, res) => {
+    const stats = await storage.getFilingStats();
     res.json(stats);
   });
 
-  app.get("/api/filings", (req, res) => {
+  app.get("/api/filings", async (req, res) => {
     const { ticker, filingType, dateFrom, dateTo, status } = req.query as Record<string, string | undefined>;
-    const results = storage.getFilings({
+    const results = await storage.getFilings({
       ticker,
       filingType,
       dateFrom,
@@ -193,7 +198,7 @@ export function registerRoutes(server: Server, app: Express): void {
   });
 
   // Trigger fetch+render for selected tickers + date range
-  app.post("/api/filings/fetch", (req, res) => {
+  app.post("/api/filings/fetch", async (req, res) => {
     const { tickers: tickerList, dateFrom, dateTo, limitPerTicker } = req.body as {
       tickers: Array<{ ticker: string; cik: string; filing_types: string[] }>;
       dateFrom?: string;
@@ -207,7 +212,7 @@ export function registerRoutes(server: Server, app: Express): void {
 
     // ── Dedup: check which accessions are already complete in our DB ──
     const tickerNames = tickerList.map((t) => t.ticker);
-    const alreadyComplete = storage.getCompleteAccessions(tickerNames);
+    const alreadyComplete = await storage.getCompleteAccessions(tickerNames);
 
     const input = JSON.stringify({
       tickers: tickerList,
@@ -244,7 +249,7 @@ export function registerRoutes(server: Server, app: Express): void {
           const event = JSON.parse(line);
           events.push(event);
 
-          // Track filings in our DB
+          // Track filings in our DB (fire-and-forget async)
           if (event.event === "rendering") {
             storage.upsertFiling({
               ticker: event.ticker,
@@ -254,7 +259,7 @@ export function registerRoutes(server: Server, app: Express): void {
               filingDate: event.filing_date || null,
               status: "rendering",
               createdAt: new Date().toISOString(),
-            });
+            }).catch((err) => console.error("Failed to upsert filing:", err));
           } else if (event.event === "complete") {
             // Copy the rendered PDF into app-managed storage
             const pipelinePdf = path.join(PIPELINE_ROOT, event.path);
@@ -278,7 +283,7 @@ export function registerRoutes(server: Server, app: Express): void {
               "complete",
               appRelPath,
               event.size,
-            );
+            ).catch((err) => console.error("Failed to update filing status:", err));
           } else if (event.event === "error" && event.accession) {
             storage.updateFilingStatus(
               event.accession,
@@ -286,7 +291,7 @@ export function registerRoutes(server: Server, app: Express): void {
               undefined,
               undefined,
               event.message,
-            );
+            ).catch((err) => console.error("Failed to update filing error:", err));
           }
         } catch {
           // non-JSON line from Python logging
@@ -323,8 +328,8 @@ export function registerRoutes(server: Server, app: Express): void {
   });
 
   // Download a PDF by accession number
-  app.get("/api/filings/:accession/pdf", (req, res) => {
-    const filing = storage.getFilingByAccession(req.params.accession);
+  app.get("/api/filings/:accession/pdf", async (req, res) => {
+    const filing = await storage.getFilingByAccession(req.params.accession);
     if (!filing || !filing.pdfPath) {
       return res.status(404).json({ error: "PDF not found" });
     }
@@ -347,10 +352,10 @@ export function registerRoutes(server: Server, app: Express): void {
   // ─── Filing management: delete, stats, view ────────────
 
   // Delete a single filing + remove PDF from disk
-  app.delete("/api/filings/:id", (req, res) => {
+  app.delete("/api/filings/:id", async (req, res) => {
     const id = Number(req.params.id);
     if (isNaN(id)) return res.status(400).json({ error: "Invalid ID" });
-    const deleted = storage.deleteFiling(id);
+    const deleted = await storage.deleteFiling(id);
     if (!deleted) return res.status(404).json({ error: "Filing not found" });
 
     // Clean up PDF file from disk
@@ -366,15 +371,15 @@ export function registerRoutes(server: Server, app: Express): void {
   });
 
   // Batch delete filings + remove PDF files
-  app.post("/api/filings/batch-delete", (req, res) => {
+  app.post("/api/filings/batch-delete", async (req, res) => {
     const { ids } = req.body as { ids: number[] };
     if (!Array.isArray(ids) || ids.length === 0) {
       return res.status(400).json({ error: "ids array is required" });
     }
 
-    // Get filings first so we can clean up PDFs
+    // Delete one at a time to also clean up PDFs
     for (const id of ids) {
-      const filing = storage.deleteFiling(id);
+      const filing = await storage.deleteFiling(id);
       if (filing?.pdfPath) {
         const appPath = path.resolve(PDF_STORAGE_DIR, "..", filing.pdfPath);
         try {
@@ -388,8 +393,8 @@ export function registerRoutes(server: Server, app: Express): void {
   });
 
   // View PDF inline (opens in browser tab instead of downloading)
-  app.get("/api/filings/:accession/view", (req, res) => {
-    const filing = storage.getFilingByAccession(req.params.accession);
+  app.get("/api/filings/:accession/view", async (req, res) => {
+    const filing = await storage.getFilingByAccession(req.params.accession);
     if (!filing || !filing.pdfPath) {
       return res.status(404).json({ error: "PDF not found" });
     }
