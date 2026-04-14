@@ -1,17 +1,24 @@
 import {
+  type User,
+  type InsertUser,
   type Watchlist,
   type InsertWatchlist,
   type Ticker,
   type InsertTicker,
   type Filing,
   type InsertFiling,
+  type WatchlistShare,
+  type InsertWatchlistShare,
+  users,
+  sessions,
   watchlists,
   tickers,
   filings,
+  watchlistShares,
 } from "@shared/schema";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
-import { eq, and, gte, lte, desc, inArray, sql } from "drizzle-orm";
+import { eq, and, gte, lte, desc, inArray, sql, or } from "drizzle-orm";
 
 const DATABASE_URL = process.env.DATABASE_URL;
 if (!DATABASE_URL) {
@@ -20,7 +27,7 @@ if (!DATABASE_URL) {
 
 const pool = new Pool({
   connectionString: DATABASE_URL,
-  max: 20,               // max connections in pool
+  max: 20,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 5000,
 });
@@ -28,13 +35,29 @@ const pool = new Pool({
 export const db = drizzle(pool);
 
 // Auto-create tables via raw SQL (runs once on startup)
-// In production, use drizzle-kit migrations instead
 export async function initDatabase(): Promise<void> {
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS watchlists (
+    CREATE TABLE IF NOT EXISTS users (
       id SERIAL PRIMARY KEY,
-      name TEXT NOT NULL UNIQUE
+      email TEXT NOT NULL UNIQUE,
+      password_hash TEXT NOT NULL,
+      display_name TEXT NOT NULL,
+      created_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS sessions (
+      id TEXT PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      expires_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+    CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+
+    -- Add user_id to watchlists (nullable initially for migration, then we'll handle it)
+    ALTER TABLE watchlists ADD COLUMN IF NOT EXISTS user_id INTEGER REFERENCES users(id) ON DELETE CASCADE;
+    -- Remove unique constraint on name if it exists (now scoped per user, not globally unique)
+    ALTER TABLE watchlists DROP CONSTRAINT IF EXISTS watchlists_name_unique;
+
     CREATE TABLE IF NOT EXISTS tickers (
       id SERIAL PRIMARY KEY,
       watchlist_id INTEGER NOT NULL REFERENCES watchlists(id) ON DELETE CASCADE,
@@ -42,19 +65,19 @@ export async function initDatabase(): Promise<void> {
       cik TEXT NOT NULL,
       filing_types TEXT NOT NULL DEFAULT '["10-K","10-Q","8-K"]'
     );
-    CREATE TABLE IF NOT EXISTS filings (
+
+    -- Add user_id to filings
+    ALTER TABLE filings ADD COLUMN IF NOT EXISTS user_id INTEGER REFERENCES users(id) ON DELETE CASCADE;
+
+    CREATE TABLE IF NOT EXISTS watchlist_shares (
       id SERIAL PRIMARY KEY,
-      ticker TEXT NOT NULL,
-      cik TEXT NOT NULL,
-      accession_number TEXT NOT NULL UNIQUE,
-      filing_type TEXT NOT NULL,
-      filing_date TEXT,
-      pdf_path TEXT,
-      pdf_size INTEGER,
-      status TEXT NOT NULL DEFAULT 'pending',
-      error_message TEXT,
+      watchlist_id INTEGER NOT NULL REFERENCES watchlists(id) ON DELETE CASCADE,
+      shared_with_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      permission TEXT NOT NULL DEFAULT 'view',
       created_at TEXT NOT NULL
     );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_share_unique ON watchlist_shares(watchlist_id, shared_with_user_id);
+    CREATE INDEX IF NOT EXISTS idx_shares_user ON watchlist_shares(shared_with_user_id);
 
     -- Indexes for performance at scale
     CREATE INDEX IF NOT EXISTS idx_tickers_watchlist ON tickers(watchlist_id);
@@ -64,47 +87,52 @@ export async function initDatabase(): Promise<void> {
     CREATE INDEX IF NOT EXISTS idx_filings_date ON filings(filing_date);
     CREATE INDEX IF NOT EXISTS idx_filings_type ON filings(filing_type);
     CREATE INDEX IF NOT EXISTS idx_filings_ticker_status ON filings(ticker, status);
+    CREATE INDEX IF NOT EXISTS idx_filings_user ON filings(user_id);
+    CREATE INDEX IF NOT EXISTS idx_watchlists_user ON watchlists(user_id);
   `);
 }
 
-export interface IStorage {
-  // Watchlists
-  getWatchlists(): Promise<Watchlist[]>;
-  getWatchlist(id: number): Promise<Watchlist | undefined>;
-  createWatchlist(data: InsertWatchlist): Promise<Watchlist>;
-  renameWatchlist(id: number, name: string): Promise<Watchlist | undefined>;
-  deleteWatchlist(id: number): Promise<void>;
+export class DatabaseStorage {
+  // ─── Users ──────────────────────────────────────────────
 
-  // Tickers
-  getTickersByWatchlist(watchlistId: number): Promise<Ticker[]>;
-  addTicker(data: InsertTicker): Promise<Ticker>;
-  removeTicker(id: number): Promise<void>;
-  updateTickerFilingTypes(id: number, filingTypes: string): Promise<Ticker | undefined>;
+  async getUserByEmail(email: string): Promise<User | undefined> {
+    const rows = await db.select().from(users).where(sql`LOWER(${users.email}) = LOWER(${email})`);
+    return rows[0];
+  }
 
-  // Filings
-  getFilings(filters?: { ticker?: string; filingType?: string; dateFrom?: string; dateTo?: string; status?: string }): Promise<Filing[]>;
-  getFilingByAccession(accession: string): Promise<Filing | undefined>;
-  upsertFiling(data: InsertFiling): Promise<Filing>;
-  updateFilingStatus(accession: string, status: string, pdfPath?: string, pdfSize?: number, errorMessage?: string): Promise<void>;
+  async getUserById(id: number): Promise<User | undefined> {
+    const rows = await db.select().from(users).where(eq(users.id, id));
+    return rows[0];
+  }
 
-  // Delete
-  deleteFiling(id: number): Promise<Filing | undefined>;
-  deleteFilings(ids: number[]): Promise<number>;
+  async createUser(data: InsertUser): Promise<User> {
+    const rows = await db.insert(users).values(data).returning();
+    return rows[0];
+  }
 
-  // Stats
-  getFilingStats(): Promise<{ totalCount: number; completeCount: number; errorCount: number; totalSizeMb: number; tickers: string[]; filingTypes: string[] }>;
+  // ─── Sessions ───────────────────────────────────────────
 
-  // Dedup
-  getCompleteAccessions(tickerList: string[]): Promise<Set<string>>;
+  async createSession(id: string, userId: number, expiresAt: string): Promise<void> {
+    await db.insert(sessions).values({ id, userId, expiresAt });
+  }
 
-  // Export
-  exportWatchlistJson(): Promise<Array<{ cik: string; ticker: string; filing_types: string[] }>>;
-  getAllTickers(): Promise<Array<{ ticker: string; cik: string; filingTypes: string[] }>>;
-}
+  async getSession(id: string): Promise<{ userId: number; expiresAt: string } | undefined> {
+    const rows = await db.select().from(sessions).where(eq(sessions.id, id));
+    return rows[0];
+  }
 
-export class DatabaseStorage implements IStorage {
-  async getWatchlists(): Promise<Watchlist[]> {
-    return db.select().from(watchlists);
+  async deleteSession(id: string): Promise<void> {
+    await db.delete(sessions).where(eq(sessions.id, id));
+  }
+
+  async deleteExpiredSessions(): Promise<void> {
+    await db.delete(sessions).where(lte(sessions.expiresAt, new Date().toISOString()));
+  }
+
+  // ─── Watchlists (scoped by userId) ─────────────────────
+
+  async getWatchlists(userId: number): Promise<Watchlist[]> {
+    return db.select().from(watchlists).where(eq(watchlists.userId, userId));
   }
 
   async getWatchlist(id: number): Promise<Watchlist | undefined> {
@@ -129,6 +157,69 @@ export class DatabaseStorage implements IStorage {
   async deleteWatchlist(id: number): Promise<void> {
     await db.delete(watchlists).where(eq(watchlists.id, id));
   }
+
+  // ─── Watchlist Shares ───────────────────────────────────
+
+  async getSharedWatchlists(userId: number): Promise<Array<Watchlist & { ownerName: string; ownerEmail: string; permission: string }>> {
+    const rows = await db
+      .select({
+        id: watchlists.id,
+        name: watchlists.name,
+        userId: watchlists.userId,
+        ownerName: users.displayName,
+        ownerEmail: users.email,
+        permission: watchlistShares.permission,
+      })
+      .from(watchlistShares)
+      .innerJoin(watchlists, eq(watchlistShares.watchlistId, watchlists.id))
+      .innerJoin(users, eq(watchlists.userId, users.id))
+      .where(eq(watchlistShares.sharedWithUserId, userId));
+    return rows;
+  }
+
+  async getWatchlistShares(watchlistId: number): Promise<Array<{ id: number; userId: number; email: string; displayName: string; permission: string }>> {
+    const rows = await db
+      .select({
+        id: watchlistShares.id,
+        userId: watchlistShares.sharedWithUserId,
+        email: users.email,
+        displayName: users.displayName,
+        permission: watchlistShares.permission,
+      })
+      .from(watchlistShares)
+      .innerJoin(users, eq(watchlistShares.sharedWithUserId, users.id))
+      .where(eq(watchlistShares.watchlistId, watchlistId));
+    return rows;
+  }
+
+  async createShare(data: InsertWatchlistShare): Promise<WatchlistShare> {
+    const rows = await db.insert(watchlistShares).values(data).returning();
+    return rows[0];
+  }
+
+  async deleteShare(watchlistId: number, userId: number): Promise<void> {
+    await db.delete(watchlistShares).where(
+      and(
+        eq(watchlistShares.watchlistId, watchlistId),
+        eq(watchlistShares.sharedWithUserId, userId),
+      ),
+    );
+  }
+
+  async getShareForUser(watchlistId: number, userId: number): Promise<WatchlistShare | undefined> {
+    const rows = await db
+      .select()
+      .from(watchlistShares)
+      .where(
+        and(
+          eq(watchlistShares.watchlistId, watchlistId),
+          eq(watchlistShares.sharedWithUserId, userId),
+        ),
+      );
+    return rows[0];
+  }
+
+  // ─── Tickers ────────────────────────────────────────────
 
   async getTickersByWatchlist(watchlistId: number): Promise<Ticker[]> {
     return db
@@ -155,8 +246,10 @@ export class DatabaseStorage implements IStorage {
     return rows[0];
   }
 
-  async getFilings(filters?: { ticker?: string; filingType?: string; dateFrom?: string; dateTo?: string; status?: string }): Promise<Filing[]> {
-    const conditions: any[] = [];
+  // ─── Filings (scoped by userId) ────────────────────────
+
+  async getFilings(userId: number, filters?: { ticker?: string; filingType?: string; dateFrom?: string; dateTo?: string; status?: string }): Promise<Filing[]> {
+    const conditions: any[] = [eq(filings.userId, userId)];
 
     if (filters?.ticker) conditions.push(eq(filings.ticker, filters.ticker));
     if (filters?.filingType) conditions.push(eq(filings.filingType, filters.filingType));
@@ -164,10 +257,7 @@ export class DatabaseStorage implements IStorage {
     if (filters?.dateFrom) conditions.push(gte(filings.filingDate, filters.dateFrom));
     if (filters?.dateTo) conditions.push(lte(filings.filingDate, filters.dateTo));
 
-    if (conditions.length > 0) {
-      return db.select().from(filings).where(and(...conditions)).orderBy(desc(filings.filingDate));
-    }
-    return db.select().from(filings).orderBy(desc(filings.filingDate));
+    return db.select().from(filings).where(and(...conditions)).orderBy(desc(filings.filingDate));
   }
 
   async getFilingByAccession(accession: string): Promise<Filing | undefined> {
@@ -207,12 +297,11 @@ export class DatabaseStorage implements IStorage {
 
   async deleteFilings(ids: number[]): Promise<number> {
     if (ids.length === 0) return 0;
-    const result = await db.delete(filings).where(inArray(filings.id, ids));
-    return ids.length; // pg driver doesn't return rowCount from drizzle delete easily
+    await db.delete(filings).where(inArray(filings.id, ids));
+    return ids.length;
   }
 
-  async getFilingStats(): Promise<{ totalCount: number; completeCount: number; errorCount: number; totalSizeMb: number; tickers: string[]; filingTypes: string[] }> {
-    // Use aggregate queries instead of pulling all rows — scales to millions
+  async getFilingStats(userId: number): Promise<{ totalCount: number; completeCount: number; errorCount: number; totalSizeMb: number; tickers: string[]; filingTypes: string[] }> {
     const countResult = await pool.query(`
       SELECT
         COUNT(*) as total_count,
@@ -220,10 +309,11 @@ export class DatabaseStorage implements IStorage {
         COUNT(*) FILTER (WHERE status = 'error') as error_count,
         COALESCE(SUM(pdf_size) FILTER (WHERE status = 'complete'), 0) as total_bytes
       FROM filings
-    `);
+      WHERE user_id = $1
+    `, [userId]);
 
-    const tickerResult = await pool.query(`SELECT DISTINCT ticker FROM filings ORDER BY ticker`);
-    const typeResult = await pool.query(`SELECT DISTINCT filing_type FROM filings ORDER BY filing_type`);
+    const tickerResult = await pool.query(`SELECT DISTINCT ticker FROM filings WHERE user_id = $1 ORDER BY ticker`, [userId]);
+    const typeResult = await pool.query(`SELECT DISTINCT filing_type FROM filings WHERE user_id = $1 ORDER BY filing_type`, [userId]);
 
     const row = countResult.rows[0];
     return {
@@ -236,13 +326,14 @@ export class DatabaseStorage implements IStorage {
     };
   }
 
-  async getCompleteAccessions(tickerList: string[]): Promise<Set<string>> {
+  async getCompleteAccessions(userId: number, tickerList: string[]): Promise<Set<string>> {
     if (tickerList.length === 0) return new Set();
     const rows = await db
       .select({ accessionNumber: filings.accessionNumber })
       .from(filings)
       .where(
         and(
+          eq(filings.userId, userId),
           inArray(filings.ticker, tickerList),
           eq(filings.status, "complete"),
         ),
@@ -250,8 +341,13 @@ export class DatabaseStorage implements IStorage {
     return new Set(rows.map((r) => r.accessionNumber));
   }
 
-  async exportWatchlistJson(): Promise<Array<{ cik: string; ticker: string; filing_types: string[] }>> {
-    const allTickers = await db.select().from(tickers);
+  async exportWatchlistJson(userId: number): Promise<Array<{ cik: string; ticker: string; filing_types: string[] }>> {
+    const userWatchlists = await this.getWatchlists(userId);
+    const allTickers: Ticker[] = [];
+    for (const wl of userWatchlists) {
+      const t = await this.getTickersByWatchlist(wl.id);
+      allTickers.push(...t);
+    }
     const byCik = new Map<string, { cik: string; ticker: string; filing_types: Set<string> }>();
     for (const t of allTickers) {
       const types: string[] = JSON.parse(t.filingTypes);
@@ -269,8 +365,13 @@ export class DatabaseStorage implements IStorage {
     }));
   }
 
-  async getAllTickers(): Promise<Array<{ ticker: string; cik: string; filingTypes: string[] }>> {
-    const allTickers = await db.select().from(tickers);
+  async getAllTickers(userId: number): Promise<Array<{ ticker: string; cik: string; filingTypes: string[] }>> {
+    const userWatchlists = await this.getWatchlists(userId);
+    const allTickers: Ticker[] = [];
+    for (const wl of userWatchlists) {
+      const t = await this.getTickersByWatchlist(wl.id);
+      allTickers.push(...t);
+    }
     const seen = new Map<string, { ticker: string; cik: string; filingTypes: Set<string> }>();
     for (const t of allTickers) {
       const types: string[] = JSON.parse(t.filingTypes);

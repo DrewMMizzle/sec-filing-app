@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useRoute, useLocation } from "wouter";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { queryClient, apiRequest } from "@/lib/queryClient";
+import { useAuth } from "@/hooks/use-auth";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -24,9 +25,16 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Checkbox } from "@/components/ui/checkbox";
 import { useToast } from "@/hooks/use-toast";
-import { Plus, Trash2, Pencil, Download, Search } from "lucide-react";
+import { Plus, Trash2, Pencil, Share2, Users, X } from "lucide-react";
 import type { Watchlist } from "@shared/schema";
 
 type TickerWithTypes = {
@@ -39,6 +47,16 @@ type TickerWithTypes = {
 
 type WatchlistDetail = Watchlist & {
   tickers: TickerWithTypes[];
+  access: "owner" | "edit" | "view";
+  ownerName?: string;
+};
+
+type ShareEntry = {
+  id: number;
+  userId: number;
+  email: string;
+  displayName: string;
+  permission: string;
 };
 
 const ALL_FILING_TYPES = ["10-K", "10-Q", "8-K", "DEF 14A", "S-1", "20-F"];
@@ -47,6 +65,7 @@ export default function WatchlistPage() {
   const [, params] = useRoute("/watchlist/:id");
   const [, setLocation] = useLocation();
   const { toast } = useToast();
+  const { user } = useAuth();
   const watchlistId = Number(params?.id);
 
   // State
@@ -57,6 +76,9 @@ export default function WatchlistPage() {
   const [renameName, setRenameName] = useState("");
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleteTickerId, setDeleteTickerId] = useState<number | null>(null);
+  const [shareOpen, setShareOpen] = useState(false);
+  const [shareEmail, setShareEmail] = useState("");
+  const [sharePermission, setSharePermission] = useState("view");
 
   // Queries
   const { data: watchlist, isLoading } = useQuery<WatchlistDetail>({
@@ -75,7 +97,19 @@ export default function WatchlistPage() {
     },
   });
 
+  const sharesQuery = useQuery<ShareEntry[]>({
+    queryKey: ["/api/watchlists", watchlistId, "shares"],
+    queryFn: async () => {
+      const res = await apiRequest("GET", `/api/watchlists/${watchlistId}/shares`);
+      return res.json();
+    },
+    enabled: watchlist?.access === "owner",
+  });
+
   const tickers = tickersQuery.data || [];
+  const shares = sharesQuery.data || [];
+  const isOwner = watchlist?.access === "owner";
+  const canEdit = watchlist?.access === "owner" || watchlist?.access === "edit";
 
   // Mutations
   const addTickerMutation = useMutation({
@@ -137,6 +171,36 @@ export default function WatchlistPage() {
     },
   });
 
+  const shareMutation = useMutation({
+    mutationFn: async (data: { email: string; permission: string }) => {
+      const res = await apiRequest("POST", `/api/watchlists/${watchlistId}/share`, data);
+      if (!res.ok) {
+        const body = await res.json();
+        throw new Error(body.error || "Failed to share");
+      }
+      return res.json();
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/watchlists", watchlistId, "shares"] });
+      setShareEmail("");
+      setSharePermission("view");
+      toast({ title: "Watchlist shared" });
+    },
+    onError: (err: Error) => {
+      toast({ title: "Error", description: err.message, variant: "destructive" });
+    },
+  });
+
+  const unshareMutation = useMutation({
+    mutationFn: async (targetUserId: number) => {
+      await apiRequest("DELETE", `/api/watchlists/${watchlistId}/share/${targetUserId}`);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/watchlists", watchlistId, "shares"] });
+      toast({ title: "Share removed" });
+    },
+  });
+
   const handleAddTicker = () => {
     const trimmed = tickerInput.trim().toUpperCase();
     if (!trimmed || selectedTypes.length === 0) return;
@@ -147,6 +211,12 @@ export default function WatchlistPage() {
     setSelectedTypes((prev) =>
       prev.includes(type) ? prev.filter((t) => t !== type) : [...prev, type]
     );
+  };
+
+  const handleShare = () => {
+    const trimmed = shareEmail.trim();
+    if (!trimmed) return;
+    shareMutation.mutate({ email: trimmed, permission: sharePermission });
   };
 
   if (isLoading) {
@@ -174,56 +244,82 @@ export default function WatchlistPage() {
       {/* Header */}
       <div className="flex items-start justify-between mb-6">
         <div>
-          <h1
-            className="text-xl font-semibold mb-0.5"
-            data-testid="text-watchlist-name"
-          >
-            {watchlist.name}
-          </h1>
+          <div className="flex items-center gap-2 mb-0.5">
+            <h1
+              className="text-xl font-semibold"
+              data-testid="text-watchlist-name"
+            >
+              {watchlist.name}
+            </h1>
+            {!isOwner && watchlist.ownerName && (
+              <Badge variant="secondary" className="text-xs">
+                Shared by {watchlist.ownerName}
+              </Badge>
+            )}
+            {!isOwner && (
+              <Badge variant="outline" className="text-xs">
+                {watchlist.access}
+              </Badge>
+            )}
+          </div>
           <p className="text-sm text-muted-foreground">
             {tickers.length} ticker{tickers.length !== 1 ? "s" : ""} monitored
           </p>
         </div>
         <div className="flex gap-2">
-          <Button
-            size="sm"
-            variant="secondary"
-            onClick={() => {
-              setRenameName(watchlist.name);
-              setRenameOpen(true);
-            }}
-            data-testid="button-rename-watchlist"
-          >
-            <Pencil className="w-3.5 h-3.5 mr-1.5" />
-            Rename
-          </Button>
-          <Button
-            size="sm"
-            variant="destructive"
-            onClick={() => setDeleteOpen(true)}
-            data-testid="button-delete-watchlist"
-          >
-            <Trash2 className="w-3.5 h-3.5 mr-1.5" />
-            Delete
-          </Button>
+          {isOwner && (
+            <>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => setShareOpen(true)}
+              >
+                <Share2 className="w-3.5 h-3.5 mr-1.5" />
+                Share
+              </Button>
+              <Button
+                size="sm"
+                variant="secondary"
+                onClick={() => {
+                  setRenameName(watchlist.name);
+                  setRenameOpen(true);
+                }}
+                data-testid="button-rename-watchlist"
+              >
+                <Pencil className="w-3.5 h-3.5 mr-1.5" />
+                Rename
+              </Button>
+              <Button
+                size="sm"
+                variant="destructive"
+                onClick={() => setDeleteOpen(true)}
+                data-testid="button-delete-watchlist"
+              >
+                <Trash2 className="w-3.5 h-3.5 mr-1.5" />
+                Delete
+              </Button>
+            </>
+          )}
         </div>
       </div>
 
       {/* Add Ticker Button */}
-      <Button
-        className="mb-4"
-        onClick={() => setAddOpen(true)}
-        data-testid="button-add-ticker"
-      >
-        <Plus className="w-4 h-4 mr-1.5" />
-        Add Ticker
-      </Button>
+      {canEdit && (
+        <Button
+          className="mb-4"
+          onClick={() => setAddOpen(true)}
+          data-testid="button-add-ticker"
+        >
+          <Plus className="w-4 h-4 mr-1.5" />
+          Add Ticker
+        </Button>
+      )}
 
       {/* Ticker List */}
       {tickers.length === 0 ? (
         <Card className="p-8 text-center">
           <p className="text-sm text-muted-foreground">
-            No tickers in this watchlist. Add one to start monitoring SEC filings.
+            No tickers in this watchlist. {canEdit ? "Add one to start monitoring SEC filings." : ""}
           </p>
         </Card>
       ) : (
@@ -256,15 +352,17 @@ export default function WatchlistPage() {
                   ))}
                 </div>
               </div>
-              <Button
-                size="icon"
-                variant="ghost"
-                className="text-muted-foreground shrink-0"
-                onClick={() => setDeleteTickerId(t.id)}
-                data-testid={`button-remove-${t.ticker}`}
-              >
-                <Trash2 className="w-4 h-4" />
-              </Button>
+              {canEdit && (
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  className="text-muted-foreground shrink-0"
+                  onClick={() => setDeleteTickerId(t.id)}
+                  data-testid={`button-remove-${t.ticker}`}
+                >
+                  <Trash2 className="w-4 h-4" />
+                </Button>
+              )}
             </Card>
           ))}
         </div>
@@ -333,6 +431,82 @@ export default function WatchlistPage() {
               </Button>
             </DialogFooter>
           </form>
+        </DialogContent>
+      </Dialog>
+
+      {/* Share Dialog */}
+      <Dialog open={shareOpen} onOpenChange={setShareOpen}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Users className="w-4 h-4" />
+              Share "{watchlist.name}"
+            </DialogTitle>
+            <DialogDescription>
+              Share this watchlist with other users by email address.
+            </DialogDescription>
+          </DialogHeader>
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              handleShare();
+            }}
+            className="space-y-4"
+          >
+            <div className="flex gap-2">
+              <Input
+                placeholder="user@example.com"
+                type="email"
+                value={shareEmail}
+                onChange={(e) => setShareEmail(e.target.value)}
+                className="flex-1"
+              />
+              <Select value={sharePermission} onValueChange={setSharePermission}>
+                <SelectTrigger className="w-24">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="view">View</SelectItem>
+                  <SelectItem value="edit">Edit</SelectItem>
+                </SelectContent>
+              </Select>
+              <Button
+                type="submit"
+                disabled={!shareEmail.trim() || shareMutation.isPending}
+                size="sm"
+              >
+                Share
+              </Button>
+            </div>
+          </form>
+
+          {/* Current shares list */}
+          {shares.length > 0 && (
+            <div className="space-y-2 pt-2 border-t">
+              <p className="text-xs font-medium text-muted-foreground">Shared with</p>
+              {shares.map((s) => (
+                <div key={s.id} className="flex items-center justify-between gap-2 py-1">
+                  <div className="min-w-0">
+                    <p className="text-sm truncate">{s.displayName}</p>
+                    <p className="text-xs text-muted-foreground truncate">{s.email}</p>
+                  </div>
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    <Badge variant="outline" className="text-xs">
+                      {s.permission}
+                    </Badge>
+                    <Button
+                      size="icon"
+                      variant="ghost"
+                      className="h-6 w-6 text-muted-foreground"
+                      onClick={() => unshareMutation.mutate(s.userId)}
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </Button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
         </DialogContent>
       </Dialog>
 

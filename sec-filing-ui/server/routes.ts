@@ -1,12 +1,15 @@
 import type { Express } from "express";
 import type { Server } from "http";
 import { storage, initDatabase } from "./storage";
-import { insertWatchlistSchema, insertTickerSchema } from "@shared/schema";
-import { z } from "zod";
+import { insertWatchlistSchema } from "@shared/schema";
 import { spawn } from "child_process";
 import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
+import { hashPassword, verifyPassword, createSession, clearSession, requireAuth } from "./auth";
+import { db } from "./storage";
+import { tickers as tickersTable, filings as filingsTable } from "@shared/schema";
+import { eq } from "drizzle-orm";
 
 const SEC_COMPANY_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json";
 const SEC_USER_AGENT = process.env.SEC_USER_AGENT || "DotAdda ameister@dotadda.com";
@@ -22,14 +25,97 @@ if (!fs.existsSync(PDF_STORAGE_DIR)) {
   fs.mkdirSync(PDF_STORAGE_DIR, { recursive: true });
 }
 
+// Helper: check if user has access to a watchlist (owner or shared)
+async function checkWatchlistAccess(watchlistId: number, userId: number): Promise<{ access: "owner" | "edit" | "view" | null; watchlist: any }> {
+  const wl = await storage.getWatchlist(watchlistId);
+  if (!wl) return { access: null, watchlist: null };
+
+  if (wl.userId === userId) return { access: "owner", watchlist: wl };
+
+  const share = await storage.getShareForUser(watchlistId, userId);
+  if (share) return { access: share.permission as "edit" | "view", watchlist: wl };
+
+  return { access: null, watchlist: wl };
+}
+
 export async function registerRoutes(server: Server, app: Express): Promise<void> {
   // Initialize database tables + indexes
   await initDatabase();
 
+  // ─── Auth Routes ────────────────────────────────────────
+
+  app.post("/api/auth/register", async (req, res) => {
+    const { email, password, displayName } = req.body;
+
+    if (!email || !password || !displayName) {
+      return res.status(400).json({ error: "email, password, and displayName are required" });
+    }
+    if (typeof password !== "string" || password.length < 8) {
+      return res.status(400).json({ error: "Password must be at least 8 characters" });
+    }
+
+    const existing = await storage.getUserByEmail(email);
+    if (existing) {
+      return res.status(409).json({ error: "An account with this email already exists" });
+    }
+
+    const passwordHash = await hashPassword(password);
+    const user = await storage.createUser({
+      email: email.trim().toLowerCase(),
+      passwordHash,
+      displayName: displayName.trim(),
+      createdAt: new Date().toISOString(),
+    });
+
+    await createSession(res, user.id);
+
+    // Clean up expired sessions in background
+    storage.deleteExpiredSessions().catch(() => {});
+
+    res.status(201).json({ id: user.id, email: user.email, displayName: user.displayName });
+  });
+
+  app.post("/api/auth/login", async (req, res) => {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({ error: "email and password are required" });
+    }
+
+    const user = await storage.getUserByEmail(email);
+    if (!user) {
+      return res.status(401).json({ error: "Invalid email or password" });
+    }
+
+    const valid = await verifyPassword(password, user.passwordHash);
+    if (!valid) {
+      return res.status(401).json({ error: "Invalid email or password" });
+    }
+
+    await createSession(res, user.id);
+
+    // Clean up expired sessions in background
+    storage.deleteExpiredSessions().catch(() => {});
+
+    res.json({ id: user.id, email: user.email, displayName: user.displayName });
+  });
+
+  app.post("/api/auth/logout", async (req, res) => {
+    await clearSession(req, res);
+    res.json({ ok: true });
+  });
+
+  app.get("/api/auth/me", requireAuth, (req, res) => {
+    res.json(req.user);
+  });
+
+  // ─── All remaining routes require auth ──────────────────
+
   // ─── Watchlists ──────────────────────────────────────────
 
-  app.get("/api/watchlists", async (_req, res) => {
-    const lists = await storage.getWatchlists();
+  app.get("/api/watchlists", requireAuth, async (req, res) => {
+    const userId = req.user!.id;
+    const lists = await storage.getWatchlists(userId);
     const result = await Promise.all(
       lists.map(async (wl) => ({
         ...wl,
@@ -39,16 +125,38 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     res.json(result);
   });
 
-  app.get("/api/watchlists/:id", async (req, res) => {
-    const id = Number(req.params.id);
-    const wl = await storage.getWatchlist(id);
-    if (!wl) return res.status(404).json({ error: "Watchlist not found" });
-    const tickers = await storage.getTickersByWatchlist(id);
-    res.json({ ...wl, tickers });
+  app.get("/api/watchlists/shared", requireAuth, async (req, res) => {
+    const userId = req.user!.id;
+    const shared = await storage.getSharedWatchlists(userId);
+    const result = await Promise.all(
+      shared.map(async (wl) => ({
+        ...wl,
+        tickerCount: (await storage.getTickersByWatchlist(wl.id)).length,
+      })),
+    );
+    res.json(result);
   });
 
-  app.post("/api/watchlists", async (req, res) => {
-    const parsed = insertWatchlistSchema.safeParse(req.body);
+  app.get("/api/watchlists/:id", requireAuth, async (req, res) => {
+    const id = Number(req.params.id);
+    const userId = req.user!.id;
+    const { access, watchlist: wl } = await checkWatchlistAccess(id, userId);
+
+    if (!wl) return res.status(404).json({ error: "Watchlist not found" });
+    if (!access) return res.status(403).json({ error: "Access denied" });
+
+    const tickerRows = await storage.getTickersByWatchlist(id);
+    let ownerName: string | undefined;
+    if (access !== "owner") {
+      const owner = await storage.getUserById(wl.userId);
+      ownerName = owner?.displayName;
+    }
+    res.json({ ...wl, tickers: tickerRows, access, ownerName });
+  });
+
+  app.post("/api/watchlists", requireAuth, async (req, res) => {
+    const userId = req.user!.id;
+    const parsed = insertWatchlistSchema.safeParse({ ...req.body, userId });
     if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
     try {
       const wl = await storage.createWatchlist(parsed.data);
@@ -61,8 +169,14 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     }
   });
 
-  app.patch("/api/watchlists/:id", async (req, res) => {
+  app.patch("/api/watchlists/:id", requireAuth, async (req, res) => {
     const id = Number(req.params.id);
+    const userId = req.user!.id;
+    const { access } = await checkWatchlistAccess(id, userId);
+
+    if (!access) return res.status(404).json({ error: "Watchlist not found" });
+    if (access !== "owner") return res.status(403).json({ error: "Only the owner can rename a watchlist" });
+
     const { name } = req.body;
     if (!name || typeof name !== "string") {
       return res.status(400).json({ error: "name is required" });
@@ -72,30 +186,106 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     res.json(updated);
   });
 
-  app.delete("/api/watchlists/:id", async (req, res) => {
+  app.delete("/api/watchlists/:id", requireAuth, async (req, res) => {
     const id = Number(req.params.id);
+    const userId = req.user!.id;
+    const { access } = await checkWatchlistAccess(id, userId);
+
+    if (!access) return res.status(404).json({ error: "Watchlist not found" });
+    if (access !== "owner") return res.status(403).json({ error: "Only the owner can delete a watchlist" });
+
     await storage.deleteWatchlist(id);
+    res.status(204).send();
+  });
+
+  // ─── Sharing ────────────────────────────────────────────
+
+  app.get("/api/watchlists/:id/shares", requireAuth, async (req, res) => {
+    const id = Number(req.params.id);
+    const userId = req.user!.id;
+    const { access } = await checkWatchlistAccess(id, userId);
+
+    if (!access) return res.status(404).json({ error: "Watchlist not found" });
+    if (access !== "owner") return res.status(403).json({ error: "Only the owner can view shares" });
+
+    const shares = await storage.getWatchlistShares(id);
+    res.json(shares);
+  });
+
+  app.post("/api/watchlists/:id/share", requireAuth, async (req, res) => {
+    const watchlistId = Number(req.params.id);
+    const userId = req.user!.id;
+    const { access } = await checkWatchlistAccess(watchlistId, userId);
+
+    if (!access) return res.status(404).json({ error: "Watchlist not found" });
+    if (access !== "owner") return res.status(403).json({ error: "Only the owner can share a watchlist" });
+
+    const { email, permission } = req.body;
+    if (!email) return res.status(400).json({ error: "email is required" });
+    if (permission && !["view", "edit"].includes(permission)) {
+      return res.status(400).json({ error: "permission must be 'view' or 'edit'" });
+    }
+
+    const targetUser = await storage.getUserByEmail(email);
+    if (!targetUser) return res.status(404).json({ error: "No user found with that email" });
+    if (targetUser.id === userId) return res.status(400).json({ error: "Cannot share with yourself" });
+
+    // Check if already shared
+    const existing = await storage.getShareForUser(watchlistId, targetUser.id);
+    if (existing) return res.status(409).json({ error: "Already shared with this user" });
+
+    const share = await storage.createShare({
+      watchlistId,
+      sharedWithUserId: targetUser.id,
+      permission: permission || "view",
+      createdAt: new Date().toISOString(),
+    });
+    res.status(201).json(share);
+  });
+
+  app.delete("/api/watchlists/:id/share/:userId", requireAuth, async (req, res) => {
+    const watchlistId = Number(req.params.id);
+    const targetUserId = Number(req.params.userId);
+    const userId = req.user!.id;
+    const { access } = await checkWatchlistAccess(watchlistId, userId);
+
+    if (!access) return res.status(404).json({ error: "Watchlist not found" });
+
+    // Owner can remove anyone; shared user can remove themselves
+    if (access !== "owner" && targetUserId !== userId) {
+      return res.status(403).json({ error: "Only the owner can remove other users' shares" });
+    }
+
+    await storage.deleteShare(watchlistId, targetUserId);
     res.status(204).send();
   });
 
   // ─── Tickers ─────────────────────────────────────────────
 
-  app.get("/api/watchlists/:id/tickers", async (req, res) => {
+  app.get("/api/watchlists/:id/tickers", requireAuth, async (req, res) => {
     const id = Number(req.params.id);
-    const wl = await storage.getWatchlist(id);
+    const userId = req.user!.id;
+    const { access, watchlist: wl } = await checkWatchlistAccess(id, userId);
+
     if (!wl) return res.status(404).json({ error: "Watchlist not found" });
-    const tickers = await storage.getTickersByWatchlist(id);
-    const result = tickers.map((t) => ({
+    if (!access) return res.status(403).json({ error: "Access denied" });
+
+    const tickerRows = await storage.getTickersByWatchlist(id);
+    const result = tickerRows.map((t) => ({
       ...t,
       filingTypes: JSON.parse(t.filingTypes) as string[],
     }));
     res.json(result);
   });
 
-  app.post("/api/watchlists/:id/tickers", async (req, res) => {
+  app.post("/api/watchlists/:id/tickers", requireAuth, async (req, res) => {
     const watchlistId = Number(req.params.id);
-    const wl = await storage.getWatchlist(watchlistId);
+    const userId = req.user!.id;
+    const { access, watchlist: wl } = await checkWatchlistAccess(watchlistId, userId);
+
     if (!wl) return res.status(404).json({ error: "Watchlist not found" });
+    if (!access) return res.status(403).json({ error: "Access denied" });
+    if (access === "view") return res.status(403).json({ error: "View-only access cannot add tickers" });
 
     const { ticker, filingTypes } = req.body;
     if (!ticker || typeof ticker !== "string") {
@@ -146,14 +336,33 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     }
   });
 
-  app.delete("/api/tickers/:id", async (req, res) => {
+  app.delete("/api/tickers/:id", requireAuth, async (req, res) => {
+    // We need to verify the ticker belongs to a watchlist the user owns or has edit access to
     const id = Number(req.params.id);
+    const tickerRows = await db.select().from(tickersTable).where(eq(tickersTable.id, id));
+    const ticker = tickerRows[0];
+    if (!ticker) return res.status(404).json({ error: "Ticker not found" });
+
+    const userId = req.user!.id;
+    const { access } = await checkWatchlistAccess(ticker.watchlistId, userId);
+    if (!access) return res.status(403).json({ error: "Access denied" });
+    if (access === "view") return res.status(403).json({ error: "View-only access cannot remove tickers" });
+
     await storage.removeTicker(id);
     res.status(204).send();
   });
 
-  app.patch("/api/tickers/:id/filing-types", async (req, res) => {
+  app.patch("/api/tickers/:id/filing-types", requireAuth, async (req, res) => {
     const id = Number(req.params.id);
+    const patchTickerRows = await db.select().from(tickersTable).where(eq(tickersTable.id, id));
+    const patchTicker = patchTickerRows[0];
+    if (!patchTicker) return res.status(404).json({ error: "Ticker not found" });
+
+    const userId = req.user!.id;
+    const { access } = await checkWatchlistAccess(patchTicker.watchlistId, userId);
+    if (!access) return res.status(403).json({ error: "Access denied" });
+    if (access === "view") return res.status(403).json({ error: "View-only access" });
+
     const { filingTypes } = req.body;
     if (!Array.isArray(filingTypes)) {
       return res.status(400).json({ error: "filingTypes must be an array" });
@@ -165,29 +374,33 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
 
   // ─── Export watchlist.json ───────────────────────────────
 
-  app.get("/api/export-watchlist", async (_req, res) => {
-    const data = await storage.exportWatchlistJson();
+  app.get("/api/export-watchlist", requireAuth, async (req, res) => {
+    const userId = req.user!.id;
+    const data = await storage.exportWatchlistJson(userId);
     res.json(data);
   });
 
   // ─── All unique tickers across watchlists ────────────────
 
-  app.get("/api/all-tickers", async (_req, res) => {
-    const data = await storage.getAllTickers();
+  app.get("/api/all-tickers", requireAuth, async (req, res) => {
+    const userId = req.user!.id;
+    const data = await storage.getAllTickers(userId);
     res.json(data);
   });
 
   // ─── Filings: list, stats, fetch, download, manage ────────
 
   // Filing stats summary (must come before /:accession routes)
-  app.get("/api/filings/stats", async (_req, res) => {
-    const stats = await storage.getFilingStats();
+  app.get("/api/filings/stats", requireAuth, async (req, res) => {
+    const userId = req.user!.id;
+    const stats = await storage.getFilingStats(userId);
     res.json(stats);
   });
 
-  app.get("/api/filings", async (req, res) => {
+  app.get("/api/filings", requireAuth, async (req, res) => {
+    const userId = req.user!.id;
     const { ticker, filingType, dateFrom, dateTo, status } = req.query as Record<string, string | undefined>;
-    const results = await storage.getFilings({
+    const results = await storage.getFilings(userId, {
       ticker,
       filingType,
       dateFrom,
@@ -198,7 +411,8 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
   });
 
   // Trigger fetch+render for selected tickers + date range
-  app.post("/api/filings/fetch", async (req, res) => {
+  app.post("/api/filings/fetch", requireAuth, async (req, res) => {
+    const userId = req.user!.id;
     const { tickers: tickerList, dateFrom, dateTo, limitPerTicker } = req.body as {
       tickers: Array<{ ticker: string; cik: string; filing_types: string[] }>;
       dateFrom?: string;
@@ -212,7 +426,7 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
 
     // ── Dedup: check which accessions are already complete in our DB ──
     const tickerNames = tickerList.map((t) => t.ticker);
-    const alreadyComplete = await storage.getCompleteAccessions(tickerNames);
+    const alreadyComplete = await storage.getCompleteAccessions(userId, tickerNames);
 
     const input = JSON.stringify({
       tickers: tickerList,
@@ -259,6 +473,7 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
               filingDate: event.filing_date || null,
               status: "rendering",
               createdAt: new Date().toISOString(),
+              userId,
             }).catch((err) => console.error("Failed to upsert filing:", err));
           } else if (event.event === "complete") {
             // Copy the rendered PDF into app-managed storage
@@ -328,10 +543,14 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
   });
 
   // Download a PDF by accession number
-  app.get("/api/filings/:accession/pdf", async (req, res) => {
-    const filing = await storage.getFilingByAccession(req.params.accession);
+  app.get("/api/filings/:accession/pdf", requireAuth, async (req, res) => {
+    const userId = req.user!.id;
+    const filing = await storage.getFilingByAccession(req.params.accession as string);
     if (!filing || !filing.pdfPath) {
       return res.status(404).json({ error: "PDF not found" });
+    }
+    if (filing.userId !== userId) {
+      return res.status(403).json({ error: "Access denied" });
     }
 
     // Try app-managed storage first, fall back to pipeline output
@@ -352,9 +571,17 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
   // ─── Filing management: delete, stats, view ────────────
 
   // Delete a single filing + remove PDF from disk
-  app.delete("/api/filings/:id", async (req, res) => {
+  app.delete("/api/filings/:id", requireAuth, async (req, res) => {
     const id = Number(req.params.id);
+    const userId = req.user!.id;
     if (isNaN(id)) return res.status(400).json({ error: "Invalid ID" });
+
+    // Verify ownership before deleting
+    const filingRows = await db.select().from(filingsTable).where(eq(filingsTable.id, id));
+    const filing = filingRows[0];
+    if (!filing) return res.status(404).json({ error: "Filing not found" });
+    if (filing.userId !== userId) return res.status(403).json({ error: "Access denied" });
+
     const deleted = await storage.deleteFiling(id);
     if (!deleted) return res.status(404).json({ error: "Filing not found" });
 
@@ -371,14 +598,20 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
   });
 
   // Batch delete filings + remove PDF files
-  app.post("/api/filings/batch-delete", async (req, res) => {
+  app.post("/api/filings/batch-delete", requireAuth, async (req, res) => {
+    const userId = req.user!.id;
     const { ids } = req.body as { ids: number[] };
     if (!Array.isArray(ids) || ids.length === 0) {
       return res.status(400).json({ error: "ids array is required" });
     }
 
-    // Delete one at a time to also clean up PDFs
+    // Delete one at a time to also clean up PDFs, verifying ownership
+    let deletedCount = 0;
     for (const id of ids) {
+      const batchRows = await db.select().from(filingsTable).where(eq(filingsTable.id, id));
+      const f = batchRows[0];
+      if (!f || f.userId !== userId) continue;
+
       const filing = await storage.deleteFiling(id);
       if (filing?.pdfPath) {
         const appPath = path.resolve(PDF_STORAGE_DIR, "..", filing.pdfPath);
@@ -388,15 +621,20 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
           console.error("Failed to remove PDF file:", e);
         }
       }
+      deletedCount++;
     }
-    res.json({ deleted: ids.length });
+    res.json({ deleted: deletedCount });
   });
 
   // View PDF inline (opens in browser tab instead of downloading)
-  app.get("/api/filings/:accession/view", async (req, res) => {
-    const filing = await storage.getFilingByAccession(req.params.accession);
+  app.get("/api/filings/:accession/view", requireAuth, async (req, res) => {
+    const userId = req.user!.id;
+    const filing = await storage.getFilingByAccession(req.params.accession as string);
     if (!filing || !filing.pdfPath) {
       return res.status(404).json({ error: "PDF not found" });
+    }
+    if (filing.userId !== userId) {
+      return res.status(403).json({ error: "Access denied" });
     }
 
     const appPath = path.resolve(PDF_STORAGE_DIR, "..", filing.pdfPath);
@@ -415,8 +653,8 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
 
   // ─── Ticker search / CIK lookup ─────────────────────────
 
-  app.get("/api/resolve-ticker/:ticker", async (req, res) => {
-    const tickerParam = req.params.ticker.toUpperCase().trim();
+  app.get("/api/resolve-ticker/:ticker", requireAuth, async (req, res) => {
+    const tickerParam = (req.params.ticker as string).toUpperCase().trim();
     try {
       const response = await fetch(SEC_COMPANY_TICKERS_URL, {
         headers: { "User-Agent": SEC_USER_AGENT },

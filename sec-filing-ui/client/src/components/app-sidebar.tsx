@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Link, useLocation } from "wouter";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { queryClient, apiRequest } from "@/lib/queryClient";
+import { useAuth } from "@/hooks/use-auth";
 import {
   Sidebar,
   SidebarContent,
@@ -24,8 +25,9 @@ import {
   DialogFooter,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { Badge } from "@/components/ui/badge";
 import { useToast } from "@/hooks/use-toast";
-import { List, Plus, FileText, Search, Database } from "lucide-react";
+import { List, Plus, FileText, Search, Database, LogOut, Share2, User } from "lucide-react";
 
 type WatchlistSummary = {
   id: number;
@@ -33,14 +35,29 @@ type WatchlistSummary = {
   tickerCount: number;
 };
 
+type SharedWatchlistSummary = {
+  id: number;
+  name: string;
+  userId: number;
+  ownerName: string;
+  ownerEmail: string;
+  permission: string;
+  tickerCount: number;
+};
+
 export function AppSidebar() {
   const [location] = useLocation();
   const { toast } = useToast();
+  const { user, logout } = useAuth();
   const [createOpen, setCreateOpen] = useState(false);
   const [newName, setNewName] = useState("");
 
   const { data: watchlists = [], isLoading } = useQuery<WatchlistSummary[]>({
     queryKey: ["/api/watchlists"],
+  });
+
+  const { data: sharedWatchlists = [] } = useQuery<SharedWatchlistSummary[]>({
+    queryKey: ["/api/watchlists/shared"],
   });
 
   const createMutation = useMutation({
@@ -63,6 +80,14 @@ export function AppSidebar() {
     const trimmed = newName.trim();
     if (!trimmed) return;
     createMutation.mutate(trimmed);
+  };
+
+  const handleLogout = async () => {
+    try {
+      await logout();
+    } catch {
+      // ignore
+    }
   };
 
   return (
@@ -162,12 +187,65 @@ export function AppSidebar() {
               </SidebarMenu>
             </SidebarGroupContent>
           </SidebarGroup>
+
+          {/* Shared With Me */}
+          {sharedWatchlists.length > 0 && (
+            <>
+              <SidebarSeparator />
+              <SidebarGroup>
+                <SidebarGroupLabel>
+                  <Share2 className="w-3.5 h-3.5 mr-1.5" />
+                  Shared with me
+                </SidebarGroupLabel>
+                <SidebarGroupContent>
+                  <SidebarMenu>
+                    {sharedWatchlists.map((wl) => {
+                      const isActive = location === `/watchlist/${wl.id}`;
+                      return (
+                        <SidebarMenuItem key={`shared-${wl.id}`}>
+                          <SidebarMenuButton
+                            asChild
+                            isActive={isActive}
+                          >
+                            <Link href={`/watchlist/${wl.id}`}>
+                              <List className="w-4 h-4" />
+                              <span className="flex-1 truncate">{wl.name}</span>
+                              <Badge variant="outline" className="text-[10px] px-1.5 py-0 ml-1 shrink-0">
+                                {wl.ownerName}
+                              </Badge>
+                            </Link>
+                          </SidebarMenuButton>
+                        </SidebarMenuItem>
+                      );
+                    })}
+                  </SidebarMenu>
+                </SidebarGroupContent>
+              </SidebarGroup>
+            </>
+          )}
         </SidebarContent>
 
-        <SidebarFooter className="p-3">
-          <p className="text-xs text-sidebar-foreground/40 text-center">
-            DotAdda SEC Pipeline
-          </p>
+        <SidebarFooter className="p-3 space-y-2">
+          {user && (
+            <div className="flex items-center gap-2 px-1">
+              <div className="flex items-center justify-center w-7 h-7 rounded-full bg-primary/10 shrink-0">
+                <User className="w-3.5 h-3.5 text-primary" />
+              </div>
+              <div className="flex-1 min-w-0">
+                <p className="text-xs font-medium text-sidebar-foreground truncate">{user.displayName}</p>
+                <p className="text-[10px] text-sidebar-foreground/50 truncate">{user.email}</p>
+              </div>
+              <Button
+                size="icon"
+                variant="ghost"
+                className="h-7 w-7 text-sidebar-foreground/60 shrink-0"
+                onClick={handleLogout}
+                title="Sign out"
+              >
+                <LogOut className="w-3.5 h-3.5" />
+              </Button>
+            </div>
+          )}
         </SidebarFooter>
       </Sidebar>
 
