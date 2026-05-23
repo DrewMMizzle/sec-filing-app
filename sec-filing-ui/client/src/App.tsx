@@ -41,6 +41,10 @@ function AuthenticatedApp() {
               <Route path="/watchlist/:id" component={WatchlistPage} />
               <Route path="/fetch" component={FetchFilings} />
               <Route path="/library" component={PdfLibrary} />
+              {/* If we land on an auth route while already signed in (e.g. the
+                  post-login redirect race), bounce home instead of 404ing. */}
+              <Route path="/login"><Redirect to="/" /></Route>
+              <Route path="/register"><Redirect to="/" /></Route>
               <Route component={NotFound} />
             </Switch>
           </main>
