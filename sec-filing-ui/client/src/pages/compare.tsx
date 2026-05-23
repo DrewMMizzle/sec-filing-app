@@ -4,6 +4,7 @@ import { apiRequest, queryClient } from "@/lib/queryClient";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { Progress } from "@/components/ui/progress";
 import {
   Select,
   SelectContent,
@@ -210,16 +211,15 @@ export default function Compare() {
       )}
 
       {/* Controls */}
-      <Card className="p-5 mb-6 space-y-4">
-        {/* Ticker search */}
-        <div>
-          <label className="text-sm font-medium mb-1.5 block">Company</label>
+      <Card className="p-5 mb-6 space-y-5">
+        {/* Step 1 — company */}
+        <Step n={1} title="Pick a company">
           <Popover open={tickerOpen} onOpenChange={setTickerOpen}>
             <PopoverTrigger asChild>
               <Button
                 variant="outline"
                 role="combobox"
-                className="w-72 justify-between font-mono"
+                className="w-full sm:w-72 justify-between font-mono"
                 data-testid="button-ticker-search"
               >
                 {ticker || <span className="text-muted-foreground font-sans">Search ticker…</span>}
@@ -250,98 +250,136 @@ export default function Compare() {
               </Command>
             </PopoverContent>
           </Popover>
-        </div>
+        </Step>
 
         {ticker && (
           <>
-            <div className="flex items-center justify-between gap-3 flex-wrap">
-              <p className="text-xs text-muted-foreground">
-                {tickerFilings.length} rendered filing{tickerFilings.length !== 1 ? "s" : ""} for {ticker}
-              </p>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => setConfirmLoad(true)}
-                disabled={loadHistoryMutation.isPending || !selectedEntry}
-                data-testid="button-load-history"
-              >
-                {loadHistoryMutation.isPending ? (
-                  <Loader2 className="w-3.5 h-3.5 mr-1.5 animate-spin" />
-                ) : (
-                  <History className="w-3.5 h-3.5 mr-1.5" />
-                )}
-                Load last 3 years
-              </Button>
-            </div>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              <div>
-                <label className="text-sm font-medium mb-1.5 block">Filing A</label>
-                <Select value={accA} onValueChange={setAccA}>
-                  <SelectTrigger data-testid="select-compare-a">
-                    <SelectValue placeholder="Select filing" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {tickerFilings.map((f) => (
-                      <SelectItem key={f.accessionNumber} value={f.accessionNumber}>
-                        {filingLabel(f)}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-              <div>
-                <label className="text-sm font-medium mb-1.5 block">Filing B</label>
-                <Select value={accB} onValueChange={setAccB}>
-                  <SelectTrigger data-testid="select-compare-b">
-                    <SelectValue placeholder="Select filing" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {tickerFilings.map((f) => (
-                      <SelectItem key={f.accessionNumber} value={f.accessionNumber}>
-                        {filingLabel(f)}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-            </div>
-            {tickerFilings.length < 2 && (
-              <p className="text-xs text-muted-foreground">
-                Need at least two rendered filings for {ticker}. Use “Load last 3 years” to pull more history.
-              </p>
-            )}
-
-            <div>
-              <label className="text-sm font-medium mb-1.5 block">Section</label>
-              <Select value={section} onValueChange={setSection}>
-                <SelectTrigger className="w-60" data-testid="select-compare-section">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="all">All sections</SelectItem>
-                  {SECTIONS.map((s) => (
-                    <SelectItem key={s.key} value={s.key}>
-                      {s.label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-
-            <Button onClick={runCompare} disabled={!canCompare} data-testid="button-compare">
-              {running ? (
-                <>
-                  <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                  Comparing…
-                </>
+            {/* Step 2 — choose filings */}
+            <Step n={2} title="Choose two filings to compare">
+              {tickerFilings.length < 2 ? (
+                <div className="rounded-md border border-amber-600/30 bg-amber-600/5 p-3 space-y-2">
+                  <p className="text-sm">
+                    {ticker} has {tickerFilings.length} rendered filing{tickerFilings.length !== 1 ? "s" : ""} in the
+                    library. Load the last 3 years of 10-K / 10-Q / DEF 14A filings to compare across periods.
+                  </p>
+                  <Button
+                    size="sm"
+                    onClick={() => setConfirmLoad(true)}
+                    disabled={loadHistoryMutation.isPending || !selectedEntry}
+                    data-testid="button-load-history"
+                  >
+                    <History className="w-3.5 h-3.5 mr-1.5" />
+                    Load last 3 years
+                  </Button>
+                </div>
               ) : (
-                <>
-                  <GitCompareArrows className="w-4 h-4 mr-2" />
-                  Compare {section === "all" ? "all sections" : SECTIONS.find((s) => s.key === section)?.label}
-                </>
+                <div className="flex items-center justify-between gap-3 flex-wrap">
+                  <p className="text-xs text-muted-foreground">
+                    {tickerFilings.length} rendered filings available
+                  </p>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setConfirmLoad(true)}
+                    disabled={loadHistoryMutation.isPending || !selectedEntry}
+                    data-testid="button-load-history"
+                  >
+                    <History className="w-3.5 h-3.5 mr-1.5" />
+                    Need older? Load last 3 years
+                  </Button>
+                </div>
               )}
-            </Button>
+
+              {loadHistoryMutation.isPending && (
+                <SimulatedProgress label="Loading the last 3 years of filings… this can take up to a minute." />
+              )}
+
+              {tickerFilings.length >= 2 && (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className="text-xs font-medium text-muted-foreground mb-1 block">Filing A</label>
+                    <Select value={accA} onValueChange={setAccA}>
+                      <SelectTrigger data-testid="select-compare-a">
+                        <SelectValue placeholder="Select filing" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {tickerFilings.map((f) => (
+                          <SelectItem key={f.accessionNumber} value={f.accessionNumber}>
+                            {filingLabel(f)}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div>
+                    <label className="text-xs font-medium text-muted-foreground mb-1 block">Filing B</label>
+                    <Select value={accB} onValueChange={setAccB}>
+                      <SelectTrigger data-testid="select-compare-b">
+                        <SelectValue placeholder="Select filing" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {tickerFilings.map((f) => (
+                          <SelectItem key={f.accessionNumber} value={f.accessionNumber}>
+                            {filingLabel(f)}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </div>
+              )}
+            </Step>
+
+            {tickerFilings.length >= 2 && (
+              <>
+                {/* Step 3 — sections */}
+                <Step n={3} title="SEC filing sections to compare">
+                  <Select value={section} onValueChange={setSection}>
+                    <SelectTrigger className="w-full sm:w-72" data-testid="select-compare-section">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="all">All sections</SelectItem>
+                      {SECTIONS.map((s) => (
+                        <SelectItem key={s.key} value={s.key}>
+                          {s.label}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </Step>
+
+                {/* Compare action */}
+                <div className="pl-9 space-y-2">
+                  <Button onClick={runCompare} disabled={!canCompare} data-testid="button-compare">
+                    {running ? (
+                      <>
+                        <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                        Comparing…
+                      </>
+                    ) : (
+                      <>
+                        <GitCompareArrows className="w-4 h-4 mr-2" />
+                        Compare {section === "all" ? "all sections" : SECTIONS.find((s) => s.key === section)?.label}
+                      </>
+                    )}
+                  </Button>
+                  {running &&
+                    (section === "all" ? (
+                      <div className="space-y-1.5">
+                        <Progress value={((results.length + sectionErrors.length) / SECTION_KEYS.length) * 100} />
+                        <p className="text-xs text-muted-foreground">
+                          Comparing section{" "}
+                          {Math.min(results.length + sectionErrors.length + 1, SECTION_KEYS.length)} of{" "}
+                          {SECTION_KEYS.length}…
+                        </p>
+                      </div>
+                    ) : (
+                      <SimulatedProgress label="Comparing…" />
+                    ))}
+                </div>
+              </>
+            )}
           </>
         )}
       </Card>
@@ -425,13 +463,6 @@ export default function Compare() {
             </div>
           ))}
 
-          {running && (
-            <div className="flex items-center gap-2 text-sm text-muted-foreground">
-              <Loader2 className="w-4 h-4 animate-spin" />
-              Comparing{section === "all" ? ` (${results.length + sectionErrors.length}/${SECTION_KEYS.length})` : ""}…
-            </div>
-          )}
-
           {sectionErrors.map((err, i) => (
             <Card key={i} className="p-3 border-destructive/40">
               <p className="text-sm text-destructive">{err}</p>
@@ -468,6 +499,39 @@ export default function Compare() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+    </div>
+  );
+}
+
+function Step({ n, title, children }: { n: number; title: string; children: React.ReactNode }) {
+  return (
+    <div className="flex gap-3">
+      <div className="w-6 h-6 rounded-full bg-primary/10 text-primary text-xs font-semibold flex items-center justify-center shrink-0 mt-0.5">
+        {n}
+      </div>
+      <div className="flex-1 min-w-0 space-y-2">
+        <p className="text-sm font-medium">{title}</p>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+// An animated progress bar for tasks whose duration we can't measure (a single
+// blocking request). Climbs toward ~92% while mounted; the parent unmounts it
+// when the task finishes.
+function SimulatedProgress({ label }: { label: string }) {
+  const [value, setValue] = useState(8);
+  useEffect(() => {
+    const id = setInterval(() => {
+      setValue((p) => (p < 92 ? p + Math.max(1, (92 - p) * 0.06) : p));
+    }, 500);
+    return () => clearInterval(id);
+  }, []);
+  return (
+    <div className="space-y-1.5">
+      <Progress value={value} />
+      <p className="text-xs text-muted-foreground">{label}</p>
     </div>
   );
 }
