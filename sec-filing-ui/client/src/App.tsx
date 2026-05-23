@@ -10,6 +10,7 @@ import { AuthProvider, useAuth } from "@/hooks/use-auth";
 import Home from "@/pages/home";
 import WatchlistPage from "@/pages/watchlist";
 import FetchFilings from "@/pages/fetch-filings";
+import Findings from "@/pages/findings";
 import PdfLibrary from "@/pages/pdf-library";
 import LoginPage from "@/pages/login";
 import RegisterPage from "@/pages/register";
@@ -37,6 +38,7 @@ function AuthenticatedApp() {
               <Route path="/" component={Home} />
               <Route path="/watchlist/:id" component={WatchlistPage} />
               <Route path="/fetch" component={FetchFilings} />
+              <Route path="/findings" component={Findings} />
               <Route path="/library" component={PdfLibrary} />
               <Route component={NotFound} />
             </Switch>

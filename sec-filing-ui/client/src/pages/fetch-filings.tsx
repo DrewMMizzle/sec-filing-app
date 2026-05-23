@@ -24,6 +24,7 @@ import type { DateRange } from "react-day-picker";
 import { useToast } from "@/hooks/use-toast";
 import { Search, Download, Loader2, FileText, Calendar as CalendarIcon, Check, X, AlertCircle, ShieldAlert, ShieldCheck } from "lucide-react";
 import type { Filing } from "@shared/schema";
+import { CATEGORY_LABELS, parseFindings } from "@/lib/findings";
 
 // SEC filing dates are plain calendar dates (YYYY-MM-DD); convert to/from local
 // Date objects so the calendar never shifts a day across timezones.
@@ -36,26 +37,6 @@ function parseYmd(s: string): Date | undefined {
   const [y, m, d] = s.split("-").map(Number);
   if (!y || !m || !d) return undefined;
   return new Date(y, m - 1, d);
-}
-
-type ReviewFinding = { category: string; headline: string; detail: string; why: string };
-
-const CATEGORY_LABELS: Record<string, string> = {
-  perks_comp: "Perks & comp",
-  severance_parachute: "Severance / parachute",
-  related_party_insider: "Related-party / insider",
-  language_governance_accounting: "Language / governance / accounting",
-  other: "Other",
-};
-
-function parseFindings(f: Filing): ReviewFinding[] {
-  if (!f.reviewFindings) return [];
-  try {
-    const parsed = JSON.parse(f.reviewFindings);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
 }
 
 type TickerInfo = {
