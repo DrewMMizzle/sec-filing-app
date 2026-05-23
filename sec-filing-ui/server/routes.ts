@@ -7,7 +7,7 @@ import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
 import { hashPassword, verifyPassword, createSession, clearSession, requireAuth } from "./auth";
-import { seedSP500ForUser } from "./seed-sp500";
+import { ensureSP500Seeded } from "./seed-sp500";
 import { db } from "./storage";
 import { tickers as tickersTable, filings as filingsTable } from "@shared/schema";
 import { eq } from "drizzle-orm";
@@ -71,12 +71,8 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     await createSession(res, user.id);
 
     // Pre-load the S&P 500 watchlist so new users start with a usable list.
-    // Never let seeding failure block account creation.
-    try {
-      await seedSP500ForUser(user.id);
-    } catch (e) {
-      console.error("Failed to seed S&P 500 watchlist for new user:", e);
-    }
+    // ensureSP500Seeded never throws, so it can't block account creation.
+    await ensureSP500Seeded(user.id);
 
     // Clean up expired sessions in background
     storage.deleteExpiredSessions().catch(() => {});
@@ -124,6 +120,9 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
 
   app.get("/api/watchlists", requireAuth, async (req, res) => {
     const userId = req.user!.id;
+    // Self-heal: ensure the user has their pre-loaded S&P 500 list, so existing
+    // users get it on their next visit without needing a restart or re-login.
+    await ensureSP500Seeded(userId);
     const lists = await storage.getWatchlists(userId);
     const result = await Promise.all(
       lists.map(async (wl) => ({

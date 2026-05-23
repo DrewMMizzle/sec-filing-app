@@ -93,6 +93,23 @@ export async function seedSP500ForUser(userId: number): Promise<boolean> {
   return true;
 }
 
+// Users we've already ensured this process, to keep the lazy check off the hot
+// path. Only populated on success, so a transient failure is retried later.
+const ensuredUsers = new Set<number>();
+
+// Lazily ensure a user has the S&P 500 watchlist. Safe to call on every request;
+// the in-memory guard and idempotent seed keep it cheap. Errors are swallowed so
+// reads never fail because of seeding.
+export async function ensureSP500Seeded(userId: number): Promise<void> {
+  if (ensuredUsers.has(userId)) return;
+  try {
+    await seedSP500ForUser(userId);
+    ensuredUsers.add(userId);
+  } catch (err) {
+    console.error(`[sp500] Lazy seed failed for user ${userId}:`, err);
+  }
+}
+
 // Seed the S&P 500 watchlist for every existing user that doesn't have one.
 export async function backfillSP500(): Promise<void> {
   const allUsers = await db.select({ id: users.id }).from(users);
