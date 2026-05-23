@@ -13,9 +13,30 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Calendar } from "@/components/ui/calendar";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
+import { format } from "date-fns";
+import type { DateRange } from "react-day-picker";
 import { useToast } from "@/hooks/use-toast";
-import { Search, Download, Loader2, FileText, Calendar, Check, X, AlertCircle } from "lucide-react";
+import { Search, Download, Loader2, FileText, Calendar as CalendarIcon, Check, X, AlertCircle } from "lucide-react";
 import type { Filing } from "@shared/schema";
+
+// SEC filing dates are plain calendar dates (YYYY-MM-DD); convert to/from local
+// Date objects so the calendar never shifts a day across timezones.
+function toYmd(d: Date): string {
+  return format(d, "yyyy-MM-dd");
+}
+
+function parseYmd(s: string): Date | undefined {
+  if (!s) return undefined;
+  const [y, m, d] = s.split("-").map(Number);
+  if (!y || !m || !d) return undefined;
+  return new Date(y, m - 1, d);
+}
 
 type TickerInfo = {
   ticker: string;
@@ -40,9 +61,26 @@ type FetchResult = {
 export default function FetchFilings() {
   const { toast } = useToast();
 
-  // Date range state
+  // Date range state (kept as YYYY-MM-DD strings for the API + filtering)
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
+
+  const dateRange: DateRange | undefined =
+    dateFrom || dateTo ? { from: parseYmd(dateFrom), to: parseYmd(dateTo) } : undefined;
+
+  const handleRangeSelect = (range: DateRange | undefined) => {
+    setDateFrom(range?.from ? toYmd(range.from) : "");
+    setDateTo(range?.to ? toYmd(range.to) : "");
+  };
+
+  const rangeLabel = (() => {
+    const from = parseYmd(dateFrom);
+    const to = parseYmd(dateTo);
+    if (from && to) return `${format(from, "MMM d, yyyy")} – ${format(to, "MMM d, yyyy")}`;
+    if (from) return `${format(from, "MMM d, yyyy")} – End date`;
+    if (to) return `Start date – ${format(to, "MMM d, yyyy")}`;
+    return "All dates";
+  })();
 
   // Ticker selection state
   const [selectedWatchlist, setSelectedWatchlist] = useState<string>("all");
@@ -176,24 +214,42 @@ export default function FetchFilings() {
           <div>
             <label className="text-sm font-medium mb-2 block">Date Range</label>
             <div className="flex items-center gap-3">
-              <div className="flex items-center gap-2">
-                <Calendar className="w-4 h-4 text-muted-foreground" />
-                <Input
-                  type="date"
-                  value={dateFrom}
-                  onChange={(e) => setDateFrom(e.target.value)}
-                  className="w-40"
-                  data-testid="input-date-from"
-                />
-              </div>
-              <span className="text-sm text-muted-foreground">to</span>
-              <Input
-                type="date"
-                value={dateTo}
-                onChange={(e) => setDateTo(e.target.value)}
-                className="w-40"
-                data-testid="input-date-to"
-              />
+              <Popover>
+                <PopoverTrigger asChild>
+                  <Button
+                    variant="outline"
+                    className="w-72 justify-start text-left font-normal"
+                    data-testid="button-date-range"
+                  >
+                    <CalendarIcon className="w-4 h-4 mr-2 text-muted-foreground shrink-0" />
+                    <span className={dateFrom || dateTo ? "" : "text-muted-foreground"}>
+                      {rangeLabel}
+                    </span>
+                  </Button>
+                </PopoverTrigger>
+                <PopoverContent className="w-auto p-0" align="start">
+                  <Calendar
+                    mode="range"
+                    numberOfMonths={2}
+                    defaultMonth={dateRange?.from}
+                    selected={dateRange}
+                    onSelect={handleRangeSelect}
+                    disabled={{ after: new Date() }}
+                    initialFocus
+                  />
+                  <div className="flex justify-end border-t p-2">
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="text-xs h-7"
+                      onClick={() => handleRangeSelect(undefined)}
+                      data-testid="button-clear-date-range"
+                    >
+                      Clear
+                    </Button>
+                  </div>
+                </PopoverContent>
+              </Popover>
               <div className="flex items-center gap-2 ml-4">
                 <label className="text-sm text-muted-foreground whitespace-nowrap">Max per ticker:</label>
                 <Input
