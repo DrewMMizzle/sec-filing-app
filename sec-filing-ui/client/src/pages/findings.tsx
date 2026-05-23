@@ -12,7 +12,29 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Sparkles, ExternalLink, ShieldAlert, Search, Star, CheckCircle2, Ban, Download } from "lucide-react";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import { useToast } from "@/hooks/use-toast";
+import {
+  Sparkles,
+  ExternalLink,
+  ShieldAlert,
+  Search,
+  Star,
+  CheckCircle2,
+  Ban,
+  Download,
+  Loader2,
+  AlertCircle,
+} from "lucide-react";
 import type { Filing, FindingAction } from "@shared/schema";
 import { CATEGORY_LABELS, parseFindings, interestColor, type ReviewFinding } from "@/lib/findings";
 
@@ -73,6 +95,13 @@ export default function Findings() {
     queryKey: ["/api/finding-actions"],
   });
 
+  const { data: config } = useQuery<{ reviewEnabled: boolean }>({
+    queryKey: ["/api/config"],
+  });
+  const reviewEnabled = config?.reviewEnabled ?? false;
+
+  const { toast } = useToast();
+
   const actionMutation = useMutation({
     mutationFn: async (vars: { accessionNumber: string; findingIndex: number; status: string }) => {
       const res = await apiRequest("POST", "/api/finding-actions", vars);
@@ -82,10 +111,48 @@ export default function Findings() {
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["/api/finding-actions"] }),
   });
 
+  // Review saved-but-unreviewed PDFs straight from the Findings page
+  const reviewMutation = useMutation<{ queued: number }>({
+    mutationFn: async () => {
+      const res = await apiRequest("POST", "/api/filings/review");
+      if (!res.ok) {
+        const body = await res.json();
+        throw new Error(body.error || "Review request failed");
+      }
+      return res.json();
+    },
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ["/api/filings"] });
+      toast({
+        title:
+          data.queued > 0
+            ? `Queued ${data.queued} saved filing${data.queued !== 1 ? "s" : ""} for review`
+            : "All saved filings are already reviewed",
+      });
+    },
+    onError: (err: Error) => toast({ title: "Error", description: err.message, variant: "destructive" }),
+  });
+
   const [activeCats, setActiveCats] = useState<Set<string>>(new Set());
   const [interest, setInterest] = useState<string>("all");
   const [triage, setTriage] = useState<string>("active");
   const [q, setQ] = useState("");
+  const [confirmReview, setConfirmReview] = useState(false);
+
+  // Saved PDFs that haven't been (successfully) reviewed yet
+  const reviewableCount = filings.filter(
+    (f) =>
+      f.status === "complete" &&
+      !["done", "pending", "reviewing"].includes(f.reviewStatus || ""),
+  ).length;
+
+  const handleReviewSaved = () => {
+    if (reviewableCount > 25) {
+      setConfirmReview(true);
+      return;
+    }
+    reviewMutation.mutate();
+  };
 
   const statusMap = new Map<string, string>();
   for (const a of actions) statusMap.set(`${a.accessionNumber}#${a.findingIndex}`, a.status);
@@ -138,7 +205,7 @@ export default function Findings() {
 
   return (
     <div className="p-6 max-w-5xl mx-auto">
-      <div className="mb-6 flex items-start justify-between gap-3">
+      <div className="mb-4 flex items-start justify-between gap-3">
         <div>
           <h1 className="text-xl font-semibold mb-1" data-testid="text-page-title">
             Findings
@@ -147,17 +214,56 @@ export default function Findings() {
             Post-worthy details Claude surfaced across your reviewed filings — triage, then open the source.
           </p>
         </div>
-        <Button
-          variant="secondary"
-          size="sm"
-          onClick={() => downloadCsv(rows)}
-          disabled={rows.length === 0}
-          data-testid="button-export-findings"
-        >
-          <Download className="w-3.5 h-3.5 mr-1.5" />
-          Export CSV
-        </Button>
+        <div className="flex items-center gap-2 shrink-0">
+          {reviewEnabled && (reviewableCount > 0 || reviewing) && (
+            <Button
+              size="sm"
+              onClick={handleReviewSaved}
+              disabled={reviewMutation.isPending || reviewing}
+              data-testid="button-review-saved"
+            >
+              {reviewMutation.isPending || reviewing ? (
+                <Loader2 className="w-3.5 h-3.5 mr-1.5 animate-spin" />
+              ) : (
+                <Sparkles className="w-3.5 h-3.5 mr-1.5" />
+              )}
+              {reviewing ? "Reviewing…" : `Review ${reviewableCount} saved`}
+            </Button>
+          )}
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => downloadCsv(rows)}
+            disabled={rows.length === 0}
+            data-testid="button-export-findings"
+          >
+            <Download className="w-3.5 h-3.5 mr-1.5" />
+            Export CSV
+          </Button>
+        </div>
       </div>
+
+      {/* Review availability notice */}
+      {config && !reviewEnabled && (
+        <Card className="p-3 mb-4 flex items-center gap-2 border-amber-600/30" data-testid="card-review-disabled">
+          <AlertCircle className="w-4 h-4 text-amber-400 shrink-0" />
+          <p className="text-xs text-muted-foreground">
+            Claude review is off. Set <code className="text-foreground">ANTHROPIC_API_KEY</code> in the
+            environment to review saved filings for footnoted-worthy findings.
+          </p>
+        </Card>
+      )}
+      {reviewEnabled && reviewableCount > 0 && !reviewing && allRows.length === 0 && (
+        <Card className="p-3 mb-4 flex items-center gap-2" data-testid="card-review-available">
+          <Sparkles className="w-4 h-4 text-primary shrink-0" />
+          <p className="text-xs text-muted-foreground">
+            {reviewableCount} saved filing{reviewableCount !== 1 ? "s" : ""} in your library{" "}
+            {reviewableCount !== 1 ? "haven't" : "hasn't"} been reviewed yet. Click{" "}
+            <span className="font-medium text-foreground">Review {reviewableCount} saved</span> above to scan
+            them.
+          </p>
+        </Card>
+      )}
 
       {/* Filters */}
       <Card className="p-4 mb-6 space-y-3">
@@ -229,9 +335,13 @@ export default function Findings() {
             </div>
           </div>
           <p className="text-sm text-muted-foreground">
-            {allRows.length === 0
-              ? "No findings yet. Fetch filings and run a review on the Fetch Filings page."
-              : "No findings match your filters."}
+            {allRows.length > 0
+              ? "No findings match your filters."
+              : reviewEnabled && reviewableCount > 0
+                ? `${reviewableCount} saved filing${reviewableCount !== 1 ? "s are" : " is"} ready to review — click "Review ${reviewableCount} saved" above.`
+                : !reviewEnabled
+                  ? "No findings yet. Set ANTHROPIC_API_KEY to enable Claude review, then review your saved filings."
+                  : "No findings yet. Fetch filings on the Fetch Filings page, then review them."}
           </p>
         </Card>
       ) : (
@@ -332,6 +442,30 @@ export default function Findings() {
           })}
         </div>
       )}
+
+      <AlertDialog open={confirmReview} onOpenChange={setConfirmReview}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Review the saved library with Claude?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This will run a Claude review on ~{reviewableCount} saved filing
+              {reviewableCount !== 1 ? "s" : ""}. It can take a while and will incur Claude API cost.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => {
+                setConfirmReview(false);
+                reviewMutation.mutate();
+              }}
+              data-testid="button-confirm-review-saved"
+            >
+              Review
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }
