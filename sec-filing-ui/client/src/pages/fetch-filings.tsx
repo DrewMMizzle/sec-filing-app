@@ -34,7 +34,7 @@ import type { DateRange } from "react-day-picker";
 import { useToast } from "@/hooks/use-toast";
 import { Search, Download, Loader2, FileText, Calendar as CalendarIcon, Check, X, AlertCircle, ShieldAlert, ShieldCheck } from "lucide-react";
 import type { Filing } from "@shared/schema";
-import { CATEGORY_LABELS, parseFindings } from "@/lib/findings";
+import { CATEGORY_LABELS, parseFindings, estimateReviewCost, formatCostRange } from "@/lib/findings";
 
 // SEC filing dates are plain calendar dates (YYYY-MM-DD); convert to/from local
 // Date objects so the calendar never shifts a day across timezones.
@@ -243,11 +243,12 @@ export default function FetchFilings() {
   });
 
   // Filings eligible for a library review (complete, not already done/in-flight)
-  const reviewableCount = existingFilings.filter(
+  const reviewableFilings = existingFilings.filter(
     (f) =>
       f.status === "complete" &&
       !["done", "pending", "reviewing"].includes(f.reviewStatus || ""),
-  ).length;
+  );
+  const reviewableCount = reviewableFilings.length;
 
   const handleFetch = () => {
     if (selectedTickers.size === 0) {
@@ -256,12 +257,16 @@ export default function FetchFilings() {
     }
     if (selectedTickers.size > CONFIRM_THRESHOLD) {
       const est = selectedTickers.size * limitPerTicker;
+      const costNote = reviewEnabled
+        ? ` Estimated Claude review cost: ${formatCostRange(estimateReviewCost(Array(est).fill(undefined)))} (Opus 4.7; rough).`
+        : "";
       setConfirm({
         title: "Fetch a large batch?",
         body:
           `This will fetch up to ~${est} filings across ${selectedTickers.size} tickers` +
           (reviewEnabled ? " and run a Claude review on each new one" : "") +
-          `. It can take a while${reviewEnabled ? " and will incur Claude API cost" : ""}.`,
+          `. It can take a while.` +
+          costNote,
         action: () => fetchMutation.mutate(),
       });
       return;
@@ -271,9 +276,10 @@ export default function FetchFilings() {
 
   const handleReviewLibrary = () => {
     if (reviewableCount > CONFIRM_THRESHOLD) {
+      const cost = formatCostRange(estimateReviewCost(reviewableFilings.map((f) => f.filingType)));
       setConfirm({
         title: "Review the library with Claude?",
-        body: `This will run a Claude review on ~${reviewableCount} filing${reviewableCount !== 1 ? "s" : ""}. It can take a while and will incur Claude API cost.`,
+        body: `This will run a Claude review on ~${reviewableCount} filing${reviewableCount !== 1 ? "s" : ""}. Estimated Claude cost: ${cost} (Opus 4.7; rough, varies with filing length). It can also take a while.`,
         action: () => reviewMutation.mutate(),
       });
       return;
