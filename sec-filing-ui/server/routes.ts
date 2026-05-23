@@ -574,6 +574,34 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     res.json({ reviewEnabled: isReviewEnabled() });
   });
 
+  // ─── Per-finding triage (star / posted / dismissed) ──────
+
+  app.get("/api/finding-actions", requireAuth, async (req, res) => {
+    res.json(await storage.getFindingActions(req.user!.id));
+  });
+
+  app.post("/api/finding-actions", requireAuth, async (req, res) => {
+    const userId = req.user!.id;
+    const { accessionNumber, findingIndex, status } = req.body as {
+      accessionNumber?: string;
+      findingIndex?: number;
+      status?: string | null;
+    };
+    if (!accessionNumber || typeof findingIndex !== "number") {
+      return res.status(400).json({ error: "accessionNumber and numeric findingIndex are required" });
+    }
+    // Empty / "new" clears any existing action (untriage)
+    if (!status || status === "new") {
+      await storage.clearFindingAction(userId, accessionNumber, findingIndex);
+      return res.json({ status: null });
+    }
+    if (!["starred", "dismissed", "posted"].includes(status)) {
+      return res.status(400).json({ error: "status must be starred, posted, dismissed, or new" });
+    }
+    await storage.setFindingAction(userId, accessionNumber, findingIndex, status);
+    res.json({ status });
+  });
+
   // Review filings already in the library (not just freshly fetched ones)
   app.post("/api/filings/review", requireAuth, async (req, res) => {
     const userId = req.user!.id;

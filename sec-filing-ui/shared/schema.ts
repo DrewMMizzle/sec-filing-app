@@ -88,6 +88,20 @@ export const watchlistShares = pgTable("watchlist_shares", {
   index("idx_shares_user").on(table.sharedWithUserId),
 ]);
 
+// ─── Per-finding triage state ──────────────────────────────
+
+export const findingActions = pgTable("finding_actions", {
+  id: serial("id").primaryKey(),
+  userId: integer("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  accessionNumber: text("accession_number").notNull(),
+  findingIndex: integer("finding_index").notNull(),
+  status: text("status").notNull(), // starred | dismissed | posted
+  updatedAt: text("updated_at").notNull(),
+}, (table) => [
+  uniqueIndex("idx_finding_action_unique").on(table.userId, table.accessionNumber, table.findingIndex),
+  index("idx_finding_actions_user").on(table.userId),
+]);
+
 // ─── Insert schemas ────────────────────────────────────────
 
 export const insertUserSchema = createInsertSchema(users).omit({ id: true });
@@ -95,6 +109,7 @@ export const insertWatchlistSchema = createInsertSchema(watchlists).omit({ id: t
 export const insertTickerSchema = createInsertSchema(tickers).omit({ id: true });
 export const insertFilingSchema = createInsertSchema(filings).omit({ id: true });
 export const insertWatchlistShareSchema = createInsertSchema(watchlistShares).omit({ id: true });
+export const insertFindingActionSchema = createInsertSchema(findingActions).omit({ id: true });
 
 // ─── Types ─────────────────────────────────────────────────
 
@@ -109,3 +124,5 @@ export type Filing = typeof filings.$inferSelect;
 export type InsertFiling = z.infer<typeof insertFilingSchema>;
 export type WatchlistShare = typeof watchlistShares.$inferSelect;
 export type InsertWatchlistShare = z.infer<typeof insertWatchlistShareSchema>;
+export type FindingAction = typeof findingActions.$inferSelect;
+export type InsertFindingAction = z.infer<typeof insertFindingActionSchema>;
