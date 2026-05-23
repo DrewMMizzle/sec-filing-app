@@ -184,7 +184,11 @@ export async function compareFilings(a: Filing, b: Filing, key: SectionKey): Pro
 
   const pathE = resolvePdfPath(earlierF);
   const pathL = resolvePdfPath(laterF);
-  if (!pathE || !pathL) throw new Error("Rendered PDF not found for one of the filings");
+  if (!pathE || !pathL) {
+    throw new Error(
+      "The rendered PDF is missing for one of these filings (storage was likely cleared on a redeploy). Re-pull this company with “Load last 3 years” to regenerate the PDFs, then compare again.",
+    );
+  }
 
   const [textE, textL] = await Promise.all([extractPdfText(pathE), extractPdfText(pathL)]);
   const secE = extractSection(textE, key);

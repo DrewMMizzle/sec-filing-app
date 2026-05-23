@@ -524,6 +524,23 @@ export class DatabaseStorage {
     return new Set(rows.map((r) => r.accessionNumber));
   }
 
+  async getCompleteFilings(
+    userId: number,
+    tickerList: string[],
+  ): Promise<Array<{ accessionNumber: string; pdfPath: string | null }>> {
+    if (tickerList.length === 0) return [];
+    return db
+      .select({ accessionNumber: filings.accessionNumber, pdfPath: filings.pdfPath })
+      .from(filings)
+      .where(
+        and(
+          eq(filings.userId, userId),
+          inArray(filings.ticker, tickerList),
+          eq(filings.status, "complete"),
+        ),
+      );
+  }
+
   async exportWatchlistJson(userId: number): Promise<Array<{ cik: string; ticker: string; filing_types: string[] }>> {
     const userWatchlists = await this.getWatchlists(userId);
     const allTickers: Ticker[] = [];

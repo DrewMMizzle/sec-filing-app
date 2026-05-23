@@ -28,6 +28,16 @@ if (!fs.existsSync(PDF_STORAGE_DIR)) {
   fs.mkdirSync(PDF_STORAGE_DIR, { recursive: true });
 }
 
+// Whether a filing's rendered PDF actually exists on disk. The DB row can say
+// "complete" while the file is gone (e.g. ephemeral storage wiped on redeploy),
+// so callers verify the file before treating a filing as available.
+function pdfExistsOnDisk(pdfPath: string | null | undefined): boolean {
+  if (!pdfPath) return false;
+  const appPath = path.resolve(PDF_STORAGE_DIR, "..", pdfPath);
+  const pipelinePath = path.join(PIPELINE_ROOT, pdfPath);
+  return fs.existsSync(appPath) || fs.existsSync(pipelinePath);
+}
+
 // Helper: check if user has access to a watchlist (owner or shared)
 async function checkWatchlistAccess(watchlistId: number, userId: number): Promise<{ access: "owner" | "edit" | "view" | null; watchlist: any }> {
   const wl = await storage.getWatchlist(watchlistId);
@@ -441,9 +451,14 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
       return res.status(400).json({ error: "tickers array is required" });
     }
 
-    // ── Dedup: check which accessions are already complete in our DB ──
+    // ── Dedup: skip filings already complete AND whose PDF still exists on disk.
+    // (A redeploy can wipe ephemeral PDF storage while the DB row persists, so a
+    // status check alone would wrongly skip filings that need re-rendering.) ──
     const tickerNames = tickerList.map((t) => t.ticker);
-    const alreadyComplete = await storage.getCompleteAccessions(userId, tickerNames);
+    const completeRows = await storage.getCompleteFilings(userId, tickerNames);
+    const alreadyComplete = new Set(
+      completeRows.filter((r) => pdfExistsOnDisk(r.pdfPath)).map((r) => r.accessionNumber),
+    );
 
     const input = JSON.stringify({
       tickers: tickerList,
