@@ -7,6 +7,7 @@ import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
 import { hashPassword, verifyPassword, createSession, clearSession, requireAuth } from "./auth";
+import { seedSP500ForUser } from "./seed-sp500";
 import { db } from "./storage";
 import { tickers as tickersTable, filings as filingsTable } from "@shared/schema";
 import { eq } from "drizzle-orm";
@@ -68,6 +69,14 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     });
 
     await createSession(res, user.id);
+
+    // Pre-load the S&P 500 watchlist so new users start with a usable list.
+    // Never let seeding failure block account creation.
+    try {
+      await seedSP500ForUser(user.id);
+    } catch (e) {
+      console.error("Failed to seed S&P 500 watchlist for new user:", e);
+    }
 
     // Clean up expired sessions in background
     storage.deleteExpiredSessions().catch(() => {});

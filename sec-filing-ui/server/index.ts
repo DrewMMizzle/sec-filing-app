@@ -2,6 +2,7 @@ import express, { type Request, Response, NextFunction } from "express";
 import cookieParser from "cookie-parser";
 import { registerRoutes } from "./routes";
 import { serveStatic } from "./static";
+import { backfillSP500 } from "./seed-sp500";
 import { createServer } from "http";
 
 const app = express();
@@ -101,6 +102,9 @@ app.use((req, res, next) => {
     },
     () => {
       log(`serving on port ${port}`);
+      // Backfill the S&P 500 watchlist for existing users in the background so
+      // it never delays startup or the healthcheck.
+      backfillSP500().catch((err) => console.error("S&P 500 backfill failed:", err));
     },
   );
 })();
