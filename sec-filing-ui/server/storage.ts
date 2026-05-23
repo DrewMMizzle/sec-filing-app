@@ -69,6 +69,15 @@ export async function initDatabase(): Promise<void> {
     -- Add user_id to filings
     ALTER TABLE filings ADD COLUMN IF NOT EXISTS user_id INTEGER REFERENCES users(id) ON DELETE CASCADE;
 
+    -- Claude material-disclosure review columns
+    ALTER TABLE filings ADD COLUMN IF NOT EXISTS review_status TEXT;
+    ALTER TABLE filings ADD COLUMN IF NOT EXISTS review_flagged BOOLEAN;
+    ALTER TABLE filings ADD COLUMN IF NOT EXISTS review_materiality TEXT;
+    ALTER TABLE filings ADD COLUMN IF NOT EXISTS review_summary TEXT;
+    ALTER TABLE filings ADD COLUMN IF NOT EXISTS review_error TEXT;
+    ALTER TABLE filings ADD COLUMN IF NOT EXISTS reviewed_at TEXT;
+    CREATE INDEX IF NOT EXISTS idx_filings_review_status ON filings(review_status);
+
     CREATE TABLE IF NOT EXISTS watchlist_shares (
       id SERIAL PRIMARY KEY,
       watchlist_id INTEGER NOT NULL REFERENCES watchlists(id) ON DELETE CASCADE,
@@ -285,6 +294,53 @@ export class DatabaseStorage {
     if (pdfSize !== undefined) updates.pdfSize = pdfSize;
     if (errorMessage !== undefined) updates.errorMessage = errorMessage;
     await db.update(filings).set(updates).where(eq(filings.accessionNumber, accession));
+  }
+
+  // ─── Material-disclosure review ─────────────────────────
+
+  async markFilingForReview(accession: string): Promise<void> {
+    await db.update(filings).set({ reviewStatus: "pending" }).where(eq(filings.accessionNumber, accession));
+  }
+
+  async requeueStaleReviews(): Promise<void> {
+    // Reset rows left mid-review by a crash/restart back to the queue.
+    await db.update(filings).set({ reviewStatus: "pending" }).where(eq(filings.reviewStatus, "reviewing"));
+  }
+
+  async getPendingReviewFilings(limit = 5): Promise<Filing[]> {
+    return db
+      .select()
+      .from(filings)
+      .where(eq(filings.reviewStatus, "pending"))
+      .limit(limit);
+  }
+
+  async setFilingReviewStatus(accession: string, status: string): Promise<void> {
+    await db.update(filings).set({ reviewStatus: status }).where(eq(filings.accessionNumber, accession));
+  }
+
+  async setFilingReviewResult(
+    accession: string,
+    result: { flagged: boolean; materiality: string; summary: string },
+  ): Promise<void> {
+    await db
+      .update(filings)
+      .set({
+        reviewStatus: "done",
+        reviewFlagged: result.flagged,
+        reviewMateriality: result.materiality,
+        reviewSummary: result.summary,
+        reviewError: null,
+        reviewedAt: new Date().toISOString(),
+      })
+      .where(eq(filings.accessionNumber, accession));
+  }
+
+  async setFilingReviewError(accession: string, message: string): Promise<void> {
+    await db
+      .update(filings)
+      .set({ reviewStatus: "error", reviewError: message, reviewedAt: new Date().toISOString() })
+      .where(eq(filings.accessionNumber, accession));
   }
 
   async deleteFiling(id: number): Promise<Filing | undefined> {
