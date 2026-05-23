@@ -11,6 +11,7 @@ import Home from "@/pages/home";
 import WatchlistPage from "@/pages/watchlist";
 import FetchFilings from "@/pages/fetch-filings";
 import Findings from "@/pages/findings";
+import Compare from "@/pages/compare";
 import PdfLibrary from "@/pages/pdf-library";
 import LoginPage from "@/pages/login";
 import RegisterPage from "@/pages/register";
@@ -40,6 +41,7 @@ function AuthenticatedApp() {
               <Route path="/watchlists" component={Home} />
               <Route path="/watchlist/:id" component={WatchlistPage} />
               <Route path="/fetch" component={FetchFilings} />
+              <Route path="/compare" component={Compare} />
               <Route path="/library" component={PdfLibrary} />
               {/* If we land on an auth route while already signed in (e.g. the
                   post-login redirect race), bounce home instead of 404ing. */}

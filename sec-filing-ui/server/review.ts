@@ -14,7 +14,7 @@ const __dirname_compat = path.dirname(__filename_compat);
 const PDF_STORAGE_DIR = process.env.PDF_STORAGE_DIR || path.resolve(__dirname_compat, "..", "pdfs");
 const PIPELINE_ROOT = process.env.PIPELINE_ROOT || path.resolve(__dirname_compat, "../../sec-pdf-pipeline");
 
-const MODEL = "claude-opus-4-7";
+export const MODEL = "claude-opus-4-7";
 // Cap the text sent per filing to bound cost/latency on very large 10-Ks.
 const MAX_CHARS = 400_000;
 
@@ -23,9 +23,12 @@ export function isReviewEnabled(): boolean {
 }
 
 let _client: Anthropic | null = null;
-function client(): Anthropic {
+export function getAnthropicClient(): Anthropic {
   if (!_client) _client = new Anthropic();
   return _client;
+}
+function client(): Anthropic {
+  return getAnthropicClient();
 }
 
 const SYSTEM_PROMPT = `You are an investigative editor for footnoted.com, a publication that digs through SEC filings to find the buried, easy-to-miss, often telling details that make a great story — the kind of thing most readers and even most analysts skim right past. You are NOT looking for the big, obvious headline event. You are looking for what's hiding in the footnotes, the exhibits, the compensation tables, and the lawyerly language.
@@ -87,14 +90,14 @@ const REVIEW_SCHEMA = {
   additionalProperties: false,
 };
 
-function resolvePdfPath(filing: Filing): string | null {
+export function resolvePdfPath(filing: Filing): string | null {
   if (!filing.pdfPath) return null;
   const appPath = path.resolve(PDF_STORAGE_DIR, "..", filing.pdfPath);
   const pipelinePath = path.join(PIPELINE_ROOT, filing.pdfPath);
   return fs.existsSync(appPath) ? appPath : fs.existsSync(pipelinePath) ? pipelinePath : null;
 }
 
-async function extractPdfText(absPath: string): Promise<string> {
+export async function extractPdfText(absPath: string): Promise<string> {
   const buffer = fs.readFileSync(absPath);
   const parser = new PDFParse({ data: buffer });
   try {

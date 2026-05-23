@@ -1,0 +1,221 @@
+import { diffWords } from "diff";
+import type { Filing } from "@shared/schema";
+import { MODEL, getAnthropicClient, resolvePdfPath, extractPdfText } from "./review";
+
+export type SectionKey = "risk_factors" | "mdna" | "legal";
+
+export const SECTION_LABELS: Record<SectionKey, string> = {
+  risk_factors: "Risk Factors",
+  mdna: "Management's Discussion & Analysis",
+  legal: "Legal Proceedings",
+};
+
+// Heading text used to locate each section. Matched by name (not item number),
+// since 10-K and 10-Q number these items differently.
+const SECTION_HEADINGS: Record<SectionKey, RegExp> = {
+  risk_factors: /risk\s+factors/i,
+  mdna: /management[’'`]s\s+discussion\s+and\s+analysis/i,
+  legal: /legal\s+proceedings/i,
+};
+
+// A generic "Item N." header used to bound the end of a captured section.
+const NEXT_ITEM = /\bitem\s+\d+[a-z]?\b\.?/gi;
+
+const SECTION_MAX_CHARS = 80_000;
+
+// Extract a named section from filing text. Heuristic: find each occurrence of
+// the heading, capture to the next "Item N" header, and keep the longest
+// capture (the real section, not the short table-of-contents entry).
+export function extractSection(text: string, key: SectionKey): string | null {
+  const heading = new RegExp(SECTION_HEADINGS[key].source, "gi");
+  let best = "";
+  let m: RegExpExecArray | null;
+  while ((m = heading.exec(text)) !== null) {
+    const from = m.index;
+    NEXT_ITEM.lastIndex = from + 40;
+    const next = NEXT_ITEM.exec(text);
+    const end = next ? next.index : Math.min(text.length, from + 120_000);
+    const body = text.slice(from, end).trim();
+    if (body.length > best.length) best = body;
+  }
+  // The longest candidate filters out short table-of-contents matches; this
+  // floor just rejects the case where only a TOC line exists.
+  if (best.length < 80) return null;
+  return best.slice(0, SECTION_MAX_CHARS);
+}
+
+export type DiffSegment = { value: string; added?: boolean; removed?: boolean };
+
+function truncateUnchanged(seg: DiffSegment): DiffSegment {
+  if (seg.added || seg.removed) return seg;
+  // Collapse long unchanged runs to keep the payload manageable.
+  if (seg.value.length > 600) {
+    return { value: `${seg.value.slice(0, 300)}\n…\n${seg.value.slice(-300)}` };
+  }
+  return seg;
+}
+
+function computeDiff(earlier: string, later: string): DiffSegment[] {
+  const parts = diffWords(earlier, later);
+  return parts
+    .map((p) => ({ value: p.value, added: p.added || undefined, removed: p.removed || undefined }))
+    .map(truncateUnchanged);
+}
+
+type ChangeItem = { headline: string; detail: string };
+export type Changelog = {
+  unchanged: boolean;
+  summary: string;
+  added: ChangeItem[];
+  removed: ChangeItem[];
+  changed: ChangeItem[];
+};
+type Usage = { inputTokens: number; outputTokens: number };
+
+const COMPARE_SYSTEM = `You are comparing the SAME section of two SEC filings from the SAME company, filed at different times, for footnoted.com. Your job is to identify what MATERIALLY changed from the earlier filing to the later one.
+
+Report:
+- ADDED: substantive new content (e.g. a brand-new risk factor, a newly disclosed proceeding) present in the later filing but not the earlier one.
+- REMOVED: substantive content dropped from the later filing.
+- CHANGED: existing content that was materially reworded in a way that changes its meaning, scope, or tone (e.g. softened/strengthened language, new dollar figures, broadened risk).
+
+Ignore pure formatting, reordering, punctuation, and immaterial boilerplate edits. Be specific: name the item and quote or closely paraphrase the relevant language. For each entry, the headline is a punchy description of the change and the detail explains what changed and why a reasonable investor or journalist would care.
+
+If the two sections are essentially the same, set unchanged=true with empty arrays and say so in the summary. Respond ONLY with the structured JSON the schema requires.`;
+
+const COMPARE_SCHEMA = {
+  type: "object",
+  properties: {
+    unchanged: { type: "boolean" },
+    summary: { type: "string", description: "1-3 sentence overview of what changed (or that nothing material did)" },
+    added: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: { headline: { type: "string" }, detail: { type: "string" } },
+        required: ["headline", "detail"],
+        additionalProperties: false,
+      },
+    },
+    removed: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: { headline: { type: "string" }, detail: { type: "string" } },
+        required: ["headline", "detail"],
+        additionalProperties: false,
+      },
+    },
+    changed: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: { headline: { type: "string" }, detail: { type: "string" } },
+        required: ["headline", "detail"],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ["unchanged", "summary", "added", "removed", "changed"],
+  additionalProperties: false,
+};
+
+async function claudeCompare(
+  label: string,
+  earlier: { form: string; date: string; text: string },
+  later: { form: string; date: string; text: string },
+): Promise<{ changelog: Changelog; usage: Usage }> {
+  const userContent =
+    `Section: ${label}\n` +
+    `The EARLIER filing is a ${earlier.form} dated ${earlier.date}.\n` +
+    `The LATER filing is a ${later.form} dated ${later.date}.\n` +
+    `Report what changed from the earlier to the later filing.\n\n` +
+    `=== EARLIER (${earlier.form} ${earlier.date}) ===\n${earlier.text}\n\n` +
+    `=== LATER (${later.form} ${later.date}) ===\n${later.text}`;
+
+  const stream = getAnthropicClient().messages.stream({
+    model: MODEL,
+    max_tokens: 8000,
+    thinking: { type: "adaptive" },
+    output_config: { effort: "high", format: { type: "json_schema", schema: COMPARE_SCHEMA } },
+    system: [{ type: "text", text: COMPARE_SYSTEM, cache_control: { type: "ephemeral" } }],
+    messages: [{ role: "user", content: userContent }],
+  });
+
+  const message = await stream.finalMessage();
+  const textBlock = message.content.find((b) => b.type === "text");
+  if (!textBlock || textBlock.type !== "text") throw new Error("No text block in comparison response");
+  const parsed = JSON.parse(textBlock.text) as Partial<Changelog>;
+  const u = message.usage;
+  return {
+    changelog: {
+      unchanged: !!parsed.unchanged,
+      summary: parsed.summary || "",
+      added: Array.isArray(parsed.added) ? parsed.added : [],
+      removed: Array.isArray(parsed.removed) ? parsed.removed : [],
+      changed: Array.isArray(parsed.changed) ? parsed.changed : [],
+    },
+    usage: { inputTokens: u?.input_tokens ?? 0, outputTokens: u?.output_tokens ?? 0 },
+  };
+}
+
+export type CompareResult = {
+  section: SectionKey;
+  sectionLabel: string;
+  earlier: { accession: string; ticker: string; form: string; date: string; found: boolean };
+  later: { accession: string; ticker: string; form: string; date: string; found: boolean };
+  diff: DiffSegment[] | null;
+  changelog: Changelog | null;
+  costUsd: number;
+  note?: string;
+};
+
+export async function compareFilings(a: Filing, b: Filing, key: SectionKey): Promise<CompareResult> {
+  // Order by filing date (older = earlier)
+  const [earlierF, laterF] =
+    (a.filingDate || "") <= (b.filingDate || "") ? [a, b] : [b, a];
+
+  const meta = (f: Filing) => ({
+    accession: f.accessionNumber,
+    ticker: f.ticker,
+    form: f.filingType,
+    date: f.filingDate || "unknown",
+  });
+
+  const pathE = resolvePdfPath(earlierF);
+  const pathL = resolvePdfPath(laterF);
+  if (!pathE || !pathL) throw new Error("Rendered PDF not found for one of the filings");
+
+  const [textE, textL] = await Promise.all([extractPdfText(pathE), extractPdfText(pathL)]);
+  const secE = extractSection(textE, key);
+  const secL = extractSection(textL, key);
+
+  const result: CompareResult = {
+    section: key,
+    sectionLabel: SECTION_LABELS[key],
+    earlier: { ...meta(earlierF), found: !!secE },
+    later: { ...meta(laterF), found: !!secL },
+    diff: null,
+    changelog: null,
+    costUsd: 0,
+  };
+
+  if (!secE || !secL) {
+    const missing = [!secE ? `the ${earlierF.filingType}` : null, !secL ? `the ${laterF.filingType}` : null]
+      .filter(Boolean)
+      .join(" and ");
+    result.note = `Couldn't locate the "${SECTION_LABELS[key]}" section in ${missing}. Extraction from rendered PDFs is approximate and can miss non-standard formatting.`;
+    return result;
+  }
+
+  result.diff = computeDiff(secE, secL);
+
+  const { changelog, usage } = await claudeCompare(
+    SECTION_LABELS[key],
+    { form: earlierF.filingType, date: earlierF.filingDate || "unknown", text: secE },
+    { form: laterF.filingType, date: laterF.filingDate || "unknown", text: secL },
+  );
+  result.changelog = changelog;
+  result.costUsd = Math.round(((usage.inputTokens * 5 + usage.outputTokens * 25) / 1_000_000) * 100) / 100;
+  return result;
+}
