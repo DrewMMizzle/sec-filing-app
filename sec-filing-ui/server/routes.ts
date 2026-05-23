@@ -574,6 +574,20 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     res.json({ reviewEnabled: isReviewEnabled() });
   });
 
+  // Actual Claude spend so far, from recorded per-filing token usage.
+  // Opus 4.7 pricing per 1M tokens: input $5, output $25, cache read $0.50,
+  // cache write $6.25.
+  app.get("/api/review/usage", requireAuth, async (req, res) => {
+    const u = await storage.getReviewUsage(req.user!.id);
+    const costUsd =
+      (u.inputTokens * 5 +
+        u.outputTokens * 25 +
+        u.cacheReadTokens * 0.5 +
+        u.cacheCreationTokens * 6.25) /
+      1_000_000;
+    res.json({ ...u, costUsd: Math.round(costUsd * 100) / 100 });
+  });
+
   // ─── Per-finding triage (star / posted / dismissed) ──────
 
   app.get("/api/finding-actions", requireAuth, async (req, res) => {

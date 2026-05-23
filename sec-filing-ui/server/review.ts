@@ -106,11 +106,18 @@ async function extractPdfText(absPath: string): Promise<string> {
 }
 
 type Finding = { category: string; headline: string; detail: string; why: string };
+type Usage = {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+};
 type ReviewResult = {
   interesting: boolean;
   interestingness: string;
   summary: string;
   findings: Finding[];
+  usage: Usage;
 };
 
 async function callClaude(filing: Filing, text: string): Promise<ReviewResult> {
@@ -144,11 +151,18 @@ async function callClaude(filing: Filing, text: string): Promise<ReviewResult> {
   }
   const parsed = JSON.parse(textBlock.text) as Partial<ReviewResult>;
   const findings = Array.isArray(parsed.findings) ? parsed.findings : [];
+  const u = message.usage;
   return {
     interesting: !!parsed.interesting,
     interestingness: parsed.interestingness || (findings.length > 0 ? "low" : "none"),
     summary: parsed.summary || "",
     findings,
+    usage: {
+      inputTokens: u?.input_tokens ?? 0,
+      outputTokens: u?.output_tokens ?? 0,
+      cacheReadTokens: u?.cache_read_input_tokens ?? 0,
+      cacheCreationTokens: u?.cache_creation_input_tokens ?? 0,
+    },
   };
 }
 
@@ -159,7 +173,7 @@ async function reviewOne(filing: Filing): Promise<void> {
     if (!pdfPath) throw new Error("Rendered PDF not found on disk");
     const text = await extractPdfText(pdfPath);
     const result = await callClaude(filing, text);
-    await storage.setFilingReviewResult(filing.accessionNumber, result);
+    await storage.setFilingReviewResult(filing.accessionNumber, result, result.usage);
   } catch (err: any) {
     console.error(`[review] Failed for ${filing.accessionNumber}:`, err?.message || err);
     await storage.setFilingReviewError(filing.accessionNumber, String(err?.message || err));
