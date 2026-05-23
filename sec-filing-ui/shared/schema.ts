@@ -65,6 +65,11 @@ export const filings = pgTable("filings", {
   reviewFindings: text("review_findings"),      // JSON array of findings [{category, headline, detail, why}]
   reviewError: text("review_error"),
   reviewedAt: text("reviewed_at"),
+  // Actual Claude token usage from the review (for cost tracking)
+  reviewInputTokens: integer("review_input_tokens"),
+  reviewOutputTokens: integer("review_output_tokens"),
+  reviewCacheReadTokens: integer("review_cache_read_tokens"),
+  reviewCacheCreationTokens: integer("review_cache_creation_tokens"),
 }, (table) => [
   index("idx_filings_ticker").on(table.ticker),
   index("idx_filings_status").on(table.status),

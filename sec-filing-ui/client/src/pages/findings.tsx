@@ -91,6 +91,10 @@ export default function Findings() {
     },
   });
 
+  const reviewing = filings.some(
+    (f) => f.reviewStatus === "pending" || f.reviewStatus === "reviewing",
+  );
+
   const { data: actions = [] } = useQuery<FindingAction[]>({
     queryKey: ["/api/finding-actions"],
   });
@@ -99,6 +103,12 @@ export default function Findings() {
     queryKey: ["/api/config"],
   });
   const reviewEnabled = config?.reviewEnabled ?? false;
+
+  // Actual Claude spend so far; poll while reviews are running so it ticks up.
+  const { data: usage } = useQuery<{ reviewedCount: number; costUsd: number }>({
+    queryKey: ["/api/review/usage"],
+    refetchInterval: reviewing ? 5000 : false,
+  });
 
   const { toast } = useToast();
 
@@ -187,10 +197,6 @@ export default function Findings() {
     return true;
   });
 
-  const reviewing = filings.some(
-    (f) => f.reviewStatus === "pending" || f.reviewStatus === "reviewing",
-  );
-
   const toggleCat = (c: string) =>
     setActiveCats((prev) => {
       const next = new Set(prev);
@@ -217,6 +223,14 @@ export default function Findings() {
           <p className="text-sm text-muted-foreground">
             Post-worthy details Claude surfaced across your reviewed filings — triage, then open the source.
           </p>
+          {usage && usage.reviewedCount > 0 && (
+            <p className="text-xs text-muted-foreground mt-1" data-testid="text-review-spend">
+              Claude review spend so far:{" "}
+              <span className="text-foreground font-medium">${usage.costUsd.toFixed(2)}</span> across{" "}
+              {usage.reviewedCount} filing{usage.reviewedCount !== 1 ? "s" : ""}
+              {reviewing && <span className="text-amber-400"> · updating…</span>}
+            </p>
+          )}
         </div>
         <div className="flex items-center gap-2 shrink-0">
           {reviewEnabled && (reviewableCount > 0 || reviewing) && (

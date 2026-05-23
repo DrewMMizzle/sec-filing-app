@@ -80,6 +80,10 @@ export async function initDatabase(): Promise<void> {
     ALTER TABLE filings ADD COLUMN IF NOT EXISTS review_findings TEXT;
     ALTER TABLE filings ADD COLUMN IF NOT EXISTS review_error TEXT;
     ALTER TABLE filings ADD COLUMN IF NOT EXISTS reviewed_at TEXT;
+    ALTER TABLE filings ADD COLUMN IF NOT EXISTS review_input_tokens INTEGER;
+    ALTER TABLE filings ADD COLUMN IF NOT EXISTS review_output_tokens INTEGER;
+    ALTER TABLE filings ADD COLUMN IF NOT EXISTS review_cache_read_tokens INTEGER;
+    ALTER TABLE filings ADD COLUMN IF NOT EXISTS review_cache_creation_tokens INTEGER;
     CREATE INDEX IF NOT EXISTS idx_filings_review_status ON filings(review_status);
 
     -- Proxy statements (DEF 14A) are core to footnoted-style review. Add the
@@ -361,6 +365,12 @@ export class DatabaseStorage {
   async setFilingReviewResult(
     accession: string,
     result: { interesting: boolean; interestingness: string; summary: string; findings: unknown[] },
+    usage?: {
+      inputTokens: number;
+      outputTokens: number;
+      cacheReadTokens: number;
+      cacheCreationTokens: number;
+    },
   ): Promise<void> {
     await db
       .update(filings)
@@ -370,10 +380,42 @@ export class DatabaseStorage {
         reviewMateriality: result.interestingness,
         reviewSummary: result.summary,
         reviewFindings: JSON.stringify(result.findings),
+        reviewInputTokens: usage?.inputTokens ?? null,
+        reviewOutputTokens: usage?.outputTokens ?? null,
+        reviewCacheReadTokens: usage?.cacheReadTokens ?? null,
+        reviewCacheCreationTokens: usage?.cacheCreationTokens ?? null,
         reviewError: null,
         reviewedAt: new Date().toISOString(),
       })
       .where(eq(filings.accessionNumber, accession));
+  }
+
+  async getReviewUsage(userId: number): Promise<{
+    reviewedCount: number;
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheCreationTokens: number;
+  }> {
+    const result = await pool.query(
+      `SELECT
+         COUNT(*) FILTER (WHERE review_input_tokens IS NOT NULL) AS reviewed_count,
+         COALESCE(SUM(review_input_tokens), 0) AS input_tokens,
+         COALESCE(SUM(review_output_tokens), 0) AS output_tokens,
+         COALESCE(SUM(review_cache_read_tokens), 0) AS cache_read_tokens,
+         COALESCE(SUM(review_cache_creation_tokens), 0) AS cache_creation_tokens
+       FROM filings
+       WHERE user_id = $1`,
+      [userId],
+    );
+    const row = result.rows[0];
+    return {
+      reviewedCount: parseInt(row.reviewed_count, 10),
+      inputTokens: parseInt(row.input_tokens, 10),
+      outputTokens: parseInt(row.output_tokens, 10),
+      cacheReadTokens: parseInt(row.cache_read_tokens, 10),
+      cacheCreationTokens: parseInt(row.cache_creation_tokens, 10),
+    };
   }
 
   async setFilingReviewError(accession: string, message: string): Promise<void> {
