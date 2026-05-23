@@ -42,15 +42,18 @@ cd sec-filing-ui
 npm install
 ```
 
-Set `DATABASE_URL` to a PostgreSQL connection string (required — the server exits on startup without it). Tables are auto-created on first run:
+Set `DATABASE_URL` to a PostgreSQL connection string (required — the server exits on startup without it):
 ```
 DATABASE_URL=postgres://user:password@localhost:5432/sec_filings
 ```
 
-Then start the dev server:
+Create the database schema (run once against a fresh database), then start the dev server:
 ```bash
+npm run db:push
 npm run dev
 ```
+
+On signup, each user is automatically given an editable **S&P 500** watchlist pre-loaded with the index constituents, so they can fetch filings without building a list first.
 
 The dev server starts on port 5000 (override with the `PORT` env var). The UI calls the Python pipeline for fetching/rendering.
 
