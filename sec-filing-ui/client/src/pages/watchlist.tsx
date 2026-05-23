@@ -71,7 +71,7 @@ export default function WatchlistPage() {
   // State
   const [addOpen, setAddOpen] = useState(false);
   const [tickerInput, setTickerInput] = useState("");
-  const [selectedTypes, setSelectedTypes] = useState<string[]>(["10-K", "10-Q", "8-K"]);
+  const [selectedTypes, setSelectedTypes] = useState<string[]>(["10-K", "10-Q", "8-K", "DEF 14A"]);
   const [renameOpen, setRenameOpen] = useState(false);
   const [renameName, setRenameName] = useState("");
   const [deleteOpen, setDeleteOpen] = useState(false);
@@ -126,7 +126,7 @@ export default function WatchlistPage() {
       queryClient.invalidateQueries({ queryKey: ["/api/watchlists"] });
       setAddOpen(false);
       setTickerInput("");
-      setSelectedTypes(["10-K", "10-Q", "8-K"]);
+      setSelectedTypes(["10-K", "10-Q", "8-K", "DEF 14A"]);
       toast({ title: "Ticker added" });
     },
     onError: (err: Error) => {

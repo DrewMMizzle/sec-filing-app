@@ -333,7 +333,7 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
 
       const types = Array.isArray(filingTypes) && filingTypes.length > 0
         ? filingTypes
-        : ["10-K", "10-Q", "8-K"];
+        : ["10-K", "10-Q", "8-K", "DEF 14A"];
 
       const newTicker = await storage.addTicker({
         watchlistId,
@@ -567,6 +567,26 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     child.on("error", (err) => {
       res.status(500).json({ error: `Failed to start pipeline: ${err.message}` });
     });
+  });
+
+  // Whether Claude review is configured, so the UI can show the right state
+  app.get("/api/config", requireAuth, (_req, res) => {
+    res.json({ reviewEnabled: isReviewEnabled() });
+  });
+
+  // Review filings already in the library (not just freshly fetched ones)
+  app.post("/api/filings/review", requireAuth, async (req, res) => {
+    const userId = req.user!.id;
+    if (!isReviewEnabled()) {
+      return res
+        .status(409)
+        .json({ error: "Claude review is not configured (ANTHROPIC_API_KEY is not set)." });
+    }
+    const queued = await storage.markCompleteFilingsForReview(userId);
+    if (queued > 0) {
+      kickReviewProcessor().catch((err) => console.error("Review processor failed:", err));
+    }
+    res.json({ queued });
   });
 
   // Download a PDF by accession number

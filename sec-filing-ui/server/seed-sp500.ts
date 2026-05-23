@@ -7,7 +7,7 @@ const SEC_COMPANY_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 const SEC_USER_AGENT = process.env.SEC_USER_AGENT || "DotAdda ameister@dotadda.com";
 
 export const SP500_WATCHLIST_NAME = "S&P 500";
-const DEFAULT_FILING_TYPES = '["10-K","10-Q","8-K"]';
+const DEFAULT_FILING_TYPES = '["10-K","10-Q","8-K","DEF 14A"]';
 
 export type ResolvedTicker = { ticker: string; cik: string };
 

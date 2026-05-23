@@ -18,7 +18,7 @@ import {
 } from "@shared/schema";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
-import { eq, and, gte, lte, desc, inArray, sql, or } from "drizzle-orm";
+import { eq, and, gte, lte, desc, inArray, sql, or, isNull } from "drizzle-orm";
 
 const DATABASE_URL = process.env.DATABASE_URL;
 if (!DATABASE_URL) {
@@ -74,9 +74,17 @@ export async function initDatabase(): Promise<void> {
     ALTER TABLE filings ADD COLUMN IF NOT EXISTS review_flagged BOOLEAN;
     ALTER TABLE filings ADD COLUMN IF NOT EXISTS review_materiality TEXT;
     ALTER TABLE filings ADD COLUMN IF NOT EXISTS review_summary TEXT;
+    ALTER TABLE filings ADD COLUMN IF NOT EXISTS review_findings TEXT;
     ALTER TABLE filings ADD COLUMN IF NOT EXISTS review_error TEXT;
     ALTER TABLE filings ADD COLUMN IF NOT EXISTS reviewed_at TEXT;
     CREATE INDEX IF NOT EXISTS idx_filings_review_status ON filings(review_status);
+
+    -- Proxy statements (DEF 14A) are core to footnoted-style review. Add the
+    -- form to any existing watchlist ticker that doesn't already track it.
+    UPDATE tickers
+      SET filing_types = ((filing_types::jsonb) || '["DEF 14A"]'::jsonb)::text
+      WHERE filing_types IS NOT NULL
+        AND NOT ((filing_types::jsonb) ? 'DEF 14A');
 
     CREATE TABLE IF NOT EXISTS watchlist_shares (
       id SERIAL PRIMARY KEY,
@@ -302,6 +310,23 @@ export class DatabaseStorage {
     await db.update(filings).set({ reviewStatus: "pending" }).where(eq(filings.accessionNumber, accession));
   }
 
+  // Queue every rendered filing for this user that hasn't been successfully
+  // reviewed yet (never reviewed or previously errored). Returns the count.
+  async markCompleteFilingsForReview(userId: number): Promise<number> {
+    const rows = await db
+      .update(filings)
+      .set({ reviewStatus: "pending" })
+      .where(
+        and(
+          eq(filings.userId, userId),
+          eq(filings.status, "complete"),
+          or(isNull(filings.reviewStatus), eq(filings.reviewStatus, "error")),
+        ),
+      )
+      .returning({ id: filings.id });
+    return rows.length;
+  }
+
   async requeueStaleReviews(): Promise<void> {
     // Reset rows left mid-review by a crash/restart back to the queue.
     await db.update(filings).set({ reviewStatus: "pending" }).where(eq(filings.reviewStatus, "reviewing"));
@@ -321,15 +346,16 @@ export class DatabaseStorage {
 
   async setFilingReviewResult(
     accession: string,
-    result: { flagged: boolean; materiality: string; summary: string },
+    result: { interesting: boolean; interestingness: string; summary: string; findings: unknown[] },
   ): Promise<void> {
     await db
       .update(filings)
       .set({
         reviewStatus: "done",
-        reviewFlagged: result.flagged,
-        reviewMateriality: result.materiality,
+        reviewFlagged: result.interesting,
+        reviewMateriality: result.interestingness,
         reviewSummary: result.summary,
+        reviewFindings: JSON.stringify(result.findings),
         reviewError: null,
         reviewedAt: new Date().toISOString(),
       })
