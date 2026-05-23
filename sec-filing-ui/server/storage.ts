@@ -9,12 +9,15 @@ import {
   type InsertFiling,
   type WatchlistShare,
   type InsertWatchlistShare,
+  type FindingAction,
+  type InsertFindingAction,
   users,
   sessions,
   watchlists,
   tickers,
   filings,
   watchlistShares,
+  findingActions,
 } from "@shared/schema";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
@@ -95,6 +98,17 @@ export async function initDatabase(): Promise<void> {
     );
     CREATE UNIQUE INDEX IF NOT EXISTS idx_share_unique ON watchlist_shares(watchlist_id, shared_with_user_id);
     CREATE INDEX IF NOT EXISTS idx_shares_user ON watchlist_shares(shared_with_user_id);
+
+    CREATE TABLE IF NOT EXISTS finding_actions (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      accession_number TEXT NOT NULL,
+      finding_index INTEGER NOT NULL,
+      status TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_finding_action_unique ON finding_actions(user_id, accession_number, finding_index);
+    CREATE INDEX IF NOT EXISTS idx_finding_actions_user ON finding_actions(user_id);
 
     -- Indexes for performance at scale
     CREATE INDEX IF NOT EXISTS idx_tickers_watchlist ON tickers(watchlist_id);
@@ -367,6 +381,51 @@ export class DatabaseStorage {
       .update(filings)
       .set({ reviewStatus: "error", reviewError: message, reviewedAt: new Date().toISOString() })
       .where(eq(filings.accessionNumber, accession));
+  }
+
+  // ─── Per-finding triage actions ─────────────────────────
+
+  async getFindingActions(userId: number): Promise<FindingAction[]> {
+    return db.select().from(findingActions).where(eq(findingActions.userId, userId));
+  }
+
+  async setFindingAction(
+    userId: number,
+    accessionNumber: string,
+    findingIndex: number,
+    status: string,
+  ): Promise<void> {
+    const existing = await db
+      .select()
+      .from(findingActions)
+      .where(
+        and(
+          eq(findingActions.userId, userId),
+          eq(findingActions.accessionNumber, accessionNumber),
+          eq(findingActions.findingIndex, findingIndex),
+        ),
+      );
+    const updatedAt = new Date().toISOString();
+    if (existing[0]) {
+      await db
+        .update(findingActions)
+        .set({ status, updatedAt })
+        .where(eq(findingActions.id, existing[0].id));
+    } else {
+      await db.insert(findingActions).values({ userId, accessionNumber, findingIndex, status, updatedAt });
+    }
+  }
+
+  async clearFindingAction(userId: number, accessionNumber: string, findingIndex: number): Promise<void> {
+    await db
+      .delete(findingActions)
+      .where(
+        and(
+          eq(findingActions.userId, userId),
+          eq(findingActions.accessionNumber, accessionNumber),
+          eq(findingActions.findingIndex, findingIndex),
+        ),
+      );
   }
 
   async deleteFiling(id: number): Promise<Filing | undefined> {
