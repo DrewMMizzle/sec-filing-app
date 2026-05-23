@@ -43,6 +43,13 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
   // Initialize database tables + indexes
   await initDatabase();
 
+  // ─── Health check (public, unauthenticated) ─────────────
+  // Used by Railway's deploy probe, which sends no auth cookie. Must stay
+  // outside requireAuth so it returns 200 instead of 401.
+  app.get("/healthz", (_req, res) => {
+    res.status(200).json({ status: "ok" });
+  });
+
   // ─── Auth Routes ────────────────────────────────────────
 
   app.post("/api/auth/register", async (req, res) => {
