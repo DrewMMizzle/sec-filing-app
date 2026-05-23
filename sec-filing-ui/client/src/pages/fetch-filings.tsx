@@ -116,6 +116,11 @@ export default function FetchFilings() {
     queryKey: ["/api/watchlists"],
   });
 
+  const { data: config } = useQuery<{ reviewEnabled: boolean }>({
+    queryKey: ["/api/config"],
+  });
+  const reviewEnabled = config?.reviewEnabled ?? false;
+
   const { data: existingFilings = [], refetch: refetchFilings } = useQuery<Filing[]>({
     queryKey: ["/api/filings"],
     // While Claude is reviewing filings, poll so flags appear as they complete.
@@ -204,6 +209,28 @@ export default function FetchFilings() {
     onError: (err: Error) => {
       toast({ title: "Error", description: err.message, variant: "destructive" });
     },
+  });
+
+  // Review filings already in the library (not just freshly fetched ones)
+  const reviewMutation = useMutation<{ queued: number }>({
+    mutationFn: async () => {
+      const res = await apiRequest("POST", "/api/filings/review");
+      if (!res.ok) {
+        const body = await res.json();
+        throw new Error(body.error || "Review request failed");
+      }
+      return res.json();
+    },
+    onSuccess: (data) => {
+      refetchFilings();
+      toast({
+        title:
+          data.queued > 0
+            ? `Queued ${data.queued} filing${data.queued !== 1 ? "s" : ""} for review`
+            : "All filings are already reviewed",
+      });
+    },
+    onError: (err: Error) => toast({ title: "Error", description: err.message, variant: "destructive" }),
   });
 
   const handleFetch = () => {
@@ -383,8 +410,19 @@ export default function FetchFilings() {
         </div>
       </Card>
 
+      {/* Claude review unavailable notice */}
+      {config && !reviewEnabled && (
+        <Card className="p-3 mb-4 flex items-center gap-2 border-amber-600/30" data-testid="card-review-disabled">
+          <AlertCircle className="w-4 h-4 text-amber-400 shrink-0" />
+          <p className="text-xs text-muted-foreground">
+            Claude review is off. Set <code className="text-foreground">ANTHROPIC_API_KEY</code> in the
+            environment to have filings reviewed for footnoted-worthy findings.
+          </p>
+        </Card>
+      )}
+
       {/* Results */}
-      <div className="mb-4 flex items-center justify-between">
+      <div className="mb-4 flex items-center justify-between gap-3">
         <h2 className="text-lg font-semibold">
           Rendered PDFs
           {completedFilings.length > 0 && (
@@ -393,6 +431,22 @@ export default function FetchFilings() {
             </span>
           )}
         </h2>
+        {reviewEnabled && completedFilings.length > 0 && (
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => reviewMutation.mutate()}
+            disabled={reviewMutation.isPending || reviewingCount > 0}
+            data-testid="button-review-library"
+          >
+            {reviewMutation.isPending || reviewingCount > 0 ? (
+              <Loader2 className="w-3.5 h-3.5 mr-1.5 animate-spin" />
+            ) : (
+              <ShieldAlert className="w-3.5 h-3.5 mr-1.5" />
+            )}
+            Review with Claude
+          </Button>
+        )}
       </div>
 
       {showReviewBanner && (

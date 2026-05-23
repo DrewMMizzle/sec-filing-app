@@ -18,7 +18,7 @@ import {
 } from "@shared/schema";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
-import { eq, and, gte, lte, desc, inArray, sql, or } from "drizzle-orm";
+import { eq, and, gte, lte, desc, inArray, sql, or, isNull } from "drizzle-orm";
 
 const DATABASE_URL = process.env.DATABASE_URL;
 if (!DATABASE_URL) {
@@ -308,6 +308,23 @@ export class DatabaseStorage {
 
   async markFilingForReview(accession: string): Promise<void> {
     await db.update(filings).set({ reviewStatus: "pending" }).where(eq(filings.accessionNumber, accession));
+  }
+
+  // Queue every rendered filing for this user that hasn't been successfully
+  // reviewed yet (never reviewed or previously errored). Returns the count.
+  async markCompleteFilingsForReview(userId: number): Promise<number> {
+    const rows = await db
+      .update(filings)
+      .set({ reviewStatus: "pending" })
+      .where(
+        and(
+          eq(filings.userId, userId),
+          eq(filings.status, "complete"),
+          or(isNull(filings.reviewStatus), eq(filings.reviewStatus, "error")),
+        ),
+      )
+      .returning({ id: filings.id });
+    return rows.length;
   }
 
   async requeueStaleReviews(): Promise<void> {
