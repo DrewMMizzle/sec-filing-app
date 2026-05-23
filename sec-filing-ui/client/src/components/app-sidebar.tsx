@@ -27,7 +27,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { useToast } from "@/hooks/use-toast";
-import { List, Plus, FileText, Search, Database, LogOut, Share2, User, Sparkles } from "lucide-react";
+import { List, Plus, FileText, Search, Database, LogOut, Share2, User, Sparkles, GitCompareArrows } from "lucide-react";
 
 type WatchlistSummary = {
   id: number;
@@ -131,6 +131,18 @@ export function AppSidebar() {
                     <Link href="/fetch">
                       <Search className="w-4 h-4" />
                       <span>Fetch Filings</span>
+                    </Link>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+                <SidebarMenuItem>
+                  <SidebarMenuButton
+                    asChild
+                    isActive={location === "/compare"}
+                    data-testid="nav-compare"
+                  >
+                    <Link href="/compare">
+                      <GitCompareArrows className="w-4 h-4" />
+                      <span>Compare</span>
                     </Link>
                   </SidebarMenuButton>
                 </SidebarMenuItem>

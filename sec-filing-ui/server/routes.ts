@@ -9,6 +9,7 @@ import { fileURLToPath } from "url";
 import { hashPassword, verifyPassword, createSession, clearSession, requireAuth } from "./auth";
 import { ensureSP500Seeded } from "./seed-sp500";
 import { isReviewEnabled, kickReviewProcessor } from "./review";
+import { compareFilings, SECTION_LABELS, type SectionKey } from "./compare";
 import { db } from "./storage";
 import { tickers as tickersTable, filings as filingsTable } from "@shared/schema";
 import { eq } from "drizzle-orm";
@@ -586,6 +587,43 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
         u.cacheCreationTokens * 6.25) /
       1_000_000;
     res.json({ ...u, costUsd: Math.round(costUsd * 100) / 100 });
+  });
+
+  // Compare a section (e.g. Risk Factors) between two filings of the same company
+  app.post("/api/compare", requireAuth, async (req, res) => {
+    const userId = req.user!.id;
+    if (!isReviewEnabled()) {
+      return res
+        .status(409)
+        .json({ error: "Claude review is not configured (ANTHROPIC_API_KEY is not set)." });
+    }
+    const { accessionA, accessionB, section } = req.body as {
+      accessionA?: string;
+      accessionB?: string;
+      section?: string;
+    };
+    if (!accessionA || !accessionB) {
+      return res.status(400).json({ error: "accessionA and accessionB are required" });
+    }
+    if (accessionA === accessionB) {
+      return res.status(400).json({ error: "Pick two different filings" });
+    }
+    if (!section || !(section in SECTION_LABELS)) {
+      return res.status(400).json({ error: "Invalid section" });
+    }
+    const fa = await storage.getFilingByAccession(accessionA);
+    const fb = await storage.getFilingByAccession(accessionB);
+    if (!fa || !fb) return res.status(404).json({ error: "Filing not found" });
+    if (fa.userId !== userId || fb.userId !== userId) {
+      return res.status(403).json({ error: "Access denied" });
+    }
+    try {
+      const result = await compareFilings(fa, fb, section as SectionKey);
+      res.json(result);
+    } catch (e: any) {
+      console.error("Comparison failed:", e?.message || e);
+      res.status(500).json({ error: e?.message || "Comparison failed" });
+    }
   });
 
   // ─── Per-finding triage (star / posted / dismissed) ──────
