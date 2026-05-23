@@ -79,11 +79,12 @@ const SECTION_KEYS = SECTIONS.map((s) => s.key);
 
 // Forms that contain the comparable sections (excludes 8-K)
 const HISTORY_FORMS = ["10-K", "10-Q", "DEF 14A"];
-const HISTORY_LIMIT = 20;
+const HISTORY_LIMIT = 30;
+const HISTORY_YEARS = 3;
 
-function twoYearsAgo(): string {
+function historyStartDate(): string {
   const d = new Date();
-  d.setFullYear(d.getFullYear() - 2);
+  d.setFullYear(d.getFullYear() - HISTORY_YEARS);
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
 
@@ -132,13 +133,13 @@ export default function Compare() {
 
   const selectedEntry = allTickers.find((t) => t.ticker === ticker);
 
-  // Load the last 2 years of comparable filings for this ticker into the library
+  // Load the last few years of comparable filings for this ticker into the library
   const loadHistoryMutation = useMutation({
     mutationFn: async () => {
       if (!selectedEntry) throw new Error("Pick a ticker first");
       const res = await apiRequest("POST", "/api/filings/fetch", {
         tickers: [{ ticker: selectedEntry.ticker, cik: selectedEntry.cik, filing_types: HISTORY_FORMS }],
-        dateFrom: twoYearsAgo(),
+        dateFrom: historyStartDate(),
         limitPerTicker: HISTORY_LIMIT,
       });
       if (!res.ok) {
@@ -269,7 +270,7 @@ export default function Compare() {
                 ) : (
                   <History className="w-3.5 h-3.5 mr-1.5" />
                 )}
-                Load last 2 years
+                Load last 3 years
               </Button>
             </div>
 
@@ -307,7 +308,7 @@ export default function Compare() {
             </div>
             {tickerFilings.length < 2 && (
               <p className="text-xs text-muted-foreground">
-                Need at least two rendered filings for {ticker}. Use “Load last 2 years” to pull more history.
+                Need at least two rendered filings for {ticker}. Use “Load last 3 years” to pull more history.
               </p>
             )}
 
@@ -443,10 +444,10 @@ export default function Compare() {
       <AlertDialog open={confirmLoad} onOpenChange={setConfirmLoad}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Load 2 years of {ticker} filings?</AlertDialogTitle>
+            <AlertDialogTitle>Load {HISTORY_YEARS} years of {ticker} filings?</AlertDialogTitle>
             <AlertDialogDescription>
               Fetches and renders up to {HISTORY_LIMIT} recent {HISTORY_FORMS.join(" / ")} filings from the
-              last 2 years. New ones are reviewed by Claude
+              last {HISTORY_YEARS} years. New ones are reviewed by Claude
               {reviewEnabled
                 ? ` (estimated cost up to ${formatCostRange(estimateReviewCost(Array(HISTORY_LIMIT).fill("10-K")))})`
                 : ""}
