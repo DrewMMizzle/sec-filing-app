@@ -74,9 +74,17 @@ export async function initDatabase(): Promise<void> {
     ALTER TABLE filings ADD COLUMN IF NOT EXISTS review_flagged BOOLEAN;
     ALTER TABLE filings ADD COLUMN IF NOT EXISTS review_materiality TEXT;
     ALTER TABLE filings ADD COLUMN IF NOT EXISTS review_summary TEXT;
+    ALTER TABLE filings ADD COLUMN IF NOT EXISTS review_findings TEXT;
     ALTER TABLE filings ADD COLUMN IF NOT EXISTS review_error TEXT;
     ALTER TABLE filings ADD COLUMN IF NOT EXISTS reviewed_at TEXT;
     CREATE INDEX IF NOT EXISTS idx_filings_review_status ON filings(review_status);
+
+    -- Proxy statements (DEF 14A) are core to footnoted-style review. Add the
+    -- form to any existing watchlist ticker that doesn't already track it.
+    UPDATE tickers
+      SET filing_types = ((filing_types::jsonb) || '["DEF 14A"]'::jsonb)::text
+      WHERE filing_types IS NOT NULL
+        AND NOT ((filing_types::jsonb) ? 'DEF 14A');
 
     CREATE TABLE IF NOT EXISTS watchlist_shares (
       id SERIAL PRIMARY KEY,
@@ -321,15 +329,16 @@ export class DatabaseStorage {
 
   async setFilingReviewResult(
     accession: string,
-    result: { flagged: boolean; materiality: string; summary: string },
+    result: { interesting: boolean; interestingness: string; summary: string; findings: unknown[] },
   ): Promise<void> {
     await db
       .update(filings)
       .set({
         reviewStatus: "done",
-        reviewFlagged: result.flagged,
-        reviewMateriality: result.materiality,
+        reviewFlagged: result.interesting,
+        reviewMateriality: result.interestingness,
         reviewSummary: result.summary,
+        reviewFindings: JSON.stringify(result.findings),
         reviewError: null,
         reviewedAt: new Date().toISOString(),
       })

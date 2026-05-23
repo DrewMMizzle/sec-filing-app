@@ -333,7 +333,7 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
 
       const types = Array.isArray(filingTypes) && filingTypes.length > 0
         ? filingTypes
-        : ["10-K", "10-Q", "8-K"];
+        : ["10-K", "10-Q", "8-K", "DEF 14A"];
 
       const newTicker = await storage.addTicker({
         watchlistId,

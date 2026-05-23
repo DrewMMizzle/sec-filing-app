@@ -28,36 +28,62 @@ function client(): Anthropic {
   return _client;
 }
 
-const SYSTEM_PROMPT = `You are a securities-disclosure analyst reviewing a single SEC filing for an investor. Your job is to decide whether the filing contains a MATERIAL DISCLOSURE — information a reasonable investor would consider important to an investment or voting decision, or that would significantly alter the total mix of available information.
+const SYSTEM_PROMPT = `You are an investigative editor for footnoted.com, a publication that digs through SEC filings to find the buried, easy-to-miss, often telling details that make a great story — the kind of thing most readers and even most analysts skim right past. You are NOT looking for the big, obvious headline event. You are looking for what's hiding in the footnotes, the exhibits, the compensation tables, and the lawyerly language.
 
-Treat the following as material when present and substantive (not boilerplate or hypothetical risk-factor language):
-- Mergers, acquisitions, divestitures, or major asset sales
-- Bankruptcy, going-concern doubt, or covenant defaults
-- Material litigation, regulatory actions, investigations, or settlements
-- Financial restatements, material weaknesses in internal controls, or auditor changes/disagreements
-- Earnings or guidance changes, material impairments or write-downs, or large unexpected charges
-- Executive or board changes (CEO/CFO/Chair departures or appointments)
-- Material debt issuance/refinancing, equity offerings, dividend changes, or buybacks
-- Major customer/contract wins or losses, supply disruptions, or cybersecurity incidents/breaches
-- Delisting notices or other significant corporate events
+Read the filing and surface DISCRETE, POST-WORTHY FINDINGS. Hunt hardest for:
 
-Do NOT flag generic, forward-looking, or hypothetical risk-factor boilerplate, routine recurring disclosures, or immaterial administrative items.
+- Executive perks & compensation oddities: personal use of corporate aircraft, security details, club memberships, tax gross-ups, relocation packages, large "all other compensation" lines, consulting deals for departing execs, unusual or outsized bonuses, repriced/backdated options, perks for family members.
+- Severance & golden parachutes: large or quietly-enriched separation payments, change-in-control payouts, accelerated vesting, employment-agreement amendments, non-competes being waived, clawback provisions weakened or not enforced.
+- Related-party & insider dealings: transactions with directors, officers, their family members or affiliated entities; insider loans; shares pledged as collateral or margined; leases/contracts with insiders; sweetheart arrangements.
+- Language, governance & accounting tells: new or materially changed risk-factor language, defensive/"CYA" wording, auditor changes or disagreements, going-concern doubt, restatements, material weaknesses, changes in accounting treatment, unusual one-time charges, governance changes that entrench management.
 
-Judge materiality conservatively and specifically: cite the concrete event(s) in the filing, not generic categories. If the extracted text is empty or unreadable, return flagged=false, materiality="none", and say so in the summary.
+What makes a good finding: it's specific, it's somewhat buried or non-obvious, and a sharp financial journalist would want to write a short post about it. A finding can be small if it's revealing. Quote or closely paraphrase the actual language/numbers and say where it appears (e.g. "in the Summary Compensation Table footnotes", "Exhibit 10.2", "Item 5").
+
+Be selective and skeptical. Do NOT manufacture findings. Skip routine boilerplate, standard recurring disclosures, generic forward-looking risk language, and ordinary administrative items. It is completely fine — and common — to return zero findings for an unremarkable filing.
+
+If the extracted text is empty or unreadable, return interesting=false, interestingness="none", an empty findings array, and say so in the summary.
 
 Respond ONLY with the structured JSON the schema requires:
-- flagged: true only if at least one material disclosure is present
-- materiality: overall significance ("high", "medium", "low", or "none")
-- summary: 1-4 sentences. If flagged, explain specifically what the material disclosure is and why it matters. If not flagged, briefly state that nothing material was found.`;
+- interesting: true if there is at least one post-worthy finding
+- interestingness: overall editorial interest of the filing ("high", "medium", "low", or "none")
+- summary: 1-2 sentences giving the editor the lead — the single most post-worthy angle, or that nothing notable was found
+- findings: an array (possibly empty) where each item has:
+    - category: one of "perks_comp", "severance_parachute", "related_party_insider", "language_governance_accounting", "other"
+    - headline: a punchy, specific draft headline/angle a writer could build a post from
+    - detail: the concrete buried detail — quote or closely paraphrase the language/numbers and note where in the filing it appears
+    - why: one sentence on why it's interesting or post-worthy`;
+
+const FINDING_CATEGORIES = [
+  "perks_comp",
+  "severance_parachute",
+  "related_party_insider",
+  "language_governance_accounting",
+  "other",
+];
 
 const REVIEW_SCHEMA = {
   type: "object",
   properties: {
-    flagged: { type: "boolean", description: "True if the filing contains a material disclosure" },
-    materiality: { type: "string", enum: ["high", "medium", "low", "none"] },
-    summary: { type: "string", description: "Why it was or wasn't flagged (1-4 sentences)" },
+    interesting: { type: "boolean", description: "True if there is at least one post-worthy finding" },
+    interestingness: { type: "string", enum: ["high", "medium", "low", "none"] },
+    summary: { type: "string", description: "1-2 sentence lead for the editor" },
+    findings: {
+      type: "array",
+      description: "Discrete post-worthy findings (may be empty)",
+      items: {
+        type: "object",
+        properties: {
+          category: { type: "string", enum: FINDING_CATEGORIES },
+          headline: { type: "string", description: "Punchy draft headline/angle" },
+          detail: { type: "string", description: "The buried detail, quoted/paraphrased, with location" },
+          why: { type: "string", description: "Why it's post-worthy (one sentence)" },
+        },
+        required: ["category", "headline", "detail", "why"],
+        additionalProperties: false,
+      },
+    },
   },
-  required: ["flagged", "materiality", "summary"],
+  required: ["interesting", "interestingness", "summary", "findings"],
   additionalProperties: false,
 };
 
@@ -79,7 +105,13 @@ async function extractPdfText(absPath: string): Promise<string> {
   }
 }
 
-type ReviewResult = { flagged: boolean; materiality: string; summary: string };
+type Finding = { category: string; headline: string; detail: string; why: string };
+type ReviewResult = {
+  interesting: boolean;
+  interestingness: string;
+  summary: string;
+  findings: Finding[];
+};
 
 async function callClaude(filing: Filing, text: string): Promise<ReviewResult> {
   const trimmed = text.length > MAX_CHARS;
@@ -110,11 +142,13 @@ async function callClaude(filing: Filing, text: string): Promise<ReviewResult> {
   if (!textBlock || textBlock.type !== "text") {
     throw new Error("No text block in Claude response");
   }
-  const parsed = JSON.parse(textBlock.text) as ReviewResult;
+  const parsed = JSON.parse(textBlock.text) as Partial<ReviewResult>;
+  const findings = Array.isArray(parsed.findings) ? parsed.findings : [];
   return {
-    flagged: !!parsed.flagged,
-    materiality: parsed.materiality || "none",
+    interesting: !!parsed.interesting,
+    interestingness: parsed.interestingness || (findings.length > 0 ? "low" : "none"),
     summary: parsed.summary || "",
+    findings,
   };
 }
 

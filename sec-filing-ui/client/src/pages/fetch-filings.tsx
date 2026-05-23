@@ -38,6 +38,26 @@ function parseYmd(s: string): Date | undefined {
   return new Date(y, m - 1, d);
 }
 
+type ReviewFinding = { category: string; headline: string; detail: string; why: string };
+
+const CATEGORY_LABELS: Record<string, string> = {
+  perks_comp: "Perks & comp",
+  severance_parachute: "Severance / parachute",
+  related_party_insider: "Related-party / insider",
+  language_governance_accounting: "Language / governance / accounting",
+  other: "Other",
+};
+
+function parseFindings(f: Filing): ReviewFinding[] {
+  if (!f.reviewFindings) return [];
+  try {
+    const parsed = JSON.parse(f.reviewFindings);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
 type TickerInfo = {
   ticker: string;
   cik: string;
@@ -204,12 +224,13 @@ export default function FetchFilings() {
 
   const completedFilings = filteredFilings.filter((f) => f.status === "complete");
 
-  // Material-disclosure review summary across the currently-shown filings
+  // Footnoted-style review summary across the currently-shown filings
   const reviewingCount = filteredFilings.filter(
     (f) => f.reviewStatus === "pending" || f.reviewStatus === "reviewing",
   ).length;
   const reviewedFilings = filteredFilings.filter((f) => f.reviewStatus === "done");
-  const flaggedCount = reviewedFilings.filter((f) => f.reviewFlagged).length;
+  const interestingCount = reviewedFilings.filter((f) => f.reviewFlagged).length;
+  const totalFindings = reviewedFilings.reduce((n, f) => n + parseFindings(f).length, 0);
   const showReviewBanner = reviewingCount > 0 || reviewedFilings.length > 0;
 
   return (
@@ -380,27 +401,28 @@ export default function FetchFilings() {
             <>
               <Loader2 className="w-4 h-4 text-amber-400 animate-spin shrink-0" />
               <p className="text-sm">
-                Claude is reviewing filings for material disclosures —{" "}
+                Claude is digging through filings for footnoted-worthy items —{" "}
                 <span className="font-medium">{reviewedFilings.length} done</span>,{" "}
                 {reviewingCount} in progress
-                {flaggedCount > 0 && <> ({flaggedCount} flagged so far)</>}
+                {totalFindings > 0 && <> ({totalFindings} finding{totalFindings !== 1 ? "s" : ""} so far)</>}
               </p>
             </>
-          ) : flaggedCount > 0 ? (
+          ) : totalFindings > 0 ? (
             <>
-              <ShieldAlert className="w-4 h-4 text-red-400 shrink-0" />
+              <ShieldAlert className="w-4 h-4 text-amber-400 shrink-0" />
               <p className="text-sm">
-                Claude flagged <span className="font-medium">{flaggedCount}</span> of{" "}
-                {reviewedFilings.length} reviewed filing{reviewedFilings.length !== 1 ? "s" : ""} for
-                material disclosures.
+                Claude surfaced <span className="font-medium">{totalFindings}</span> post-worthy finding
+                {totalFindings !== 1 ? "s" : ""} across{" "}
+                <span className="font-medium">{interestingCount}</span> of {reviewedFilings.length} filing
+                {reviewedFilings.length !== 1 ? "s" : ""}.
               </p>
             </>
           ) : (
             <>
               <ShieldCheck className="w-4 h-4 text-green-400 shrink-0" />
               <p className="text-sm">
-                Claude reviewed {reviewedFilings.length} filing{reviewedFilings.length !== 1 ? "s" : ""} —
-                no material disclosures found.
+                Claude read {reviewedFilings.length} filing{reviewedFilings.length !== 1 ? "s" : ""} —
+                nothing notable found.
               </p>
             </>
           )}
@@ -450,18 +472,26 @@ export default function FetchFilings() {
                   )}
                   {(f.reviewStatus === "pending" || f.reviewStatus === "reviewing") && (
                     <Badge variant="default" className="text-xs bg-amber-600/20 text-amber-400 border-amber-600/30">
-                      <Loader2 className="w-3 h-3 mr-0.5 animate-spin" /> Reviewing
+                      <Loader2 className="w-3 h-3 mr-0.5 animate-spin" /> Reading
                     </Badge>
                   )}
-                  {f.reviewStatus === "done" && f.reviewFlagged && (
-                    <Badge variant="default" className="text-xs bg-red-600/20 text-red-400 border-red-600/30">
-                      <ShieldAlert className="w-3 h-3 mr-0.5" /> Material
-                      {f.reviewMateriality ? `: ${f.reviewMateriality}` : ""}
-                    </Badge>
-                  )}
+                  {f.reviewStatus === "done" && f.reviewFlagged && (() => {
+                    const n = parseFindings(f).length;
+                    const high = f.reviewMateriality === "high";
+                    return (
+                      <Badge
+                        variant="default"
+                        className={`text-xs ${high ? "bg-red-600/20 text-red-400 border-red-600/30" : "bg-amber-600/20 text-amber-400 border-amber-600/30"}`}
+                      >
+                        <ShieldAlert className="w-3 h-3 mr-0.5" />
+                        {n} finding{n !== 1 ? "s" : ""}
+                        {f.reviewMateriality && f.reviewMateriality !== "none" ? ` · ${f.reviewMateriality} interest` : ""}
+                      </Badge>
+                    );
+                  })()}
                   {f.reviewStatus === "done" && !f.reviewFlagged && (
                     <Badge variant="secondary" className="text-xs text-muted-foreground">
-                      <ShieldCheck className="w-3 h-3 mr-0.5" /> No material disclosures
+                      <ShieldCheck className="w-3 h-3 mr-0.5" /> Nothing notable
                     </Badge>
                   )}
                   {f.reviewStatus === "error" && (
@@ -476,13 +506,31 @@ export default function FetchFilings() {
                     <span>{(f.pdfSize / 1024 / 1024).toFixed(1)} MB</span>
                   )}
                 </div>
-                {f.reviewStatus === "done" && f.reviewSummary && (
+                {f.reviewStatus === "done" && f.reviewFlagged && f.reviewSummary && (
                   <p
-                    className={`text-xs mt-1.5 ${f.reviewFlagged ? "text-red-400" : "text-muted-foreground"}`}
+                    className="text-xs mt-1.5 text-amber-300/90 font-medium"
                     data-testid={`review-summary-${f.accessionNumber}`}
                   >
                     {f.reviewSummary}
                   </p>
+                )}
+                {f.reviewStatus === "done" && parseFindings(f).length > 0 && (
+                  <div className="mt-2 space-y-2" data-testid={`review-findings-${f.accessionNumber}`}>
+                    {parseFindings(f).map((finding, i) => (
+                      <div key={i} className="rounded-md border border-border/60 bg-muted/30 p-2.5">
+                        <div className="flex items-center gap-2 mb-0.5">
+                          <Badge variant="secondary" className="text-[10px] uppercase tracking-wide">
+                            {CATEGORY_LABELS[finding.category] || finding.category}
+                          </Badge>
+                          <span className="text-xs font-semibold">{finding.headline}</span>
+                        </div>
+                        <p className="text-xs text-muted-foreground">{finding.detail}</p>
+                        {finding.why && (
+                          <p className="text-xs text-muted-foreground/80 italic mt-0.5">{finding.why}</p>
+                        )}
+                      </div>
+                    ))}
+                  </div>
                 )}
               </div>
               {f.status === "complete" && f.pdfPath && (

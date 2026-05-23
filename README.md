@@ -47,7 +47,7 @@ Set `DATABASE_URL` to a PostgreSQL connection string (required — the server ex
 DATABASE_URL=postgres://user:password@localhost:5432/sec_filings
 ```
 
-Optionally set `ANTHROPIC_API_KEY` to enable Claude's material-disclosure review. After each retrieval, Claude reads every newly rendered filing and flags the ones containing material disclosures (with an explanation), shown inline on the Fetch Filings page. Without the key, the rest of the app works unchanged and review is silently skipped.
+Optionally set `ANTHROPIC_API_KEY` to enable Claude's footnoted-style editorial review. After each retrieval, Claude reads every newly rendered filing (10-K, 10-Q, 8-K, and **DEF 14A** proxy statements) and surfaces buried, post-worthy details — executive perks/comp, severance and golden parachutes, related-party/insider dealings, and notable language/governance/accounting tells — as discrete findings, each with a draft headline, the buried detail, and why it matters. Results show inline on the Fetch Filings page. Without the key, the rest of the app works unchanged and review is silently skipped.
 ```
 ANTHROPIC_API_KEY=sk-ant-...
 ```

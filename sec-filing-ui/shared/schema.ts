@@ -37,7 +37,7 @@ export const tickers = pgTable("tickers", {
   watchlistId: integer("watchlist_id").notNull().references(() => watchlists.id, { onDelete: "cascade" }),
   ticker: text("ticker").notNull(),
   cik: text("cik").notNull(),
-  filingTypes: text("filing_types").notNull().default('[\"10-K\",\"10-Q\",\"8-K\"]'), // JSON array stored as text
+  filingTypes: text("filing_types").notNull().default('[\"10-K\",\"10-Q\",\"8-K\",\"DEF 14A\"]'), // JSON array stored as text
 }, (table) => [
   index("idx_tickers_watchlist").on(table.watchlistId),
   index("idx_tickers_ticker").on(table.ticker),
@@ -57,11 +57,12 @@ export const filings = pgTable("filings", {
   errorMessage: text("error_message"),
   createdAt: text("created_at").notNull(),
   userId: integer("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
-  // Claude material-disclosure review
+  // Claude footnoted-style editorial review
   reviewStatus: text("review_status"),          // null (not requested) | pending | reviewing | done | error
-  reviewFlagged: boolean("review_flagged"),     // true if Claude flagged a material disclosure
-  reviewMateriality: text("review_materiality"),// high | medium | low | none
-  reviewSummary: text("review_summary"),        // explanation of why it was (or wasn't) flagged
+  reviewFlagged: boolean("review_flagged"),     // true if there's something post-worthy here
+  reviewMateriality: text("review_materiality"),// overall interest level: high | medium | low | none
+  reviewSummary: text("review_summary"),        // one-line lead / why this filing is worth a look
+  reviewFindings: text("review_findings"),      // JSON array of findings [{category, headline, detail, why}]
   reviewError: text("review_error"),
   reviewedAt: text("reviewed_at"),
 }, (table) => [
