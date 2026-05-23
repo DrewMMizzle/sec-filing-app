@@ -30,15 +30,16 @@ function AuthenticatedApp() {
           <header className="flex items-center gap-2 px-4 py-2 border-b border-border bg-background/80 backdrop-blur-sm">
             <SidebarTrigger data-testid="button-sidebar-toggle" />
             <span className="text-sm font-medium text-muted-foreground">
-              SEC Filing Watchlist
+              SEC Filing Review
             </span>
           </header>
           <main className="flex-1 overflow-auto">
             <Switch>
-              <Route path="/" component={Home} />
+              <Route path="/" component={Findings} />
+              <Route path="/findings" component={Findings} />
+              <Route path="/watchlists" component={Home} />
               <Route path="/watchlist/:id" component={WatchlistPage} />
               <Route path="/fetch" component={FetchFilings} />
-              <Route path="/findings" component={Findings} />
               <Route path="/library" component={PdfLibrary} />
               <Route component={NotFound} />
             </Switch>

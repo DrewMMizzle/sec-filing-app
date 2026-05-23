@@ -94,15 +94,15 @@ export function AppSidebar() {
     <>
       <Sidebar>
         <SidebarHeader className="p-4">
-          <div className="flex items-center gap-2">
+          <Link href="/" className="flex items-center gap-2">
             <div className="flex items-center justify-center w-8 h-8 rounded-md bg-primary/10">
               <FileText className="w-4 h-4 text-primary" />
             </div>
             <div>
               <p className="text-sm font-semibold text-sidebar-foreground">SEC Filings</p>
-              <p className="text-xs text-sidebar-foreground/60">Watchlist Manager</p>
+              <p className="text-xs text-sidebar-foreground/60">Filing review</p>
             </div>
-          </div>
+          </Link>
         </SidebarHeader>
 
         <SidebarContent>
@@ -113,24 +113,24 @@ export function AppSidebar() {
                 <SidebarMenuItem>
                   <SidebarMenuButton
                     asChild
-                    isActive={location === "/fetch"}
-                    data-testid="nav-fetch-filings"
+                    isActive={location === "/" || location === "/findings"}
+                    data-testid="nav-findings"
                   >
-                    <Link href="/fetch">
-                      <Search className="w-4 h-4" />
-                      <span>Fetch Filings</span>
+                    <Link href="/">
+                      <Sparkles className="w-4 h-4" />
+                      <span>Findings</span>
                     </Link>
                   </SidebarMenuButton>
                 </SidebarMenuItem>
                 <SidebarMenuItem>
                   <SidebarMenuButton
                     asChild
-                    isActive={location === "/findings"}
-                    data-testid="nav-findings"
+                    isActive={location === "/fetch"}
+                    data-testid="nav-fetch-filings"
                   >
-                    <Link href="/findings">
-                      <Sparkles className="w-4 h-4" />
-                      <span>Findings</span>
+                    <Link href="/fetch">
+                      <Search className="w-4 h-4" />
+                      <span>Fetch Filings</span>
                     </Link>
                   </SidebarMenuButton>
                 </SidebarMenuItem>
@@ -155,7 +155,9 @@ export function AppSidebar() {
           {/* Watchlists */}
           <SidebarGroup>
             <SidebarGroupLabel className="flex items-center justify-between pr-2">
-              <span>Watchlists</span>
+              <Link href="/watchlists" className="hover:text-sidebar-foreground transition-colors">
+                Watchlists
+              </Link>
               <Button
                 size="icon"
                 variant="ghost"

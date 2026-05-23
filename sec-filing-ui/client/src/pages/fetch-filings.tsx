@@ -19,6 +19,16 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { format } from "date-fns";
 import type { DateRange } from "react-day-picker";
 import { useToast } from "@/hooks/use-toast";
@@ -87,6 +97,11 @@ export default function FetchFilings() {
   const [selectedWatchlist, setSelectedWatchlist] = useState<string>("all");
   const [selectedTickers, setSelectedTickers] = useState<Set<string>>(new Set());
   const [limitPerTicker, setLimitPerTicker] = useState(5);
+  const [tickerSearch, setTickerSearch] = useState("");
+
+  // Confirmation dialog for large/expensive batches
+  const [confirm, setConfirm] = useState<{ title: string; body: string; action: () => void } | null>(null);
+  const CONFIRM_THRESHOLD = 25;
 
   // Queries
   const { data: allTickers = [] } = useQuery<TickerInfo[]>({
@@ -133,6 +148,13 @@ export default function FetchFilings() {
         filingTypes: typeof t.filingTypes === "string" ? JSON.parse(t.filingTypes) : t.filingTypes,
       }));
 
+  // Tickers visible after the in-list search filter
+  const visibleTickers: TickerInfo[] = tickerSearch.trim()
+    ? displayTickers.filter((t: TickerInfo) =>
+        t.ticker.toLowerCase().includes(tickerSearch.trim().toLowerCase()),
+      )
+    : displayTickers;
+
   // Toggle ticker selection
   const toggleTicker = (ticker: string) => {
     setSelectedTickers((prev) => {
@@ -144,7 +166,13 @@ export default function FetchFilings() {
   };
 
   const selectAll = () => {
-    setSelectedTickers(new Set(displayTickers.map((t: TickerInfo) => t.ticker)));
+    // Select all currently-visible (search-filtered) tickers, preserving any
+    // already-selected ones that the search is hiding.
+    setSelectedTickers((prev) => {
+      const next = new Set(prev);
+      visibleTickers.forEach((t: TickerInfo) => next.add(t.ticker));
+      return next;
+    });
   };
 
   const selectNone = () => {
@@ -214,12 +242,43 @@ export default function FetchFilings() {
     onError: (err: Error) => toast({ title: "Error", description: err.message, variant: "destructive" }),
   });
 
+  // Filings eligible for a library review (complete, not already done/in-flight)
+  const reviewableCount = existingFilings.filter(
+    (f) =>
+      f.status === "complete" &&
+      !["done", "pending", "reviewing"].includes(f.reviewStatus || ""),
+  ).length;
+
   const handleFetch = () => {
     if (selectedTickers.size === 0) {
       toast({ title: "Select at least one ticker", variant: "destructive" });
       return;
     }
+    if (selectedTickers.size > CONFIRM_THRESHOLD) {
+      const est = selectedTickers.size * limitPerTicker;
+      setConfirm({
+        title: "Fetch a large batch?",
+        body:
+          `This will fetch up to ~${est} filings across ${selectedTickers.size} tickers` +
+          (reviewEnabled ? " and run a Claude review on each new one" : "") +
+          `. It can take a while${reviewEnabled ? " and will incur Claude API cost" : ""}.`,
+        action: () => fetchMutation.mutate(),
+      });
+      return;
+    }
     fetchMutation.mutate();
+  };
+
+  const handleReviewLibrary = () => {
+    if (reviewableCount > CONFIRM_THRESHOLD) {
+      setConfirm({
+        title: "Review the library with Claude?",
+        body: `This will run a Claude review on ~${reviewableCount} filing${reviewableCount !== 1 ? "s" : ""}. It can take a while and will incur Claude API cost.`,
+        action: () => reviewMutation.mutate(),
+      });
+      return;
+    }
+    reviewMutation.mutate();
   };
 
   // Filter existing filings by current date range
@@ -336,19 +395,32 @@ export default function FetchFilings() {
 
           {/* Ticker Selection */}
           <div>
-            <div className="flex items-center justify-between mb-2">
-              <label className="text-sm font-medium">Tickers</label>
-              <div className="flex gap-2">
+            <div className="flex items-center justify-between mb-2 gap-3">
+              <label className="text-sm font-medium shrink-0">Tickers</label>
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-muted-foreground whitespace-nowrap">
+                  {selectedTickers.size} selected
+                </span>
                 <Button variant="ghost" size="sm" onClick={selectAll} className="text-xs h-7">
-                  Select All
+                  {tickerSearch.trim() ? "Select shown" : "Select all"}
                 </Button>
                 <Button variant="ghost" size="sm" onClick={selectNone} className="text-xs h-7">
                   Clear
                 </Button>
               </div>
             </div>
-            <div className="flex flex-wrap gap-2">
-              {displayTickers.map((t: TickerInfo) => (
+            <div className="relative mb-2">
+              <Search className="w-4 h-4 absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                value={tickerSearch}
+                onChange={(e) => setTickerSearch(e.target.value)}
+                placeholder="Filter tickers…"
+                className="pl-8 h-9"
+                data-testid="input-ticker-filter"
+              />
+            </div>
+            <div className="flex flex-wrap gap-2 max-h-56 overflow-y-auto rounded-md border p-2">
+              {visibleTickers.map((t: TickerInfo) => (
                 <label
                   key={t.ticker}
                   className="flex items-center gap-1.5 px-3 py-1.5 rounded-md border cursor-pointer transition-colors hover:bg-accent/50"
@@ -362,11 +434,18 @@ export default function FetchFilings() {
                 </label>
               ))}
               {displayTickers.length === 0 && (
-                <p className="text-sm text-muted-foreground">
+                <p className="text-sm text-muted-foreground p-2">
                   No tickers in your watchlists. Add some first.
                 </p>
               )}
+              {displayTickers.length > 0 && visibleTickers.length === 0 && (
+                <p className="text-sm text-muted-foreground p-2">No tickers match "{tickerSearch}".</p>
+              )}
             </div>
+            <p className="text-xs text-muted-foreground mt-1.5">
+              Showing {visibleTickers.length} of {displayTickers.length} ticker
+              {displayTickers.length !== 1 ? "s" : ""}
+            </p>
           </div>
 
           {/* Fetch Button */}
@@ -416,7 +495,7 @@ export default function FetchFilings() {
           <Button
             variant="secondary"
             size="sm"
-            onClick={() => reviewMutation.mutate()}
+            onClick={handleReviewLibrary}
             disabled={reviewMutation.isPending || reviewingCount > 0}
             data-testid="button-review-library"
           >
@@ -589,6 +668,28 @@ export default function FetchFilings() {
           ))}
         </div>
       )}
+
+      {/* Confirmation for large / costly batches */}
+      <AlertDialog open={confirm !== null} onOpenChange={(open) => { if (!open) setConfirm(null); }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{confirm?.title}</AlertDialogTitle>
+            <AlertDialogDescription>{confirm?.body}</AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => {
+                confirm?.action();
+                setConfirm(null);
+              }}
+              data-testid="button-confirm-batch"
+            >
+              Continue
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }
