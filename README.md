@@ -65,3 +65,9 @@ The dev server starts on port 5000 (override with the `PORT` env var). The UI ca
 ## Architecture
 
 The UI spawns the Python pipeline as a child process when you click "Fetch & Render PDFs." The pipeline renders PDFs to its local `output/` directory and streams JSON events (found, rendering, complete, error, done) back to the Express server, which tracks filings in PostgreSQL and copies rendered PDFs into app-managed storage.
+
+## Deployment (Railway)
+
+Rendered PDFs are written to `PDF_STORAGE_DIR` (default `/app/data/pdfs`). Railway's container filesystem is **ephemeral**, so without persistent storage every redeploy wipes the PDFs while the PostgreSQL rows persist — breaking compare, review, and downloads for previously-rendered filings.
+
+**Attach a persistent volume** to the web service mounted at **`/app/data`** (Railway dashboard → service → Volumes). The app recreates `/app/data/pdfs` on boot, so PDFs then survive redeploys. (The fetch step verifies a PDF exists on disk before skipping it, so re-pulling regenerates any that go missing.)
