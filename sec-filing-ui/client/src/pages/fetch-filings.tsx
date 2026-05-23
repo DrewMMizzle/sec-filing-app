@@ -22,7 +22,7 @@ import {
 import { format } from "date-fns";
 import type { DateRange } from "react-day-picker";
 import { useToast } from "@/hooks/use-toast";
-import { Search, Download, Loader2, FileText, Calendar as CalendarIcon, Check, X, AlertCircle } from "lucide-react";
+import { Search, Download, Loader2, FileText, Calendar as CalendarIcon, Check, X, AlertCircle, ShieldAlert, ShieldCheck } from "lucide-react";
 import type { Filing } from "@shared/schema";
 
 // SEC filing dates are plain calendar dates (YYYY-MM-DD); convert to/from local
@@ -98,6 +98,14 @@ export default function FetchFilings() {
 
   const { data: existingFilings = [], refetch: refetchFilings } = useQuery<Filing[]>({
     queryKey: ["/api/filings"],
+    // While Claude is reviewing filings, poll so flags appear as they complete.
+    refetchInterval: (query) => {
+      const rows = query.state.data as Filing[] | undefined;
+      const reviewing = rows?.some(
+        (f) => f.reviewStatus === "pending" || f.reviewStatus === "reviewing",
+      );
+      return reviewing ? 4000 : false;
+    },
   });
 
   // Filter tickers by selected watchlist
@@ -195,6 +203,14 @@ export default function FetchFilings() {
   });
 
   const completedFilings = filteredFilings.filter((f) => f.status === "complete");
+
+  // Material-disclosure review summary across the currently-shown filings
+  const reviewingCount = filteredFilings.filter(
+    (f) => f.reviewStatus === "pending" || f.reviewStatus === "reviewing",
+  ).length;
+  const reviewedFilings = filteredFilings.filter((f) => f.reviewStatus === "done");
+  const flaggedCount = reviewedFilings.filter((f) => f.reviewFlagged).length;
+  const showReviewBanner = reviewingCount > 0 || reviewedFilings.length > 0;
 
   return (
     <div className="p-6 max-w-5xl mx-auto">
@@ -358,6 +374,39 @@ export default function FetchFilings() {
         </h2>
       </div>
 
+      {showReviewBanner && (
+        <Card className="p-4 mb-4 flex items-center gap-3" data-testid="card-review-summary">
+          {reviewingCount > 0 ? (
+            <>
+              <Loader2 className="w-4 h-4 text-amber-400 animate-spin shrink-0" />
+              <p className="text-sm">
+                Claude is reviewing filings for material disclosures —{" "}
+                <span className="font-medium">{reviewedFilings.length} done</span>,{" "}
+                {reviewingCount} in progress
+                {flaggedCount > 0 && <> ({flaggedCount} flagged so far)</>}
+              </p>
+            </>
+          ) : flaggedCount > 0 ? (
+            <>
+              <ShieldAlert className="w-4 h-4 text-red-400 shrink-0" />
+              <p className="text-sm">
+                Claude flagged <span className="font-medium">{flaggedCount}</span> of{" "}
+                {reviewedFilings.length} reviewed filing{reviewedFilings.length !== 1 ? "s" : ""} for
+                material disclosures.
+              </p>
+            </>
+          ) : (
+            <>
+              <ShieldCheck className="w-4 h-4 text-green-400 shrink-0" />
+              <p className="text-sm">
+                Claude reviewed {reviewedFilings.length} filing{reviewedFilings.length !== 1 ? "s" : ""} —
+                no material disclosures found.
+              </p>
+            </>
+          )}
+        </Card>
+      )}
+
       {filteredFilings.length === 0 ? (
         <Card className="p-8 text-center">
           <div className="flex justify-center mb-4">
@@ -399,6 +448,27 @@ export default function FetchFilings() {
                       <X className="w-3 h-3 mr-0.5" /> Error
                     </Badge>
                   )}
+                  {(f.reviewStatus === "pending" || f.reviewStatus === "reviewing") && (
+                    <Badge variant="default" className="text-xs bg-amber-600/20 text-amber-400 border-amber-600/30">
+                      <Loader2 className="w-3 h-3 mr-0.5 animate-spin" /> Reviewing
+                    </Badge>
+                  )}
+                  {f.reviewStatus === "done" && f.reviewFlagged && (
+                    <Badge variant="default" className="text-xs bg-red-600/20 text-red-400 border-red-600/30">
+                      <ShieldAlert className="w-3 h-3 mr-0.5" /> Material
+                      {f.reviewMateriality ? `: ${f.reviewMateriality}` : ""}
+                    </Badge>
+                  )}
+                  {f.reviewStatus === "done" && !f.reviewFlagged && (
+                    <Badge variant="secondary" className="text-xs text-muted-foreground">
+                      <ShieldCheck className="w-3 h-3 mr-0.5" /> No material disclosures
+                    </Badge>
+                  )}
+                  {f.reviewStatus === "error" && (
+                    <Badge variant="secondary" className="text-xs" title={f.reviewError || undefined}>
+                      <AlertCircle className="w-3 h-3 mr-0.5" /> Review failed
+                    </Badge>
+                  )}
                 </div>
                 <div className="flex items-center gap-3 text-xs text-muted-foreground">
                   <span>{f.accessionNumber}</span>
@@ -406,6 +476,14 @@ export default function FetchFilings() {
                     <span>{(f.pdfSize / 1024 / 1024).toFixed(1)} MB</span>
                   )}
                 </div>
+                {f.reviewStatus === "done" && f.reviewSummary && (
+                  <p
+                    className={`text-xs mt-1.5 ${f.reviewFlagged ? "text-red-400" : "text-muted-foreground"}`}
+                    data-testid={`review-summary-${f.accessionNumber}`}
+                  >
+                    {f.reviewSummary}
+                  </p>
+                )}
               </div>
               {f.status === "complete" && f.pdfPath && (
                 <a

@@ -8,6 +8,7 @@ import fs from "fs";
 import { fileURLToPath } from "url";
 import { hashPassword, verifyPassword, createSession, clearSession, requireAuth } from "./auth";
 import { ensureSP500Seeded } from "./seed-sp500";
+import { isReviewEnabled, kickReviewProcessor } from "./review";
 import { db } from "./storage";
 import { tickers as tickersTable, filings as filingsTable } from "@shared/schema";
 import { eq } from "drizzle-orm";
@@ -469,6 +470,7 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
 
     // Collect events from the pipeline
     const events: any[] = [];
+    const completedAccessions: string[] = [];
     let stderrOutput = "";
 
     child.stdout.on("data", (data: Buffer) => {
@@ -508,6 +510,7 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
 
             // Store the app-local relative path
             const appRelPath = path.relative(path.resolve(PDF_STORAGE_DIR, ".."), destFile);
+            completedAccessions.push(event.accession);
             storage.updateFilingStatus(
               event.accession,
               "complete",
@@ -543,6 +546,15 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
           totalErrors: doneEvent.total_errors,
           events,
         });
+        // Mark the freshly-rendered filings for review, then drain the queue.
+        // Fire-and-forget: results are written to the DB and polled by the UI.
+        if (isReviewEnabled() && completedAccessions.length > 0) {
+          Promise.all(
+            completedAccessions.map((a) => storage.markFilingForReview(a).catch(() => {})),
+          )
+            .then(() => kickReviewProcessor())
+            .catch((err) => console.error("Review processor failed:", err));
+        }
       } else {
         res.status(500).json({
           success: false,

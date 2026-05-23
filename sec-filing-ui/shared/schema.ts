@@ -1,4 +1,4 @@
-import { pgTable, serial, text, integer, index, uniqueIndex } from "drizzle-orm/pg-core";
+import { pgTable, serial, text, integer, boolean, index, uniqueIndex } from "drizzle-orm/pg-core";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod";
 
@@ -57,6 +57,13 @@ export const filings = pgTable("filings", {
   errorMessage: text("error_message"),
   createdAt: text("created_at").notNull(),
   userId: integer("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  // Claude material-disclosure review
+  reviewStatus: text("review_status"),          // null (not requested) | pending | reviewing | done | error
+  reviewFlagged: boolean("review_flagged"),     // true if Claude flagged a material disclosure
+  reviewMateriality: text("review_materiality"),// high | medium | low | none
+  reviewSummary: text("review_summary"),        // explanation of why it was (or wasn't) flagged
+  reviewError: text("review_error"),
+  reviewedAt: text("reviewed_at"),
 }, (table) => [
   index("idx_filings_ticker").on(table.ticker),
   index("idx_filings_status").on(table.status),
@@ -64,6 +71,7 @@ export const filings = pgTable("filings", {
   index("idx_filings_type").on(table.filingType),
   index("idx_filings_ticker_status").on(table.ticker, table.status),
   index("idx_filings_user").on(table.userId),
+  index("idx_filings_review_status").on(table.reviewStatus),
 ]);
 
 // ─── Watchlist Sharing ─────────────────────────────────────
