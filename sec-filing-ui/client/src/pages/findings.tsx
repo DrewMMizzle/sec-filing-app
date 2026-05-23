@@ -36,7 +36,7 @@ import {
   AlertCircle,
 } from "lucide-react";
 import type { Filing, FindingAction } from "@shared/schema";
-import { CATEGORY_LABELS, parseFindings, interestColor, type ReviewFinding } from "@/lib/findings";
+import { CATEGORY_LABELS, parseFindings, interestColor, estimateReviewCost, formatCostRange, type ReviewFinding } from "@/lib/findings";
 
 type Row = {
   filing: Filing;
@@ -140,11 +140,15 @@ export default function Findings() {
   const [confirmReview, setConfirmReview] = useState(false);
 
   // Saved PDFs that haven't been (successfully) reviewed yet
-  const reviewableCount = filings.filter(
+  const reviewableFilings = filings.filter(
     (f) =>
       f.status === "complete" &&
       !["done", "pending", "reviewing"].includes(f.reviewStatus || ""),
-  ).length;
+  );
+  const reviewableCount = reviewableFilings.length;
+  const reviewCostRange = formatCostRange(
+    estimateReviewCost(reviewableFilings.map((f) => f.filingType)),
+  );
 
   const handleReviewSaved = () => {
     if (reviewableCount > 25) {
@@ -449,7 +453,9 @@ export default function Findings() {
             <AlertDialogTitle>Review the saved library with Claude?</AlertDialogTitle>
             <AlertDialogDescription>
               This will run a Claude review on ~{reviewableCount} saved filing
-              {reviewableCount !== 1 ? "s" : ""}. It can take a while and will incur Claude API cost.
+              {reviewableCount !== 1 ? "s" : ""}. Estimated Claude cost:{" "}
+              <span className="text-foreground font-medium">{reviewCostRange}</span> (Opus 4.7; rough,
+              varies with filing length). It can also take a while.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
