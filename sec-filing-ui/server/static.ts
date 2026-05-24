@@ -12,8 +12,11 @@ export function serveStatic(app: Express) {
 
   app.use(express.static(distPath));
 
-  // fall through to index.html if the file doesn't exist
-  app.use("/{*path}", (_req, res) => {
+  // Fall through to index.html for any non-file route so the SPA can boot.
+  // A path-less middleware is used deliberately: Express 5's "/{*path}" pattern
+  // does NOT match a malformed path like a stray double slash ("//"), which
+  // would otherwise 404 before the client-side hash router ever runs.
+  app.use((_req, res) => {
     res.sendFile(path.resolve(distPath, "index.html"));
   });
 }

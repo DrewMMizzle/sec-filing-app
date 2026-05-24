@@ -28,6 +28,41 @@ if (!fs.existsSync(PDF_STORAGE_DIR)) {
   fs.mkdirSync(PDF_STORAGE_DIR, { recursive: true });
 }
 
+// Count stored PDFs so we can spot at startup whether a persistent volume is
+// actually mounted (and populated) at PDF_STORAGE_DIR vs. ephemeral disk.
+function countStoredPdfs(dir: string): number {
+  let n = 0;
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  for (const e of entries) {
+    const full = path.join(dir, e.name);
+    if (e.isDirectory()) n += countStoredPdfs(full);
+    else if (e.isFile() && e.name.toLowerCase().endsWith(".pdf")) n += 1;
+  }
+  return n;
+}
+
+// One-line startup diagnostic visible in deploy logs.
+(() => {
+  let writable = false;
+  try {
+    const probe = path.join(PDF_STORAGE_DIR, ".write-probe");
+    fs.writeFileSync(probe, "ok");
+    fs.unlinkSync(probe);
+    writable = true;
+  } catch {
+    writable = false;
+  }
+  console.log(
+    `[storage] PDF_STORAGE_DIR=${PDF_STORAGE_DIR} exists=${fs.existsSync(PDF_STORAGE_DIR)} ` +
+      `writable=${writable} storedPdfs=${countStoredPdfs(PDF_STORAGE_DIR)}`,
+  );
+})();
+
 // Whether a filing's rendered PDF actually exists on disk. The DB row can say
 // "complete" while the file is gone (e.g. ephemeral storage wiped on redeploy),
 // so callers verify the file before treating a filing as available.
