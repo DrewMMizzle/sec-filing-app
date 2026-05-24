@@ -253,24 +253,27 @@ export function AppSidebar() {
 
         <SidebarFooter className="p-3 space-y-2">
           {user && (
-            <div className="flex items-center gap-2 px-1">
-              <div className="flex items-center justify-center w-7 h-7 rounded-full bg-primary/10 shrink-0">
-                <User className="w-3.5 h-3.5 text-primary" />
-              </div>
-              <div className="flex-1 min-w-0">
-                <p className="text-xs font-medium text-sidebar-foreground truncate">{user.displayName}</p>
-                <p className="text-[10px] text-sidebar-foreground/50 truncate">{user.email}</p>
+            <>
+              <div className="flex items-center gap-2 px-1">
+                <div className="flex items-center justify-center w-7 h-7 rounded-full bg-primary/10 shrink-0">
+                  <User className="w-3.5 h-3.5 text-primary" />
+                </div>
+                <div className="flex-1 min-w-0">
+                  <p className="text-xs font-medium text-sidebar-foreground truncate">{user.displayName}</p>
+                  <p className="text-[10px] text-sidebar-foreground/50 truncate">{user.email}</p>
+                </div>
               </div>
               <Button
-                size="icon"
-                variant="ghost"
-                className="h-7 w-7 text-sidebar-foreground/60 shrink-0"
+                variant="outline"
+                size="sm"
+                className="w-full justify-start"
                 onClick={handleLogout}
-                title="Sign out"
+                data-testid="button-logout"
               >
-                <LogOut className="w-3.5 h-3.5" />
+                <LogOut className="w-3.5 h-3.5 mr-2" />
+                Sign out
               </Button>
-            </div>
+            </>
           )}
         </SidebarFooter>
       </Sidebar>
