@@ -418,16 +418,14 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
   // ─── Filings: list, stats, fetch, download, manage ────────
 
   // Filing stats summary (must come before /:accession routes)
-  app.get("/api/filings/stats", requireAuth, async (req, res) => {
-    const userId = req.user!.id;
-    const stats = await storage.getFilingStats(userId);
+  app.get("/api/filings/stats", requireAuth, async (_req, res) => {
+    const stats = await storage.getFilingStats();
     res.json(stats);
   });
 
   app.get("/api/filings", requireAuth, async (req, res) => {
-    const userId = req.user!.id;
     const { ticker, filingType, dateFrom, dateTo, status } = req.query as Record<string, string | undefined>;
-    const results = await storage.getFilings(userId, {
+    const results = await storage.getFilings({
       ticker,
       filingType,
       dateFrom,
@@ -455,7 +453,7 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     // (A redeploy can wipe ephemeral PDF storage while the DB row persists, so a
     // status check alone would wrongly skip filings that need re-rendering.) ──
     const tickerNames = tickerList.map((t) => t.ticker);
-    const completeRows = await storage.getCompleteFilings(userId, tickerNames);
+    const completeRows = await storage.getCompleteFilings(tickerNames);
     const alreadyComplete = new Set(
       completeRows.filter((r) => pdfExistsOnDisk(r.pdfPath)).map((r) => r.accessionNumber),
     );
@@ -593,8 +591,8 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
   // Actual Claude spend so far, from recorded per-filing token usage.
   // Opus 4.7 pricing per 1M tokens: input $5, output $25, cache read $0.50,
   // cache write $6.25.
-  app.get("/api/review/usage", requireAuth, async (req, res) => {
-    const u = await storage.getReviewUsage(req.user!.id);
+  app.get("/api/review/usage", requireAuth, async (_req, res) => {
+    const u = await storage.getReviewUsage();
     const costUsd =
       (u.inputTokens * 5 +
         u.outputTokens * 25 +
@@ -606,7 +604,6 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
 
   // Compare a section (e.g. Risk Factors) between two filings of the same company
   app.post("/api/compare", requireAuth, async (req, res) => {
-    const userId = req.user!.id;
     if (!isReviewEnabled()) {
       return res
         .status(409)
@@ -629,9 +626,6 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     const fa = await storage.getFilingByAccession(accessionA);
     const fb = await storage.getFilingByAccession(accessionB);
     if (!fa || !fb) return res.status(404).json({ error: "Filing not found" });
-    if (fa.userId !== userId || fb.userId !== userId) {
-      return res.status(403).json({ error: "Access denied" });
-    }
     try {
       const result = await compareFilings(fa, fb, section as SectionKey);
       res.json(result);
@@ -670,14 +664,13 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
   });
 
   // Review filings already in the library (not just freshly fetched ones)
-  app.post("/api/filings/review", requireAuth, async (req, res) => {
-    const userId = req.user!.id;
+  app.post("/api/filings/review", requireAuth, async (_req, res) => {
     if (!isReviewEnabled()) {
       return res
         .status(409)
         .json({ error: "Claude review is not configured (ANTHROPIC_API_KEY is not set)." });
     }
-    const queued = await storage.markCompleteFilingsForReview(userId);
+    const queued = await storage.markCompleteFilingsForReview();
     if (queued > 0) {
       kickReviewProcessor().catch((err) => console.error("Review processor failed:", err));
     }
@@ -686,7 +679,6 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
 
   // Retry / run review for a single filing
   app.post("/api/filings/:accession/review", requireAuth, async (req, res) => {
-    const userId = req.user!.id;
     if (!isReviewEnabled()) {
       return res
         .status(409)
@@ -695,7 +687,6 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     const accession = req.params.accession as string;
     const filing = await storage.getFilingByAccession(accession);
     if (!filing) return res.status(404).json({ error: "Filing not found" });
-    if (filing.userId !== userId) return res.status(403).json({ error: "Access denied" });
     if (filing.status !== "complete") {
       return res.status(400).json({ error: "Filing isn't rendered yet" });
     }
@@ -706,13 +697,9 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
 
   // Download a PDF by accession number
   app.get("/api/filings/:accession/pdf", requireAuth, async (req, res) => {
-    const userId = req.user!.id;
     const filing = await storage.getFilingByAccession(req.params.accession as string);
     if (!filing || !filing.pdfPath) {
       return res.status(404).json({ error: "PDF not found" });
-    }
-    if (filing.userId !== userId) {
-      return res.status(403).json({ error: "Access denied" });
     }
 
     // Try app-managed storage first, fall back to pipeline output
@@ -735,14 +722,7 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
   // Delete a single filing + remove PDF from disk
   app.delete("/api/filings/:id", requireAuth, async (req, res) => {
     const id = Number(req.params.id);
-    const userId = req.user!.id;
     if (isNaN(id)) return res.status(400).json({ error: "Invalid ID" });
-
-    // Verify ownership before deleting
-    const filingRows = await db.select().from(filingsTable).where(eq(filingsTable.id, id));
-    const filing = filingRows[0];
-    if (!filing) return res.status(404).json({ error: "Filing not found" });
-    if (filing.userId !== userId) return res.status(403).json({ error: "Access denied" });
 
     const deleted = await storage.deleteFiling(id);
     if (!deleted) return res.status(404).json({ error: "Filing not found" });
@@ -761,18 +741,17 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
 
   // Batch delete filings + remove PDF files
   app.post("/api/filings/batch-delete", requireAuth, async (req, res) => {
-    const userId = req.user!.id;
     const { ids } = req.body as { ids: number[] };
     if (!Array.isArray(ids) || ids.length === 0) {
       return res.status(400).json({ error: "ids array is required" });
     }
 
-    // Delete one at a time to also clean up PDFs, verifying ownership
+    // Delete one at a time to also clean up PDFs
     let deletedCount = 0;
     for (const id of ids) {
       const batchRows = await db.select().from(filingsTable).where(eq(filingsTable.id, id));
       const f = batchRows[0];
-      if (!f || f.userId !== userId) continue;
+      if (!f) continue;
 
       const filing = await storage.deleteFiling(id);
       if (filing?.pdfPath) {
@@ -790,13 +769,9 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
 
   // View PDF inline (opens in browser tab instead of downloading)
   app.get("/api/filings/:accession/view", requireAuth, async (req, res) => {
-    const userId = req.user!.id;
     const filing = await storage.getFilingByAccession(req.params.accession as string);
     if (!filing || !filing.pdfPath) {
       return res.status(404).json({ error: "PDF not found" });
-    }
-    if (filing.userId !== userId) {
-      return res.status(403).json({ error: "Access denied" });
     }
 
     const appPath = path.resolve(PDF_STORAGE_DIR, "..", filing.pdfPath);
