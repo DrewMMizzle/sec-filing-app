@@ -37,6 +37,7 @@ import {
   Loader2,
   AlertCircle,
   Layers,
+  X,
 } from "lucide-react";
 import type { Filing, FindingAction } from "@shared/schema";
 import { CATEGORY_LABELS, parseFindings, interestColor, estimateReviewCost, formatCostRange, type ReviewFinding } from "@/lib/findings";
@@ -155,6 +156,21 @@ export default function Findings() {
   const [sortBy, setSortBy] = useState<string>("date");
   const [groupByTicker, setGroupByTicker] = useState(false);
   const [confirmReview, setConfirmReview] = useState(false);
+  const [showHowTo, setShowHowTo] = useState(() => {
+    try {
+      return localStorage.getItem("howItWorksDismissed") !== "1";
+    } catch {
+      return true;
+    }
+  });
+  const dismissHowTo = () => {
+    try {
+      localStorage.setItem("howItWorksDismissed", "1");
+    } catch {
+      // ignore (private mode, etc.)
+    }
+    setShowHowTo(false);
+  };
 
   // Saved PDFs that haven't been (successfully) reviewed yet
   const reviewableFilings = filings.filter(
@@ -388,6 +404,52 @@ export default function Findings() {
           </Button>
         </div>
       </div>
+
+      {/* First-run "how it works" card */}
+      {showHowTo && (
+        <Card className="p-4 mb-4 relative" data-testid="card-how-it-works">
+          <Button
+            variant="ghost"
+            size="icon"
+            className="absolute top-2 right-2 h-6 w-6 text-muted-foreground"
+            onClick={dismissHowTo}
+            aria-label="Dismiss"
+            data-testid="button-dismiss-howto"
+          >
+            <X className="w-4 h-4" />
+          </Button>
+          <p className="text-sm font-semibold mb-2">How this works</p>
+          <ol className="space-y-1.5 text-sm text-muted-foreground">
+            <li>
+              <span className="text-foreground font-medium">1.</span> Watchlists track companies — an{" "}
+              <span className="text-foreground">S&amp;P 500</span> list is already set up for you.
+            </li>
+            <li>
+              <span className="text-foreground font-medium">2.</span> On{" "}
+              <Link href="/fetch" className="text-primary hover:underline">
+                Fetch &amp; Review
+              </Link>
+              , pull filings — Claude automatically reviews each one for post-worthy details.
+            </li>
+            <li>
+              <span className="text-foreground font-medium">3.</span> Findings appear here. Star, mark posted,
+              or dismiss to triage; export to CSV for drafting.
+            </li>
+            <li>
+              <span className="text-foreground font-medium">4.</span> Use{" "}
+              <Link href="/compare" className="text-primary hover:underline">
+                Compare
+              </Link>{" "}
+              to diff a section (e.g. Risk Factors) between two filings.
+            </li>
+          </ol>
+          <div className="mt-3">
+            <Button size="sm" variant="secondary" onClick={dismissHowTo} data-testid="button-howto-gotit">
+              Got it
+            </Button>
+          </div>
+        </Card>
+      )}
 
       {/* Review availability notice */}
       {config && !reviewEnabled && (
