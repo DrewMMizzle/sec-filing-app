@@ -38,6 +38,109 @@ function pdfExistsOnDisk(pdfPath: string | null | undefined): boolean {
   return fs.existsSync(appPath) || fs.existsSync(pipelinePath);
 }
 
+type PipelineResult = {
+  success: boolean;
+  events: any[];
+  completedAccessions: string[];
+  doneEvent?: any;
+  error?: string;
+};
+
+// Spawn the Python fetch/render pipeline with the given JSON input, persisting
+// rendered PDFs + filing rows. Resolves when the process exits. Shared by the
+// fetch and re-render-missing endpoints.
+function runFetchPipeline(
+  input: string,
+  ctx: { userId: number; cikByTicker: Map<string, string> },
+): Promise<PipelineResult> {
+  return new Promise((resolve) => {
+    const pythonScript = path.join(PIPELINE_ROOT, "scripts", "fetch_filings.py");
+    if (!fs.existsSync(pythonScript)) {
+      resolve({ success: false, events: [], completedAccessions: [], error: "Pipeline script not found." });
+      return;
+    }
+    const child = spawn("python3", [pythonScript], {
+      cwd: PIPELINE_ROOT,
+      env: { ...process.env, PYTHONUNBUFFERED: "1" },
+    });
+    child.stdin.write(input);
+    child.stdin.end();
+
+    const events: any[] = [];
+    const completedAccessions: string[] = [];
+    let stderrOutput = "";
+    let settled = false;
+
+    child.stdout.on("data", (data: Buffer) => {
+      const lines = data.toString().split("\n").filter(Boolean);
+      for (const line of lines) {
+        try {
+          const event = JSON.parse(line);
+          events.push(event);
+          if (event.event === "rendering") {
+            storage
+              .upsertFiling({
+                ticker: event.ticker,
+                cik: ctx.cikByTicker.get(event.ticker) || "",
+                accessionNumber: event.accession,
+                filingType: event.filing_type,
+                filingDate: event.filing_date || null,
+                status: "rendering",
+                createdAt: new Date().toISOString(),
+                userId: ctx.userId,
+              })
+              .catch((err) => console.error("Failed to upsert filing:", err));
+          } else if (event.event === "complete") {
+            const pipelinePdf = path.join(PIPELINE_ROOT, event.path);
+            const ticker = event.ticker || "UNKNOWN";
+            const safeType = (event.filing_type || "filing").replace(/ /g, "_");
+            const destDir = path.join(PDF_STORAGE_DIR, ticker, safeType);
+            if (!fs.existsSync(destDir)) fs.mkdirSync(destDir, { recursive: true });
+            const destFile = path.join(destDir, `${event.accession}.pdf`);
+            try {
+              fs.copyFileSync(pipelinePdf, destFile);
+            } catch (copyErr) {
+              console.error(`Failed to copy PDF to app storage: ${copyErr}`);
+            }
+            const appRelPath = path.relative(path.resolve(PDF_STORAGE_DIR, ".."), destFile);
+            completedAccessions.push(event.accession);
+            storage
+              .updateFilingStatus(event.accession, "complete", appRelPath, event.size)
+              .catch((err) => console.error("Failed to update filing status:", err));
+          } else if (event.event === "error" && event.accession) {
+            storage
+              .updateFilingStatus(event.accession, "error", undefined, undefined, event.message)
+              .catch((err) => console.error("Failed to update filing error:", err));
+          }
+        } catch {
+          // non-JSON line from Python logging
+        }
+      }
+    });
+
+    child.stderr.on("data", (data: Buffer) => {
+      stderrOutput += data.toString();
+    });
+
+    child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      const doneEvent = events.find((e) => e.event === "done");
+      if (code === 0 && doneEvent) {
+        resolve({ success: true, events, completedAccessions, doneEvent });
+      } else {
+        resolve({ success: false, events, completedAccessions, error: stderrOutput || "Pipeline process failed" });
+      }
+    });
+
+    child.on("error", (err) => {
+      if (settled) return;
+      settled = true;
+      resolve({ success: false, events, completedAccessions, error: `Failed to start pipeline: ${err.message}` });
+    });
+  });
+}
+
 // Helper: check if user has access to a watchlist (owner or shared)
 async function checkWatchlistAccess(watchlistId: number, userId: number): Promise<{ access: "owner" | "edit" | "view" | null; watchlist: any }> {
   const wl = await storage.getWatchlist(watchlistId);
@@ -466,120 +569,91 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
       skip_accessions: Array.from(alreadyComplete),
     });
 
-    // Spawn the Python pipeline script
-    const pythonScript = path.join(PIPELINE_ROOT, "scripts", "fetch_filings.py");
+    const cikByTicker = new Map(tickerList.map((t) => [t.ticker, t.cik]));
+    const result = await runFetchPipeline(input, { userId, cikByTicker });
+    if (!result.success) {
+      return res
+        .status(500)
+        .json({ success: false, error: result.error || "Pipeline process failed", events: result.events });
+    }
+    res.json({
+      success: true,
+      totalRendered: result.doneEvent?.total_rendered ?? 0,
+      totalSkipped: result.doneEvent?.total_skipped ?? 0,
+      totalErrors: result.doneEvent?.total_errors ?? 0,
+      events: result.events,
+    });
+    // Mark the freshly-rendered filings for review, then drain the queue.
+    if (isReviewEnabled() && result.completedAccessions.length > 0) {
+      Promise.all(result.completedAccessions.map((a) => storage.markFilingForReview(a).catch(() => {})))
+        .then(() => kickReviewProcessor())
+        .catch((err) => console.error("Review processor failed:", err));
+    }
+  });
 
-    // Check if the script exists
-    if (!fs.existsSync(pythonScript)) {
-      return res.status(500).json({ error: "Pipeline script not found. Make sure sec-pdf-pipeline is in the workspace." });
+  // Re-render filings that are "complete" in the DB but whose PDF is missing
+  // on disk (e.g. wiped before the persistent volume existed). Processes a
+  // bounded number of tickers per call; returns how many remain.
+  app.post("/api/filings/render-missing", requireAuth, async (req, res) => {
+    const userId = req.user!.id;
+    const TICKER_CAP = 20;
+
+    const complete = await storage.getFilings({ status: "complete" });
+    const missing = complete.filter((f) => !pdfExistsOnDisk(f.pdfPath));
+    if (missing.length === 0) {
+      return res.json({ rerendered: 0, missingTotal: 0, tickersRemaining: 0 });
     }
 
-    const child = spawn("python3", [pythonScript], {
-      cwd: PIPELINE_ROOT,
-      env: { ...process.env, PYTHONUNBUFFERED: "1" },
-    });
+    // Group missing filings by ticker
+    const byTicker = new Map<string, typeof missing>();
+    for (const f of missing) {
+      const arr = byTicker.get(f.ticker);
+      if (arr) arr.push(f);
+      else byTicker.set(f.ticker, [f]);
+    }
+    const allTickers = Array.from(byTicker.keys());
+    const batchTickers = allTickers.slice(0, TICKER_CAP);
 
-    child.stdin.write(input);
-    child.stdin.end();
-
-    // Collect events from the pipeline
-    const events: any[] = [];
-    const completedAccessions: string[] = [];
-    let stderrOutput = "";
-
-    child.stdout.on("data", (data: Buffer) => {
-      const lines = data.toString().split("\n").filter(Boolean);
-      for (const line of lines) {
-        try {
-          const event = JSON.parse(line);
-          events.push(event);
-
-          // Track filings in our DB (fire-and-forget async)
-          if (event.event === "rendering") {
-            storage.upsertFiling({
-              ticker: event.ticker,
-              cik: tickerList.find((t) => t.ticker === event.ticker)?.cik || "",
-              accessionNumber: event.accession,
-              filingType: event.filing_type,
-              filingDate: event.filing_date || null,
-              status: "rendering",
-              createdAt: new Date().toISOString(),
-              userId,
-            }).catch((err) => console.error("Failed to upsert filing:", err));
-          } else if (event.event === "complete") {
-            // Copy the rendered PDF into app-managed storage
-            const pipelinePdf = path.join(PIPELINE_ROOT, event.path);
-            const ticker = event.ticker || "UNKNOWN";
-            const safeType = (event.filing_type || "filing").replace(/ /g, "_");
-            const destDir = path.join(PDF_STORAGE_DIR, ticker, safeType);
-            if (!fs.existsSync(destDir)) {
-              fs.mkdirSync(destDir, { recursive: true });
-            }
-            const destFile = path.join(destDir, `${event.accession}.pdf`);
-            try {
-              fs.copyFileSync(pipelinePdf, destFile);
-            } catch (copyErr) {
-              console.error(`Failed to copy PDF to app storage: ${copyErr}`);
-            }
-
-            // Store the app-local relative path
-            const appRelPath = path.relative(path.resolve(PDF_STORAGE_DIR, ".."), destFile);
-            completedAccessions.push(event.accession);
-            storage.updateFilingStatus(
-              event.accession,
-              "complete",
-              appRelPath,
-              event.size,
-            ).catch((err) => console.error("Failed to update filing status:", err));
-          } else if (event.event === "error" && event.accession) {
-            storage.updateFilingStatus(
-              event.accession,
-              "error",
-              undefined,
-              undefined,
-              event.message,
-            ).catch((err) => console.error("Failed to update filing error:", err));
-          }
-        } catch {
-          // non-JSON line from Python logging
+    const cikByTicker = new Map<string, string>();
+    const tickers: Array<{ ticker: string; cik: string; filing_types: string[] }> = [];
+    let minDate = "9999-99-99";
+    let maxDate = "0000-00-00";
+    for (const t of batchTickers) {
+      const rows = byTicker.get(t)!;
+      const cik = rows.find((r) => r.cik)?.cik || "";
+      cikByTicker.set(t, cik);
+      tickers.push({ ticker: t, cik, filing_types: Array.from(new Set(rows.map((r) => r.filingType))) });
+      for (const r of rows) {
+        if (r.filingDate) {
+          if (r.filingDate < minDate) minDate = r.filingDate;
+          if (r.filingDate > maxDate) maxDate = r.filingDate;
         }
       }
+    }
+
+    // Skip filings that already have a PDF on disk so we only re-render missing ones.
+    const present = complete.filter((f) => pdfExistsOnDisk(f.pdfPath)).map((f) => f.accessionNumber);
+    const input = JSON.stringify({
+      tickers,
+      date_from: minDate === "9999-99-99" ? null : minDate,
+      date_to: maxDate === "0000-00-00" ? null : maxDate,
+      limit_per_ticker: 100,
+      skip_accessions: present,
     });
 
-    child.stderr.on("data", (data: Buffer) => {
-      stderrOutput += data.toString();
-    });
-
-    child.on("close", (code) => {
-      const doneEvent = events.find((e) => e.event === "done");
-      if (code === 0 && doneEvent) {
-        res.json({
-          success: true,
-          totalRendered: doneEvent.total_rendered,
-          totalSkipped: doneEvent.total_skipped || 0,
-          totalErrors: doneEvent.total_errors,
-          events,
-        });
-        // Mark the freshly-rendered filings for review, then drain the queue.
-        // Fire-and-forget: results are written to the DB and polled by the UI.
-        if (isReviewEnabled() && completedAccessions.length > 0) {
-          Promise.all(
-            completedAccessions.map((a) => storage.markFilingForReview(a).catch(() => {})),
-          )
-            .then(() => kickReviewProcessor())
-            .catch((err) => console.error("Review processor failed:", err));
-        }
-      } else {
-        res.status(500).json({
-          success: false,
-          error: stderrOutput || "Pipeline process failed",
-          events,
-        });
-      }
-    });
-
-    child.on("error", (err) => {
-      res.status(500).json({ error: `Failed to start pipeline: ${err.message}` });
+    const result = await runFetchPipeline(input, { userId, cikByTicker });
+    if (!result.success) {
+      return res.status(500).json({ error: result.error || "Re-render failed" });
+    }
+    if (isReviewEnabled() && result.completedAccessions.length > 0) {
+      Promise.all(result.completedAccessions.map((a) => storage.markFilingForReview(a).catch(() => {})))
+        .then(() => kickReviewProcessor())
+        .catch((err) => console.error("Review processor failed:", err));
+    }
+    res.json({
+      rerendered: result.completedAccessions.length,
+      missingTotal: missing.length,
+      tickersRemaining: Math.max(0, allTickers.length - batchTickers.length),
     });
   });
 

@@ -32,7 +32,7 @@ import {
 import { format } from "date-fns";
 import type { DateRange } from "react-day-picker";
 import { useToast } from "@/hooks/use-toast";
-import { Search, Download, Loader2, FileText, Calendar as CalendarIcon, Check, X, AlertCircle, ShieldAlert, ShieldCheck } from "lucide-react";
+import { Search, Download, Loader2, FileText, Calendar as CalendarIcon, Check, X, AlertCircle, ShieldAlert, ShieldCheck, RefreshCw } from "lucide-react";
 import type { Filing } from "@shared/schema";
 import { CATEGORY_LABELS, parseFindings, estimateReviewCost, formatCostRange } from "@/lib/findings";
 
@@ -233,6 +233,33 @@ export default function FetchFilings() {
     onSuccess: () => {
       refetchFilings();
       toast({ title: "Re-queued for review" });
+    },
+    onError: (err: Error) => toast({ title: "Error", description: err.message, variant: "destructive" }),
+  });
+
+  // Re-render filings whose PDF is missing from disk (zombie "complete" rows)
+  const renderMissingMutation = useMutation<{ rerendered: number; missingTotal: number; tickersRemaining: number }>({
+    mutationFn: async () => {
+      const res = await apiRequest("POST", "/api/filings/render-missing");
+      if (!res.ok) {
+        const body = await res.json();
+        throw new Error(body.error || "Re-render failed");
+      }
+      return res.json();
+    },
+    onSuccess: (data) => {
+      refetchFilings();
+      if (data.missingTotal === 0) {
+        toast({ title: "No missing PDFs — nothing to re-render" });
+      } else {
+        toast({
+          title: `Re-rendered ${data.rerendered} filing${data.rerendered !== 1 ? "s" : ""}`,
+          description:
+            data.tickersRemaining > 0
+              ? `${data.tickersRemaining} more ticker${data.tickersRemaining !== 1 ? "s" : ""} still have missing PDFs — run again.`
+              : "All missing PDFs regenerated; reviews re-queued.",
+        });
+      }
     },
     onError: (err: Error) => toast({ title: "Error", description: err.message, variant: "destructive" }),
   });
@@ -466,7 +493,7 @@ export default function FetchFilings() {
       )}
 
       {/* Results */}
-      <div className="mb-4">
+      <div className="mb-4 flex items-center justify-between gap-3">
         <h2 className="text-lg font-semibold">
           Rendered PDFs
           {completedFilings.length > 0 && (
@@ -475,6 +502,23 @@ export default function FetchFilings() {
             </span>
           )}
         </h2>
+        {completedFilings.length > 0 && (
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => renderMissingMutation.mutate()}
+            disabled={renderMissingMutation.isPending}
+            title="Regenerate PDFs that show 'Review error: Rendered PDF not found'"
+            data-testid="button-render-missing"
+          >
+            {renderMissingMutation.isPending ? (
+              <Loader2 className="w-3.5 h-3.5 mr-1.5 animate-spin" />
+            ) : (
+              <RefreshCw className="w-3.5 h-3.5 mr-1.5" />
+            )}
+            Re-render missing PDFs
+          </Button>
+        )}
       </div>
 
       {showReviewBanner && (
