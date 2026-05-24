@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Link } from "wouter";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { API_BASE, apiRequest, queryClient } from "@/lib/queryClient";
 import { Card } from "@/components/ui/card";
@@ -344,7 +345,11 @@ export default function Findings() {
             Findings
           </h1>
           <p className="text-sm text-muted-foreground">
-            Post-worthy details Claude surfaced across your reviewed filings — triage, then open the source.
+            Findings are generated automatically:{" "}
+            <Link href="/fetch" className="text-primary hover:underline">
+              fetch filings
+            </Link>{" "}
+            → Claude reviews each one → post-worthy details show up here. Triage them, then open the source.
           </p>
           {usage && usage.reviewedCount > 0 && (
             <p className="text-xs text-muted-foreground mt-1" data-testid="text-review-spend">

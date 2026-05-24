@@ -327,10 +327,13 @@ export default function FetchFilings() {
     <div className="p-6 max-w-5xl mx-auto">
       <div className="mb-6">
         <h1 className="text-xl font-semibold mb-1" data-testid="text-page-title">
-          Fetch Filings
+          Fetch &amp; Review Filings
         </h1>
         <p className="text-sm text-muted-foreground">
-          Select tickers and a date range, then fetch and render SEC filings as PDFs.
+          Select tickers and a date range, then fetch and render SEC filings as PDFs.{" "}
+          {reviewEnabled
+            ? "Newly rendered filings are automatically reviewed by Claude — findings show up in the Findings tab."
+            : "Set ANTHROPIC_API_KEY to also have Claude review fetched filings for findings."}
         </p>
       </div>
 
@@ -481,12 +484,13 @@ export default function FetchFilings() {
             {fetchMutation.isPending ? (
               <>
                 <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                Fetching & Rendering PDFs...
+                {reviewEnabled ? "Fetching, rendering & queuing review…" : "Fetching & rendering PDFs…"}
               </>
             ) : (
               <>
                 <Search className="w-4 h-4 mr-2" />
-                Fetch & Render PDFs ({selectedTickers.size} ticker{selectedTickers.size !== 1 ? "s" : ""})
+                {reviewEnabled ? "Fetch, render & review" : "Fetch & render PDFs"} ({selectedTickers.size}{" "}
+                ticker{selectedTickers.size !== 1 ? "s" : ""})
               </>
             )}
           </Button>

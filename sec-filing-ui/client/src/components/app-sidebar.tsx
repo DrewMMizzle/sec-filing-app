@@ -113,24 +113,24 @@ export function AppSidebar() {
                 <SidebarMenuItem>
                   <SidebarMenuButton
                     asChild
-                    isActive={location === "/" || location === "/findings"}
-                    data-testid="nav-findings"
+                    isActive={location === "/fetch"}
+                    data-testid="nav-fetch-filings"
                   >
-                    <Link href="/">
-                      <Sparkles className="w-4 h-4" />
-                      <span>Findings</span>
+                    <Link href="/fetch">
+                      <Search className="w-4 h-4" />
+                      <span>Fetch &amp; Review</span>
                     </Link>
                   </SidebarMenuButton>
                 </SidebarMenuItem>
                 <SidebarMenuItem>
                   <SidebarMenuButton
                     asChild
-                    isActive={location === "/fetch"}
-                    data-testid="nav-fetch-filings"
+                    isActive={location === "/" || location === "/findings"}
+                    data-testid="nav-findings"
                   >
-                    <Link href="/fetch">
-                      <Search className="w-4 h-4" />
-                      <span>Fetch Filings</span>
+                    <Link href="/">
+                      <Sparkles className="w-4 h-4" />
+                      <span>Findings</span>
                     </Link>
                   </SidebarMenuButton>
                 </SidebarMenuItem>
