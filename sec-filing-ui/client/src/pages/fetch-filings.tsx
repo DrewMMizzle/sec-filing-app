@@ -220,28 +220,6 @@ export default function FetchFilings() {
     },
   });
 
-  // Review filings already in the library (not just freshly fetched ones)
-  const reviewMutation = useMutation<{ queued: number }>({
-    mutationFn: async () => {
-      const res = await apiRequest("POST", "/api/filings/review");
-      if (!res.ok) {
-        const body = await res.json();
-        throw new Error(body.error || "Review request failed");
-      }
-      return res.json();
-    },
-    onSuccess: (data) => {
-      refetchFilings();
-      toast({
-        title:
-          data.queued > 0
-            ? `Queued ${data.queued} filing${data.queued !== 1 ? "s" : ""} for review`
-            : "All filings are already reviewed",
-      });
-    },
-    onError: (err: Error) => toast({ title: "Error", description: err.message, variant: "destructive" }),
-  });
-
   // Re-run review for a single filing whose review errored
   const retryReviewMutation = useMutation({
     mutationFn: async (accession: string) => {
@@ -258,14 +236,6 @@ export default function FetchFilings() {
     },
     onError: (err: Error) => toast({ title: "Error", description: err.message, variant: "destructive" }),
   });
-
-  // Filings eligible for a library review (complete, not already done/in-flight)
-  const reviewableFilings = existingFilings.filter(
-    (f) =>
-      f.status === "complete" &&
-      !["done", "pending", "reviewing"].includes(f.reviewStatus || ""),
-  );
-  const reviewableCount = reviewableFilings.length;
 
   const handleFetch = () => {
     if (selectedTickers.size === 0) {
@@ -289,19 +259,6 @@ export default function FetchFilings() {
       return;
     }
     fetchMutation.mutate();
-  };
-
-  const handleReviewLibrary = () => {
-    if (reviewableCount > CONFIRM_THRESHOLD) {
-      const cost = formatCostRange(estimateReviewCost(reviewableFilings.map((f) => f.filingType)));
-      setConfirm({
-        title: "Review the library with Claude?",
-        body: `This will run a Claude review on ~${reviewableCount} filing${reviewableCount !== 1 ? "s" : ""}. Estimated Claude cost: ${cost} (Opus 4.7; rough, varies with filing length). It can also take a while.`,
-        action: () => reviewMutation.mutate(),
-      });
-      return;
-    }
-    reviewMutation.mutate();
   };
 
   // Filter existing filings by current date range
@@ -509,7 +466,7 @@ export default function FetchFilings() {
       )}
 
       {/* Results */}
-      <div className="mb-4 flex items-center justify-between gap-3">
+      <div className="mb-4">
         <h2 className="text-lg font-semibold">
           Rendered PDFs
           {completedFilings.length > 0 && (
@@ -518,22 +475,6 @@ export default function FetchFilings() {
             </span>
           )}
         </h2>
-        {reviewEnabled && completedFilings.length > 0 && (
-          <Button
-            variant="secondary"
-            size="sm"
-            onClick={handleReviewLibrary}
-            disabled={reviewMutation.isPending || reviewingCount > 0}
-            data-testid="button-review-library"
-          >
-            {reviewMutation.isPending || reviewingCount > 0 ? (
-              <Loader2 className="w-3.5 h-3.5 mr-1.5 animate-spin" />
-            ) : (
-              <ShieldAlert className="w-3.5 h-3.5 mr-1.5" />
-            )}
-            Review with Claude
-          </Button>
-        )}
       </div>
 
       {showReviewBanner && (
