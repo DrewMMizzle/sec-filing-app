@@ -173,7 +173,10 @@ async function reviewOne(filing: Filing): Promise<void> {
   await storage.setFilingReviewStatus(filing.accessionNumber, "reviewing");
   try {
     const pdfPath = resolvePdfPath(filing);
-    if (!pdfPath) throw new Error("Rendered PDF not found on disk");
+    if (!pdfPath)
+      throw new Error(
+        "Rendered PDF is missing on disk (storage may have been cleared on a redeploy). Re-fetch this filing to regenerate it.",
+      );
     const text = await extractPdfText(pdfPath);
     const result = await callClaude(filing, text);
     await storage.setFilingReviewResult(filing.accessionNumber, result, result.usage);
