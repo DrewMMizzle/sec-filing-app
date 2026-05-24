@@ -117,6 +117,16 @@ export default function FetchFilings() {
   });
   const reviewEnabled = config?.reviewEnabled ?? false;
 
+  // Current Claude spend cap, so we can warn before a big run and flag pauses.
+  const { data: usage } = useQuery<{
+    costUsd: number;
+    budgetUsd: number | null;
+    pendingCount: number;
+    paused: boolean;
+  }>({
+    queryKey: ["/api/review/usage"],
+  });
+
   const { data: existingFilings = [], refetch: refetchFilings } = useQuery<Filing[]>({
     queryKey: ["/api/filings"],
     // While Claude is reviewing filings, poll so flags appear as they complete.
@@ -271,8 +281,14 @@ export default function FetchFilings() {
     }
     if (selectedTickers.size > CONFIRM_THRESHOLD) {
       const est = selectedTickers.size * limitPerTicker;
+      const capNote =
+        reviewEnabled && usage?.budgetUsd != null
+          ? ` A $${usage.budgetUsd.toFixed(2)} spend cap is set ($${usage.costUsd.toFixed(2)} used) — review pauses automatically if it's reached.`
+          : reviewEnabled
+            ? " Tip: set a spend cap on the Findings page to stop reviews automatically at a dollar limit."
+            : "";
       const costNote = reviewEnabled
-        ? ` Estimated Claude review cost: ${formatCostRange(estimateReviewCost(Array(est).fill(undefined)))} (Opus 4.7; rough).`
+        ? ` Estimated Claude review cost: ${formatCostRange(estimateReviewCost(Array(est).fill(undefined)))} (Opus 4.7; rough).${capNote}`
         : "";
       setConfirm({
         title: "Fetch a large batch?",

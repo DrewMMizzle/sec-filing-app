@@ -18,6 +18,7 @@ import {
   filings,
   watchlistShares,
   findingActions,
+  settings,
 } from "@shared/schema";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
@@ -113,6 +114,12 @@ export async function initDatabase(): Promise<void> {
     );
     CREATE UNIQUE INDEX IF NOT EXISTS idx_finding_action_unique ON finding_actions(user_id, accession_number, finding_index);
     CREATE INDEX IF NOT EXISTS idx_finding_actions_user ON finding_actions(user_id);
+
+    -- App-wide key/value settings (e.g. the review spend cap)
+    CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY,
+      value TEXT
+    );
 
     -- Indexes for performance at scale
     CREATE INDEX IF NOT EXISTS idx_tickers_watchlist ON tickers(watchlist_id);
@@ -417,6 +424,37 @@ export class DatabaseStorage {
       cacheReadTokens: parseInt(row.cache_read_tokens, 10),
       cacheCreationTokens: parseInt(row.cache_creation_tokens, 10),
     };
+  }
+
+  // ─── App settings (key/value) ───────────────────────────
+
+  async getSetting(key: string): Promise<string | null> {
+    const rows = await db.select().from(settings).where(eq(settings.key, key));
+    return rows[0]?.value ?? null;
+  }
+
+  async setSetting(key: string, value: string | null): Promise<void> {
+    const existing = await db.select().from(settings).where(eq(settings.key, key));
+    if (existing[0]) {
+      await db.update(settings).set({ value }).where(eq(settings.key, key));
+    } else {
+      await db.insert(settings).values({ key, value });
+    }
+  }
+
+  // The team-wide max review spend in USD, or null if no cap is set.
+  async getReviewBudgetUsd(): Promise<number | null> {
+    const raw = await this.getSetting("review_budget_usd");
+    if (raw === null || raw === "") return null;
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  async getPendingReviewCount(): Promise<number> {
+    const result = await pool.query(
+      `SELECT COUNT(*) AS c FROM filings WHERE review_status = 'pending'`,
+    );
+    return parseInt(result.rows[0].c, 10);
   }
 
   async setFilingReviewError(accession: string, message: string): Promise<void> {

@@ -18,6 +18,28 @@ export const MODEL = "claude-opus-4-7";
 // Cap the text sent per filing to bound cost/latency on very large 10-Ks.
 const MAX_CHARS = 400_000;
 
+// Opus 4.7 pricing (USD per 1M tokens).
+const PRICE_INPUT = 5;
+const PRICE_OUTPUT = 25;
+const PRICE_CACHE_READ = 0.5;
+const PRICE_CACHE_WRITE = 6.25;
+
+// Dollar cost of a set of token counts.
+export function reviewCostUsd(u: {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+}): number {
+  return (
+    (u.inputTokens * PRICE_INPUT +
+      u.outputTokens * PRICE_OUTPUT +
+      u.cacheReadTokens * PRICE_CACHE_READ +
+      u.cacheCreationTokens * PRICE_CACHE_WRITE) /
+    1_000_000
+  );
+}
+
 export function isReviewEnabled(): boolean {
   return !!process.env.ANTHROPIC_API_KEY;
 }
@@ -199,18 +221,25 @@ export async function resumeReviews(): Promise<void> {
 
 let processing = false;
 
-// Drain all pending filings sequentially. Safe to call repeatedly; only one
-// drain runs at a time per process. No-op when no API key is configured.
+// Drain pending filings sequentially. Safe to call repeatedly; only one drain
+// runs at a time per process. No-op when no API key is configured. If a team
+// spend cap is set, the drain stops (leaving filings 'pending') once cumulative
+// review spend reaches the cap. The cap applies ONLY to this review processor —
+// the Compare feature does not go through here and is never throttled.
 export async function kickReviewProcessor(): Promise<void> {
   if (!isReviewEnabled() || processing) return;
   processing = true;
   try {
     while (true) {
-      const batch = await storage.getPendingReviewFilings(5);
-      if (batch.length === 0) break;
-      for (const filing of batch) {
-        await reviewOne(filing);
+      const budget = await storage.getReviewBudgetUsd();
+      if (budget !== null && reviewCostUsd(await storage.getReviewUsage()) >= budget) {
+        console.log(`[review] Spend cap of $${budget} reached — pausing review queue.`);
+        break;
       }
+      // Process one at a time so the cap is checked between every filing.
+      const batch = await storage.getPendingReviewFilings(1);
+      if (batch.length === 0) break;
+      await reviewOne(batch[0]);
     }
   } catch (err) {
     console.error("[review] Processor error:", err);
