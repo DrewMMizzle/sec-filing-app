@@ -242,6 +242,23 @@ export default function FetchFilings() {
     onError: (err: Error) => toast({ title: "Error", description: err.message, variant: "destructive" }),
   });
 
+  // Re-run review for a single filing whose review errored
+  const retryReviewMutation = useMutation({
+    mutationFn: async (accession: string) => {
+      const res = await apiRequest("POST", `/api/filings/${encodeURIComponent(accession)}/review`);
+      if (!res.ok) {
+        const body = await res.json();
+        throw new Error(body.error || "Retry failed");
+      }
+      return res.json();
+    },
+    onSuccess: () => {
+      refetchFilings();
+      toast({ title: "Re-queued for review" });
+    },
+    onError: (err: Error) => toast({ title: "Error", description: err.message, variant: "destructive" }),
+  });
+
   // Filings eligible for a library review (complete, not already done/in-flight)
   const reviewableFilings = existingFilings.filter(
     (f) =>
@@ -615,9 +632,27 @@ export default function FetchFilings() {
                     </Badge>
                   )}
                   {f.reviewStatus === "error" && (
-                    <Badge variant="secondary" className="text-xs" title={f.reviewError || undefined}>
-                      <AlertCircle className="w-3 h-3 mr-0.5" /> Review failed
-                    </Badge>
+                    <span className="inline-flex items-center gap-1">
+                      <Badge
+                        variant="secondary"
+                        className="text-xs text-muted-foreground"
+                        title={f.reviewError || undefined}
+                      >
+                        <AlertCircle className="w-3 h-3 mr-0.5" /> Review error
+                      </Badge>
+                      {reviewEnabled && (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-5 px-1.5 text-[11px] text-muted-foreground"
+                          onClick={() => retryReviewMutation.mutate(f.accessionNumber)}
+                          disabled={retryReviewMutation.isPending}
+                          data-testid={`retry-review-${f.accessionNumber}`}
+                        >
+                          Retry
+                        </Button>
+                      )}
+                    </span>
                   )}
                 </div>
                 <div className="flex items-center gap-3 text-xs text-muted-foreground">
@@ -626,6 +661,9 @@ export default function FetchFilings() {
                     <span>{(f.pdfSize / 1024 / 1024).toFixed(1)} MB</span>
                   )}
                 </div>
+                {f.reviewStatus === "error" && f.reviewError && (
+                  <p className="text-xs text-muted-foreground/80 mt-1">Review error: {f.reviewError}</p>
+                )}
                 {f.reviewStatus === "done" && f.reviewFlagged && f.reviewSummary && (
                   <p
                     className="text-xs mt-1.5 text-amber-300/90 font-medium"

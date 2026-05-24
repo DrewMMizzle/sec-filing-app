@@ -684,6 +684,26 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     res.json({ queued });
   });
 
+  // Retry / run review for a single filing
+  app.post("/api/filings/:accession/review", requireAuth, async (req, res) => {
+    const userId = req.user!.id;
+    if (!isReviewEnabled()) {
+      return res
+        .status(409)
+        .json({ error: "Claude review is not configured (ANTHROPIC_API_KEY is not set)." });
+    }
+    const accession = req.params.accession as string;
+    const filing = await storage.getFilingByAccession(accession);
+    if (!filing) return res.status(404).json({ error: "Filing not found" });
+    if (filing.userId !== userId) return res.status(403).json({ error: "Access denied" });
+    if (filing.status !== "complete") {
+      return res.status(400).json({ error: "Filing isn't rendered yet" });
+    }
+    await storage.markFilingForReview(accession);
+    kickReviewProcessor().catch((err) => console.error("Review processor failed:", err));
+    res.json({ ok: true });
+  });
+
   // Download a PDF by accession number
   app.get("/api/filings/:accession/pdf", requireAuth, async (req, res) => {
     const userId = req.user!.id;

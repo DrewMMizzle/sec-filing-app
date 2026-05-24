@@ -22,6 +22,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useToast } from "@/hooks/use-toast";
 import {
   Sparkles,
@@ -34,6 +35,7 @@ import {
   Download,
   Loader2,
   AlertCircle,
+  Layers,
 } from "lucide-react";
 import type { Filing, FindingAction } from "@shared/schema";
 import { CATEGORY_LABELS, parseFindings, interestColor, estimateReviewCost, formatCostRange, type ReviewFinding } from "@/lib/findings";
@@ -78,6 +80,8 @@ function downloadCsv(rows: Row[]) {
   a.click();
   URL.revokeObjectURL(url);
 }
+
+const interestRank = (l?: string | null) => (l === "high" ? 3 : l === "medium" ? 2 : l === "low" ? 1 : 0);
 
 export default function Findings() {
   const { data: filings = [] } = useQuery<Filing[]>({
@@ -147,6 +151,8 @@ export default function Findings() {
   const [interest, setInterest] = useState<string>("all");
   const [triage, setTriage] = useState<string>("active");
   const [q, setQ] = useState("");
+  const [sortBy, setSortBy] = useState<string>("date");
+  const [groupByTicker, setGroupByTicker] = useState(false);
   const [confirmReview, setConfirmReview] = useState(false);
 
   // Saved PDFs that haven't been (successfully) reviewed yet
@@ -178,11 +184,10 @@ export default function Findings() {
         const key = `${f.accessionNumber}#${index}`;
         return { filing: f, finding, index, key, status: statusMap.get(key) };
       }),
-    )
-    .sort((a, b) => (b.filing.filingDate || "").localeCompare(a.filing.filingDate || ""));
+    );
 
   const term = q.trim().toLowerCase();
-  const rows = allRows.filter((r) => {
+  const filtered = allRows.filter((r) => {
     if (activeCats.size > 0 && !activeCats.has(r.finding.category)) return false;
     if (interest !== "all" && r.filing.reviewMateriality !== interest) return false;
     if (triage === "active" && r.status === "dismissed") return false;
@@ -196,6 +201,27 @@ export default function Findings() {
     }
     return true;
   });
+
+  const byDateDesc = (a: Row, b: Row) => (b.filing.filingDate || "").localeCompare(a.filing.filingDate || "");
+  const rows = [...filtered].sort((a, b) => {
+    if (sortBy === "ticker")
+      return a.filing.ticker.localeCompare(b.filing.ticker) || byDateDesc(a, b);
+    if (sortBy === "interest")
+      return interestRank(b.filing.reviewMateriality) - interestRank(a.filing.reviewMateriality) || byDateDesc(a, b);
+    if (sortBy === "oldest") return (a.filing.filingDate || "").localeCompare(b.filing.filingDate || "");
+    return byDateDesc(a, b);
+  });
+
+  // Group rows by ticker, ordered by finding count (most first)
+  const tickerGroups: Array<[string, Row[]]> = (() => {
+    const m = new Map<string, Row[]>();
+    for (const r of rows) {
+      const arr = m.get(r.filing.ticker);
+      if (arr) arr.push(r);
+      else m.set(r.filing.ticker, [r]);
+    }
+    return Array.from(m.entries()).sort((a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]));
+  })();
 
   const toggleCat = (c: string) =>
     setActiveCats((prev) => {
@@ -211,6 +237,103 @@ export default function Findings() {
       findingIndex: r.index,
       status: r.status === target ? "new" : target,
     });
+  };
+
+  const renderRow = (r: Row) => {
+    const { filing, finding } = r;
+    return (
+      <Card
+        key={r.key}
+        className={`p-4 ${r.status === "dismissed" ? "opacity-60" : ""}`}
+        data-testid="finding-row"
+      >
+        <div className="flex items-start gap-3">
+          <ShieldAlert className={`w-4 h-4 mt-0.5 shrink-0 ${interestColor(filing.reviewMateriality)}`} />
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-2 mb-1 flex-wrap">
+              <Badge variant="secondary" className="text-[10px] uppercase tracking-wide">
+                {CATEGORY_LABELS[finding.category] || finding.category}
+              </Badge>
+              {r.status === "starred" && (
+                <Badge className="text-[10px] bg-amber-600/20 text-amber-400 border-amber-600/30">Starred</Badge>
+              )}
+              {r.status === "posted" && (
+                <Badge className="text-[10px] bg-green-600/20 text-green-400 border-green-600/30">Posted</Badge>
+              )}
+              {r.status === "dismissed" && (
+                <Badge variant="secondary" className="text-[10px] text-muted-foreground">Dismissed</Badge>
+              )}
+              <span className="text-sm font-semibold">{finding.headline}</span>
+            </div>
+            <p className="text-sm text-muted-foreground">{finding.detail}</p>
+            {finding.why && <p className="text-xs text-muted-foreground/80 italic mt-0.5">{finding.why}</p>}
+            <div className="flex items-center gap-2 mt-2 text-xs text-muted-foreground">
+              <span className="font-mono font-medium text-foreground">{filing.ticker}</span>
+              <Badge variant="outline" className="text-[10px]">{filing.filingType}</Badge>
+              {filing.filingDate && <span>{filing.filingDate}</span>}
+            </div>
+          </div>
+          <div className="flex flex-col items-end gap-1.5 shrink-0">
+            <div className="flex items-center gap-0.5">
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className={`h-7 w-7 ${r.status === "starred" ? "text-amber-400" : "text-muted-foreground"}`}
+                    onClick={() => setStatus(r, "starred")}
+                    data-testid={`action-star-${r.key}`}
+                  >
+                    <Star className="w-3.5 h-3.5" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>{r.status === "starred" ? "Unstar" : "Star (shortlist)"}</TooltipContent>
+              </Tooltip>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className={`h-7 w-7 ${r.status === "posted" ? "text-green-400" : "text-muted-foreground"}`}
+                    onClick={() => setStatus(r, "posted")}
+                    data-testid={`action-posted-${r.key}`}
+                  >
+                    <CheckCircle2 className="w-3.5 h-3.5" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>{r.status === "posted" ? "Unmark posted" : "Mark as posted"}</TooltipContent>
+              </Tooltip>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className={`h-7 w-7 ${r.status === "dismissed" ? "text-foreground" : "text-muted-foreground"}`}
+                    onClick={() => setStatus(r, "dismissed")}
+                    data-testid={`action-dismiss-${r.key}`}
+                  >
+                    <Ban className="w-3.5 h-3.5" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>{r.status === "dismissed" ? "Un-dismiss" : "Dismiss (hide)"}</TooltipContent>
+              </Tooltip>
+            </div>
+            {filing.pdfPath && (
+              <a
+                href={`${API_BASE}/api/filings/${encodeURIComponent(filing.accessionNumber)}/pdf`}
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                <Button size="sm" variant="secondary" data-testid={`source-${filing.accessionNumber}`}>
+                  <ExternalLink className="w-3.5 h-3.5 mr-1.5" />
+                  Source
+                </Button>
+              </a>
+            )}
+          </div>
+        </div>
+      </Card>
+    );
   };
 
   return (
@@ -313,11 +436,11 @@ export default function Findings() {
             />
           </div>
           <Select value={triage} onValueChange={setTriage}>
-            <SelectTrigger className="w-40" data-testid="select-triage">
+            <SelectTrigger className="w-[150px]" data-testid="select-triage">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="active">Active (not dismissed)</SelectItem>
+              <SelectItem value="active">Active</SelectItem>
               <SelectItem value="untriaged">Untriaged</SelectItem>
               <SelectItem value="starred">Starred</SelectItem>
               <SelectItem value="posted">Posted</SelectItem>
@@ -336,12 +459,33 @@ export default function Findings() {
               <SelectItem value="low">Low</SelectItem>
             </SelectContent>
           </Select>
+          <Select value={sortBy} onValueChange={setSortBy}>
+            <SelectTrigger className="w-36" data-testid="select-sort">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="date">Newest first</SelectItem>
+              <SelectItem value="oldest">Oldest first</SelectItem>
+              <SelectItem value="ticker">Ticker A–Z</SelectItem>
+              <SelectItem value="interest">Interest</SelectItem>
+            </SelectContent>
+          </Select>
+          <Button
+            variant={groupByTicker ? "default" : "outline"}
+            size="sm"
+            onClick={() => setGroupByTicker((v) => !v)}
+            data-testid="button-group-ticker"
+          >
+            <Layers className="w-3.5 h-3.5 mr-1.5" />
+            Group by ticker
+          </Button>
         </div>
       </Card>
 
       <div className="mb-3 text-sm text-muted-foreground">
         {rows.length} finding{rows.length !== 1 ? "s" : ""}
         {allRows.length !== rows.length ? ` of ${allRows.length}` : ""}
+        {groupByTicker ? ` across ${tickerGroups.length} ticker${tickerGroups.length !== 1 ? "s" : ""}` : ""}
         {reviewing && <span className="ml-2 text-amber-400">· reviewing in progress…</span>}
       </div>
 
@@ -362,103 +506,22 @@ export default function Findings() {
                   : "No findings yet. Fetch filings on the Fetch Filings page, then review them."}
           </p>
         </Card>
-      ) : (
-        <div className="space-y-2">
-          {rows.map((r) => {
-            const { filing, finding } = r;
-            return (
-              <Card
-                key={r.key}
-                className={`p-4 ${r.status === "dismissed" ? "opacity-60" : ""}`}
-                data-testid="finding-row"
-              >
-                <div className="flex items-start gap-3">
-                  <ShieldAlert className={`w-4 h-4 mt-0.5 shrink-0 ${interestColor(filing.reviewMateriality)}`} />
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2 mb-1 flex-wrap">
-                      <Badge variant="secondary" className="text-[10px] uppercase tracking-wide">
-                        {CATEGORY_LABELS[finding.category] || finding.category}
-                      </Badge>
-                      {r.status === "starred" && (
-                        <Badge className="text-[10px] bg-amber-600/20 text-amber-400 border-amber-600/30">
-                          Starred
-                        </Badge>
-                      )}
-                      {r.status === "posted" && (
-                        <Badge className="text-[10px] bg-green-600/20 text-green-400 border-green-600/30">
-                          Posted
-                        </Badge>
-                      )}
-                      {r.status === "dismissed" && (
-                        <Badge variant="secondary" className="text-[10px] text-muted-foreground">
-                          Dismissed
-                        </Badge>
-                      )}
-                      <span className="text-sm font-semibold">{finding.headline}</span>
-                    </div>
-                    <p className="text-sm text-muted-foreground">{finding.detail}</p>
-                    {finding.why && (
-                      <p className="text-xs text-muted-foreground/80 italic mt-0.5">{finding.why}</p>
-                    )}
-                    <div className="flex items-center gap-2 mt-2 text-xs text-muted-foreground">
-                      <span className="font-mono font-medium text-foreground">{filing.ticker}</span>
-                      <Badge variant="outline" className="text-[10px]">
-                        {filing.filingType}
-                      </Badge>
-                      {filing.filingDate && <span>{filing.filingDate}</span>}
-                    </div>
-                  </div>
-                  <div className="flex flex-col items-end gap-1.5 shrink-0">
-                    <div className="flex items-center gap-0.5">
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className={`h-7 w-7 ${r.status === "starred" ? "text-amber-400" : "text-muted-foreground"}`}
-                        title="Star"
-                        onClick={() => setStatus(r, "starred")}
-                        data-testid={`action-star-${r.key}`}
-                      >
-                        <Star className="w-3.5 h-3.5" />
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className={`h-7 w-7 ${r.status === "posted" ? "text-green-400" : "text-muted-foreground"}`}
-                        title="Mark posted"
-                        onClick={() => setStatus(r, "posted")}
-                        data-testid={`action-posted-${r.key}`}
-                      >
-                        <CheckCircle2 className="w-3.5 h-3.5" />
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className={`h-7 w-7 ${r.status === "dismissed" ? "text-foreground" : "text-muted-foreground"}`}
-                        title="Dismiss"
-                        onClick={() => setStatus(r, "dismissed")}
-                        data-testid={`action-dismiss-${r.key}`}
-                      >
-                        <Ban className="w-3.5 h-3.5" />
-                      </Button>
-                    </div>
-                    {filing.pdfPath && (
-                      <a
-                        href={`${API_BASE}/api/filings/${encodeURIComponent(filing.accessionNumber)}/pdf`}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                      >
-                        <Button size="sm" variant="secondary" data-testid={`source-${filing.accessionNumber}`}>
-                          <ExternalLink className="w-3.5 h-3.5 mr-1.5" />
-                          Source
-                        </Button>
-                      </a>
-                    )}
-                  </div>
-                </div>
-              </Card>
-            );
-          })}
+      ) : groupByTicker ? (
+        <div className="space-y-6">
+          {tickerGroups.map(([tk, rs]) => (
+            <div key={tk} className="space-y-2">
+              <div className="flex items-center gap-2 border-b pb-1.5">
+                <span className="font-mono font-semibold text-sm">{tk}</span>
+                <Badge variant="secondary" className="text-[10px]">
+                  {rs.length} finding{rs.length !== 1 ? "s" : ""}
+                </Badge>
+              </div>
+              {rs.map(renderRow)}
+            </div>
+          ))}
         </div>
+      ) : (
+        <div className="space-y-2">{rows.map(renderRow)}</div>
       )}
 
       <AlertDialog open={confirmReview} onOpenChange={setConfirmReview}>
