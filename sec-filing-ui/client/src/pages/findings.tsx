@@ -24,14 +24,6 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogDescription,
-  DialogFooter,
-} from "@/components/ui/dialog";
 import { useToast } from "@/hooks/use-toast";
 import {
   Sparkles,
@@ -46,7 +38,6 @@ import {
   AlertCircle,
   Layers,
   X,
-  Wallet,
   PauseCircle,
 } from "lucide-react";
 import type { Filing, FindingAction } from "@shared/schema";
@@ -174,50 +165,6 @@ export default function Findings() {
   });
 
   const paused = usage?.paused ?? false;
-
-  // Team-wide Claude spend cap
-  const [budgetOpen, setBudgetOpen] = useState(false);
-  const [budgetInput, setBudgetInput] = useState("");
-  const budgetMutation = useMutation<{ budgetUsd: number | null }, Error, number | null>({
-    mutationFn: async (budgetUsd) => {
-      const res = await apiRequest("POST", "/api/review/budget", { budgetUsd });
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        throw new Error(body.error || "Failed to update spend cap");
-      }
-      return res.json();
-    },
-    onSuccess: (data) => {
-      queryClient.invalidateQueries({ queryKey: ["/api/review/usage"] });
-      queryClient.invalidateQueries({ queryKey: ["/api/filings"] });
-      setBudgetOpen(false);
-      toast({
-        title:
-          data.budgetUsd === null
-            ? "Spend cap removed"
-            : `Spend cap set to $${data.budgetUsd.toFixed(2)}`,
-      });
-    },
-    onError: (err) => toast({ title: "Error", description: err.message, variant: "destructive" }),
-  });
-
-  const openBudgetDialog = () => {
-    setBudgetInput(usage?.budgetUsd != null ? String(usage.budgetUsd) : "");
-    setBudgetOpen(true);
-  };
-  const saveBudget = () => {
-    const trimmed = budgetInput.trim();
-    if (trimmed === "") {
-      budgetMutation.mutate(null);
-      return;
-    }
-    const n = Number(trimmed);
-    if (!Number.isFinite(n) || n < 0) {
-      toast({ title: "Enter a valid amount", description: "Use a non-negative dollar amount.", variant: "destructive" });
-      return;
-    }
-    budgetMutation.mutate(n);
-  };
 
   const [activeCats, setActiveCats] = useState<Set<string>>(new Set());
   const [interest, setInterest] = useState<string>("all");
@@ -453,17 +400,6 @@ export default function Findings() {
           )}
         </div>
         <div className="flex items-center gap-2 shrink-0">
-          {reviewEnabled && (
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={openBudgetDialog}
-              data-testid="button-set-budget"
-            >
-              <Wallet className="w-3.5 h-3.5 mr-1.5" />
-              {usage?.budgetUsd != null ? `Cap $${usage.budgetUsd.toFixed(0)}` : "Set cap"}
-            </Button>
-          )}
           {reviewEnabled && (reviewableCount > 0 || reviewing) && (
             <Button
               size="sm"
@@ -566,10 +502,10 @@ export default function Findings() {
           <PauseCircle className="w-4 h-4 text-amber-400 shrink-0" />
           <p className="text-xs text-muted-foreground flex-1">
             Review paused — the ${usage.budgetUsd?.toFixed(2)} spend cap has been reached (${usage.costUsd.toFixed(2)} spent).{" "}
-            {usage.pendingCount} filing{usage.pendingCount !== 1 ? "s" : ""} still queued. Raise the cap to continue.
+            {usage.pendingCount} filing{usage.pendingCount !== 1 ? "s" : ""} still queued. Raise the cap on Fetch &amp; Review to continue.
           </p>
-          <Button size="sm" variant="secondary" onClick={openBudgetDialog} data-testid="button-raise-budget">
-            Raise cap
+          <Button size="sm" variant="secondary" asChild data-testid="button-raise-budget">
+            <Link href="/fetch">Manage cap</Link>
           </Button>
         </Card>
       )}
@@ -717,70 +653,6 @@ export default function Findings() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
-
-      {/* Claude spend cap editor */}
-      <Dialog open={budgetOpen} onOpenChange={setBudgetOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Claude review spend cap</DialogTitle>
-            <DialogDescription>
-              Set a maximum total Claude cost for fetching &amp; reviewing filings. When cumulative
-              spend reaches this cap, the review queue pauses and remaining filings stay queued until
-              you raise it. This does not affect the Compare feature. Leave blank to remove the cap.
-            </DialogDescription>
-          </DialogHeader>
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              saveBudget();
-            }}
-          >
-            <div className="relative">
-              <span className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground text-sm">$</span>
-              <Input
-                type="number"
-                min="0"
-                step="1"
-                placeholder="e.g. 50"
-                className="pl-6"
-                value={budgetInput}
-                onChange={(e) => setBudgetInput(e.target.value)}
-                autoFocus
-                data-testid="input-budget"
-              />
-            </div>
-            {usage && (
-              <p className="text-xs text-muted-foreground mt-2">
-                Spent so far: <span className="text-foreground font-medium">${usage.costUsd.toFixed(2)}</span>
-                {usage.pendingCount > 0 && <> · {usage.pendingCount} filing{usage.pendingCount !== 1 ? "s" : ""} queued</>}
-              </p>
-            )}
-            <DialogFooter className="mt-4">
-              {usage?.budgetUsd != null && (
-                <Button
-                  type="button"
-                  variant="ghost"
-                  onClick={() => budgetMutation.mutate(null)}
-                  disabled={budgetMutation.isPending}
-                  data-testid="button-clear-budget"
-                >
-                  Remove cap
-                </Button>
-              )}
-              <Button
-                type="button"
-                variant="secondary"
-                onClick={() => setBudgetOpen(false)}
-              >
-                Cancel
-              </Button>
-              <Button type="submit" disabled={budgetMutation.isPending} data-testid="button-save-budget">
-                {budgetMutation.isPending ? "Saving…" : "Save cap"}
-              </Button>
-            </DialogFooter>
-          </form>
-        </DialogContent>
-      </Dialog>
     </div>
   );
 }
