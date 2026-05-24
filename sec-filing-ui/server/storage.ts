@@ -283,8 +283,9 @@ export class DatabaseStorage {
 
   // ─── Filings (scoped by userId) ────────────────────────
 
-  async getFilings(userId: number, filters?: { ticker?: string; filingType?: string; dateFrom?: string; dateTo?: string; status?: string }): Promise<Filing[]> {
-    const conditions: any[] = [eq(filings.userId, userId)];
+  // Filings are a shared team corpus (no per-user filter).
+  async getFilings(filters?: { ticker?: string; filingType?: string; dateFrom?: string; dateTo?: string; status?: string }): Promise<Filing[]> {
+    const conditions: any[] = [];
 
     if (filters?.ticker) conditions.push(eq(filings.ticker, filters.ticker));
     if (filters?.filingType) conditions.push(eq(filings.filingType, filters.filingType));
@@ -292,7 +293,9 @@ export class DatabaseStorage {
     if (filters?.dateFrom) conditions.push(gte(filings.filingDate, filters.dateFrom));
     if (filters?.dateTo) conditions.push(lte(filings.filingDate, filters.dateTo));
 
-    return db.select().from(filings).where(and(...conditions)).orderBy(desc(filings.filingDate));
+    const query = db.select().from(filings);
+    const rows = conditions.length > 0 ? await query.where(and(...conditions)) : await query;
+    return rows.sort((a, b) => (b.filingDate || "").localeCompare(a.filingDate || ""));
   }
 
   async getFilingByAccession(accession: string): Promise<Filing | undefined> {
@@ -328,15 +331,14 @@ export class DatabaseStorage {
     await db.update(filings).set({ reviewStatus: "pending" }).where(eq(filings.accessionNumber, accession));
   }
 
-  // Queue every rendered filing for this user that hasn't been successfully
-  // reviewed yet (never reviewed or previously errored). Returns the count.
-  async markCompleteFilingsForReview(userId: number): Promise<number> {
+  // Queue every rendered filing in the shared corpus that hasn't been
+  // successfully reviewed yet (never reviewed or previously errored).
+  async markCompleteFilingsForReview(): Promise<number> {
     const rows = await db
       .update(filings)
       .set({ reviewStatus: "pending" })
       .where(
         and(
-          eq(filings.userId, userId),
           eq(filings.status, "complete"),
           or(isNull(filings.reviewStatus), eq(filings.reviewStatus, "error")),
         ),
@@ -390,7 +392,8 @@ export class DatabaseStorage {
       .where(eq(filings.accessionNumber, accession));
   }
 
-  async getReviewUsage(userId: number): Promise<{
+  // Team-wide review spend (shared corpus).
+  async getReviewUsage(): Promise<{
     reviewedCount: number;
     inputTokens: number;
     outputTokens: number;
@@ -404,9 +407,7 @@ export class DatabaseStorage {
          COALESCE(SUM(review_output_tokens), 0) AS output_tokens,
          COALESCE(SUM(review_cache_read_tokens), 0) AS cache_read_tokens,
          COALESCE(SUM(review_cache_creation_tokens), 0) AS cache_creation_tokens
-       FROM filings
-       WHERE user_id = $1`,
-      [userId],
+       FROM filings`,
     );
     const row = result.rows[0];
     return {
@@ -484,7 +485,8 @@ export class DatabaseStorage {
     return ids.length;
   }
 
-  async getFilingStats(userId: number): Promise<{ totalCount: number; completeCount: number; errorCount: number; totalSizeMb: number; tickers: string[]; filingTypes: string[] }> {
+  // Team-wide stats (shared corpus).
+  async getFilingStats(): Promise<{ totalCount: number; completeCount: number; errorCount: number; totalSizeMb: number; tickers: string[]; filingTypes: string[] }> {
     const countResult = await pool.query(`
       SELECT
         COUNT(*) as total_count,
@@ -492,11 +494,10 @@ export class DatabaseStorage {
         COUNT(*) FILTER (WHERE status = 'error') as error_count,
         COALESCE(SUM(pdf_size) FILTER (WHERE status = 'complete'), 0) as total_bytes
       FROM filings
-      WHERE user_id = $1
-    `, [userId]);
+    `);
 
-    const tickerResult = await pool.query(`SELECT DISTINCT ticker FROM filings WHERE user_id = $1 ORDER BY ticker`, [userId]);
-    const typeResult = await pool.query(`SELECT DISTINCT filing_type FROM filings WHERE user_id = $1 ORDER BY filing_type`, [userId]);
+    const tickerResult = await pool.query(`SELECT DISTINCT ticker FROM filings ORDER BY ticker`);
+    const typeResult = await pool.query(`SELECT DISTINCT filing_type FROM filings ORDER BY filing_type`);
 
     const row = countResult.rows[0];
     return {
@@ -509,14 +510,13 @@ export class DatabaseStorage {
     };
   }
 
-  async getCompleteAccessions(userId: number, tickerList: string[]): Promise<Set<string>> {
+  async getCompleteAccessions(tickerList: string[]): Promise<Set<string>> {
     if (tickerList.length === 0) return new Set();
     const rows = await db
       .select({ accessionNumber: filings.accessionNumber })
       .from(filings)
       .where(
         and(
-          eq(filings.userId, userId),
           inArray(filings.ticker, tickerList),
           eq(filings.status, "complete"),
         ),
@@ -524,8 +524,8 @@ export class DatabaseStorage {
     return new Set(rows.map((r) => r.accessionNumber));
   }
 
+  // Shared-corpus dedup: any complete filing counts, regardless of who fetched it.
   async getCompleteFilings(
-    userId: number,
     tickerList: string[],
   ): Promise<Array<{ accessionNumber: string; pdfPath: string | null }>> {
     if (tickerList.length === 0) return [];
@@ -534,7 +534,6 @@ export class DatabaseStorage {
       .from(filings)
       .where(
         and(
-          eq(filings.userId, userId),
           inArray(filings.ticker, tickerList),
           eq(filings.status, "complete"),
         ),
