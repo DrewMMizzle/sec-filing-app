@@ -136,11 +136,15 @@ export default function FetchFilings() {
     queryKey: ["/api/review/usage"],
     refetchInterval: (query) => {
       const data = query.state.data as { paused?: boolean } | undefined;
-      // Poll while a review run is in flight; stop once the cap pauses it.
-      const reviewing = existingFilings.some(
+      // Read the filings from the cache (rather than the outer const, which is
+      // declared later) to decide whether a review run is in flight. Fast while
+      // reviewing; slow (not stopped) while paused so this page recovers on its
+      // own if the team-wide cap is raised elsewhere.
+      const rows = queryClient.getQueryData<Filing[]>(["/api/filings"]);
+      const reviewing = rows?.some(
         (f) => f.reviewStatus === "pending" || f.reviewStatus === "reviewing",
       );
-      return reviewing && !data?.paused ? 5000 : false;
+      return reviewing ? (data?.paused ? 30000 : 5000) : false;
     },
   });
   const paused = usage?.paused ?? false;
@@ -192,12 +196,16 @@ export default function FetchFilings() {
   const { data: existingFilings = [], refetch: refetchFilings } = useQuery<Filing[]>({
     queryKey: ["/api/filings"],
     // While Claude is reviewing filings, poll so flags appear as they complete.
+    // When the spend cap pauses the queue, slow the poll instead of stopping so
+    // the page recovers on its own if the team-wide cap is raised elsewhere.
     refetchInterval: (query) => {
       const rows = query.state.data as Filing[] | undefined;
       const reviewing = rows?.some(
         (f) => f.reviewStatus === "pending" || f.reviewStatus === "reviewing",
       );
-      return reviewing ? 4000 : false;
+      const isPaused =
+        (queryClient.getQueryData(["/api/review/usage"]) as { paused?: boolean } | undefined)?.paused ?? false;
+      return reviewing ? (isPaused ? 30000 : 4000) : false;
     },
   });
 

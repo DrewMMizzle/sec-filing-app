@@ -94,11 +94,12 @@ export default function Findings() {
       const reviewing = rows?.some(
         (f) => f.reviewStatus === "pending" || f.reviewStatus === "reviewing",
       );
-      // Stop polling once the spend cap pauses the queue — nothing changes
-      // until the user raises the cap (which invalidates this query).
+      // While reviews are in flight, poll fast. When the spend cap has paused
+      // the queue, keep polling slowly: the cap is team-wide, so another
+      // session raising it should still let this page recover on its own.
       const isPaused =
         (queryClient.getQueryData(["/api/review/usage"]) as { paused?: boolean } | undefined)?.paused ?? false;
-      return reviewing && !isPaused ? 4000 : false;
+      return reviewing ? (isPaused ? 30000 : 4000) : false;
     },
   });
 
@@ -126,8 +127,9 @@ export default function Findings() {
     queryKey: ["/api/review/usage"],
     refetchInterval: (query) => {
       const data = query.state.data as { paused?: boolean } | undefined;
-      // Keep polling while reviews run, but stop once paused by the cap.
-      return reviewing && !data?.paused ? 5000 : false;
+      // Fast while reviewing; slow (not stopped) while paused so the page can
+      // recover on its own if the team-wide cap is raised in another session.
+      return reviewing ? (data?.paused ? 30000 : 5000) : false;
     },
   });
 
@@ -404,7 +406,7 @@ export default function Findings() {
             <Button
               size="sm"
               onClick={handleReviewSaved}
-              disabled={reviewMutation.isPending || (reviewing && !paused)}
+              disabled={reviewMutation.isPending || reviewing}
               data-testid="button-review-saved"
             >
               {reviewMutation.isPending || (reviewing && !paused) ? (

@@ -434,12 +434,12 @@ export class DatabaseStorage {
   }
 
   async setSetting(key: string, value: string | null): Promise<void> {
-    const existing = await db.select().from(settings).where(eq(settings.key, key));
-    if (existing[0]) {
-      await db.update(settings).set({ value }).where(eq(settings.key, key));
-    } else {
-      await db.insert(settings).values({ key, value });
-    }
+    // Atomic upsert so concurrent first-time writes to the same key can't both
+    // INSERT and trip the primary-key constraint.
+    await db
+      .insert(settings)
+      .values({ key, value })
+      .onConflictDoUpdate({ target: settings.key, set: { value } });
   }
 
   // The team-wide max review spend in USD, or null if no cap is set.
