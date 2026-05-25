@@ -354,6 +354,24 @@ export class DatabaseStorage {
     return rows.length;
   }
 
+  // Same, but scoped to a set of tickers — used after a fetch so already-rendered
+  // (dedup-skipped) filings that were never reviewed still get queued.
+  async markCompleteFilingsForReviewByTickers(tickerList: string[]): Promise<number> {
+    if (tickerList.length === 0) return 0;
+    const rows = await db
+      .update(filings)
+      .set({ reviewStatus: "pending" })
+      .where(
+        and(
+          inArray(filings.ticker, tickerList),
+          eq(filings.status, "complete"),
+          or(isNull(filings.reviewStatus), eq(filings.reviewStatus, "error")),
+        ),
+      )
+      .returning({ id: filings.id });
+    return rows.length;
+  }
+
   async requeueStaleReviews(): Promise<void> {
     // Reset rows left mid-review by a crash/restart back to the queue.
     await db.update(filings).set({ reviewStatus: "pending" }).where(eq(filings.reviewStatus, "reviewing"));
