@@ -762,8 +762,10 @@ export default function FetchFilings() {
         <Card className="p-4 mb-4 space-y-3" data-testid="card-review-summary">
           {/* Header: status + live spend */}
           <div className="flex items-start justify-between gap-3">
-            <div className="flex items-center gap-2 min-w-0">
-              {runActive ? (
+            <div className="flex items-center gap-2 min-w-0 flex-wrap">
+              {paused ? (
+                <PauseCircle className="w-4 h-4 text-amber-400 shrink-0" />
+              ) : runActive ? (
                 <Loader2 className="w-4 h-4 text-amber-400 animate-spin shrink-0" />
               ) : reviewErrorCount > 0 || renderErrorCount > 0 ? (
                 <AlertCircle className="w-4 h-4 text-amber-400 shrink-0" />
@@ -771,12 +773,25 @@ export default function FetchFilings() {
                 <ShieldCheck className="w-4 h-4 text-green-400 shrink-0" />
               )}
               <p className="text-sm font-medium">
-                {runActive
-                  ? renderingCount > 0
-                    ? "Fetching, rendering & reviewing…"
-                    : "Reviewing filings…"
-                  : "Last run complete"}
+                {paused
+                  ? `Review paused — ${usage?.budgetUsd != null ? `$${usage.budgetUsd.toFixed(2)} ` : ""}spend cap reached`
+                  : runActive
+                    ? renderingCount > 0
+                      ? "Fetching, rendering & reviewing…"
+                      : "Reviewing filings…"
+                    : "Last run complete"}
               </p>
+              {paused && (
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  className="h-6"
+                  onClick={openBudgetDialog}
+                  data-testid="button-raise-cap-inline"
+                >
+                  Raise cap
+                </Button>
+              )}
             </div>
             {usage && (
               <div className="flex items-center gap-1 shrink-0">
@@ -834,6 +849,22 @@ export default function FetchFilings() {
               <span className="text-red-400">{renderErrorCount} render error{renderErrorCount !== 1 ? "s" : ""}</span>
             )}
           </div>
+
+          {/* What-to-do-next when the spend cap pauses the queue */}
+          {paused && (
+            <p className="text-xs text-muted-foreground">
+              {queuedCount} filing{queuedCount !== 1 ? "s are" : " is"} held and won't be reviewed until you{" "}
+              <button
+                type="button"
+                onClick={openBudgetDialog}
+                className="text-primary hover:underline"
+                data-testid="link-raise-cap"
+              >
+                raise or remove the spend cap
+              </button>
+              . Already-reviewed findings are saved.
+            </p>
+          )}
 
           {/* Findings link */}
           {totalFindings > 0 && (
