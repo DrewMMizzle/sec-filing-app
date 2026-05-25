@@ -236,6 +236,13 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
   // Initialize database tables + indexes
   await initDatabase();
 
+  // Recover filings left mid-render by a prior crash/stall so the UI doesn't
+  // spin on them forever. Safe at boot: no render is in flight yet.
+  storage
+    .recoverStaleRenders()
+    .then((n) => n > 0 && console.log(`[startup] Reset ${n} stale 'rendering' filing(s) to error.`))
+    .catch((err) => console.error("Stale-render recovery failed:", err));
+
   // ─── Health check (public, unauthenticated) ─────────────
   // Used by Railway's deploy probe, which sends no auth cookie. Must stay
   // outside requireAuth so it returns 200 instead of 401.
@@ -661,6 +668,12 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
       totalErrors: result.doneEvent?.total_errors ?? 0,
       events: result.events,
     });
+    // Clear any rows the pipeline left at 'rendering' (e.g. it was stalled and
+    // killed) for these tickers so they don't spin forever.
+    storage
+      .recoverStaleRenders(tickerNames)
+      .catch((err) => console.error("Stale-render recovery failed:", err));
+
     // Newly-rendered filings were queued incrementally as each PDF landed. Also
     // queue any already-rendered filings (skipped by dedup) that were never
     // reviewed, so a re-fetch reviews the whole outstanding backlog for these
