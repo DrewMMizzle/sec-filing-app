@@ -17,6 +17,8 @@ const PIPELINE_ROOT = process.env.PIPELINE_ROOT || path.resolve(__dirname_compat
 export const MODEL = "claude-opus-4-7";
 // Cap the text sent per filing to bound cost/latency on very large 10-Ks.
 const MAX_CHARS = 400_000;
+// Hard ceiling per review so one stalled call can't freeze the serial queue.
+const REVIEW_TIMEOUT_MS = 5 * 60 * 1000;
 
 // Opus 4.7 pricing (USD per 1M tokens).
 const PRICE_INPUT = 5;
@@ -157,19 +159,36 @@ async function callClaude(filing: Filing, text: string): Promise<ReviewResult> {
     (trimmed ? `[NOTE: filing text truncated to the first ${MAX_CHARS} characters]\n\n` : "") +
     (body.trim() ? `Filing text:\n${body}` : `Filing text: [no extractable text]`);
 
-  const stream = client().messages.stream({
-    model: MODEL,
-    max_tokens: 8000,
-    thinking: { type: "adaptive" },
-    output_config: {
-      effort: "high",
-      format: { type: "json_schema", schema: REVIEW_SCHEMA },
-    },
-    system: [{ type: "text", text: SYSTEM_PROMPT, cache_control: { type: "ephemeral" } }],
-    messages: [{ role: "user", content: userContent }],
-  });
+  // Bound each review so a single stalled Claude call can't wedge the whole
+  // queue (the processor awaits this serially).
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REVIEW_TIMEOUT_MS);
+  let message;
+  try {
+    const stream = client().messages.stream(
+      {
+        model: MODEL,
+        max_tokens: 8000,
+        thinking: { type: "adaptive" },
+        output_config: {
+          effort: "high",
+          format: { type: "json_schema", schema: REVIEW_SCHEMA },
+        },
+        system: [{ type: "text", text: SYSTEM_PROMPT, cache_control: { type: "ephemeral" } }],
+        messages: [{ role: "user", content: userContent }],
+      },
+      { signal: controller.signal },
+    );
+    message = await stream.finalMessage();
+  } catch (err: any) {
+    if (controller.signal.aborted) {
+      throw new Error(`Review timed out after ${Math.round(REVIEW_TIMEOUT_MS / 1000)}s`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
 
-  const message = await stream.finalMessage();
   const textBlock = message.content.find((b) => b.type === "text");
   if (!textBlock || textBlock.type !== "text") {
     throw new Error("No text block in Claude response");

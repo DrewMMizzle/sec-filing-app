@@ -629,10 +629,15 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
       totalErrors: result.doneEvent?.total_errors ?? 0,
       events: result.events,
     });
-    // Reviews were queued incrementally as each PDF rendered; give the queue a
-    // final nudge in case the drain finished just before the last one landed.
-    if (isReviewEnabled() && result.completedAccessions.length > 0) {
-      kickReviewProcessor().catch((err) => console.error("Review processor failed:", err));
+    // Newly-rendered filings were queued incrementally as each PDF landed. Also
+    // queue any already-rendered filings (skipped by dedup) that were never
+    // reviewed, so a re-fetch reviews the whole outstanding backlog for these
+    // tickers — not just the brand-new filings.
+    if (isReviewEnabled()) {
+      storage
+        .markCompleteFilingsForReviewByTickers(tickerNames)
+        .then(() => kickReviewProcessor())
+        .catch((err) => console.error("Review processor failed:", err));
     }
   });
 
