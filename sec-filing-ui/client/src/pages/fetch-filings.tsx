@@ -460,9 +460,10 @@ export default function FetchFilings() {
   const interestingCount = reviewedFilings.filter((f) => f.reviewFlagged).length;
   const totalFindings = reviewedFilings.reduce((n, f) => n + parseFindings(f).length, 0);
 
-  const reviewSettled = reviewedCount + reviewErrorCount;
+  // Percent reflects successfully-reviewed filings only, so it matches the
+  // "Reviewed X of Y" headline. Errors keep the bar below 100% until resolved.
   const reviewProgressPct =
-    reviewableTotal > 0 ? Math.round((reviewSettled / reviewableTotal) * 100) : 0;
+    reviewableTotal > 0 ? Math.round((reviewedCount / reviewableTotal) * 100) : 0;
   const runActive = renderingCount > 0 || inFlightReviews > 0;
   const showReviewBanner = filteredFilings.length > 0 && (reviewableTotal > 0 || renderingCount > 0);
 
