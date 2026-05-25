@@ -223,6 +223,11 @@ export default function Findings() {
     );
 
   const term = q.trim().toLowerCase();
+  // If the query exactly matches a known ticker, filter by that ticker rather
+  // than substring-matching it inside finding text (so "BA" → ticker BA, not
+  // every finding containing the letters "ba").
+  const knownTickers = new Set(filings.map((f) => f.ticker.toLowerCase()));
+  const tickerExact = term && knownTickers.has(term) ? term : null;
   const filtered = allRows.filter((r) => {
     if (activeCats.size > 0 && !activeCats.has(r.finding.category)) return false;
     if (interest !== "all" && r.filing.reviewMateriality !== interest) return false;
@@ -231,7 +236,9 @@ export default function Findings() {
     if (triage === "starred" && r.status !== "starred") return false;
     if (triage === "posted" && r.status !== "posted") return false;
     if (triage === "dismissed" && r.status !== "dismissed") return false;
-    if (term) {
+    if (tickerExact) {
+      if (r.filing.ticker.toLowerCase() !== tickerExact) return false;
+    } else if (term) {
       const hay = `${r.finding.headline} ${r.finding.detail} ${r.finding.why} ${r.filing.ticker}`.toLowerCase();
       if (!hay.includes(term)) return false;
     }
