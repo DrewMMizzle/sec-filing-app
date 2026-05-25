@@ -106,7 +106,30 @@ function runFetchPipeline(
     let stderrOutput = "";
     let settled = false;
 
+    // Watchdog: if the pipeline produces no output for this long, treat it as
+    // stalled (e.g. a wedged Chromium) and kill it so the run can't hang
+    // forever. Anything rendered/reviewed before the stall is already saved, and
+    // a re-fetch resumes (dedup skips completed filings).
+    const IDLE_TIMEOUT_MS = 6 * 60 * 1000;
+    let lastActivity = Date.now();
+    let stalled = false;
+    const watchdog = setInterval(() => {
+      if (settled) return;
+      if (Date.now() - lastActivity > IDLE_TIMEOUT_MS) {
+        stalled = true;
+        console.error(
+          `[pipeline] No output for ${IDLE_TIMEOUT_MS / 1000}s — stopping stalled pipeline.`,
+        );
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // already gone
+        }
+      }
+    }, 30_000);
+
     child.stdout.on("data", (data: Buffer) => {
+      lastActivity = Date.now();
       const lines = data.toString().split("\n").filter(Boolean);
       for (const line of lines) {
         try {
@@ -171,8 +194,16 @@ function runFetchPipeline(
     child.on("close", (code) => {
       if (settled) return;
       settled = true;
+      clearInterval(watchdog);
       const doneEvent = events.find((e) => e.event === "done");
-      if (code === 0 && doneEvent) {
+      if (stalled) {
+        resolve({
+          success: false,
+          events,
+          completedAccessions,
+          error: `Pipeline stalled (no output for ${IDLE_TIMEOUT_MS / 60000} min) and was stopped after rendering ${completedAccessions.length} filing(s). Run it again to resume.`,
+        });
+      } else if (code === 0 && doneEvent) {
         resolve({ success: true, events, completedAccessions, doneEvent });
       } else {
         resolve({ success: false, events, completedAccessions, error: stderrOutput || "Pipeline process failed" });
@@ -182,6 +213,7 @@ function runFetchPipeline(
     child.on("error", (err) => {
       if (settled) return;
       settled = true;
+      clearInterval(watchdog);
       resolve({ success: false, events, completedAccessions, error: `Failed to start pipeline: ${err.message}` });
     });
   });

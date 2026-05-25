@@ -215,8 +215,33 @@ async def main() -> None:
                     "filing_date": f["filing_date"],
                 })
 
-                try:
-                    result = await render_filing(f)
+                # Render with a few retries; reset the browser between attempts
+                # so a crashed/wedged Chromium doesn't poison the rest of the run.
+                result = None
+                last_err = None
+                for attempt in range(3):
+                    try:
+                        result = await render_filing(f)
+                        break
+                    except Exception as e:
+                        last_err = e
+                        if attempt < 2:
+                            # Heartbeat so the orchestrator's stall watchdog
+                            # doesn't mistake a retry for a hang.
+                            emit({
+                                "event": "retry",
+                                "ticker": ticker,
+                                "accession": f["accession_number"],
+                                "attempt": attempt + 1,
+                                "message": str(e),
+                            })
+                            try:
+                                await close_browser()
+                            except Exception:
+                                pass
+                            await asyncio.sleep(2 * (attempt + 1))
+
+                if result is not None:
                     emit({
                         "event": "complete",
                         "ticker": ticker,
@@ -227,12 +252,12 @@ async def main() -> None:
                         "size": result["size"],
                     })
                     total_rendered += 1
-                except Exception as e:
+                else:
                     emit({
                         "event": "error",
                         "ticker": ticker,
                         "accession": f["accession_number"],
-                        "message": str(e),
+                        "message": str(last_err),
                     })
                     total_errors += 1
 
