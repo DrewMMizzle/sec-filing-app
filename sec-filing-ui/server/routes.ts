@@ -141,6 +141,17 @@ function runFetchPipeline(
             completedAccessions.push(event.accession);
             storage
               .updateFilingStatus(event.accession, "complete", appRelPath, event.size)
+              .then(() => {
+                // Queue the review as soon as the PDF is rendered (and nudge the
+                // processor) so spend and review progress move during the run,
+                // instead of only after the entire batch finishes rendering.
+                if (!isReviewEnabled()) return;
+                return storage.markFilingForReview(event.accession).then(() => {
+                  kickReviewProcessor().catch((err) =>
+                    console.error("Review processor failed:", err),
+                  );
+                });
+              })
               .catch((err) => console.error("Failed to update filing status:", err));
           } else if (event.event === "error" && event.accession) {
             storage
@@ -618,11 +629,10 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
       totalErrors: result.doneEvent?.total_errors ?? 0,
       events: result.events,
     });
-    // Mark the freshly-rendered filings for review, then drain the queue.
+    // Reviews were queued incrementally as each PDF rendered; give the queue a
+    // final nudge in case the drain finished just before the last one landed.
     if (isReviewEnabled() && result.completedAccessions.length > 0) {
-      Promise.all(result.completedAccessions.map((a) => storage.markFilingForReview(a).catch(() => {})))
-        .then(() => kickReviewProcessor())
-        .catch((err) => console.error("Review processor failed:", err));
+      kickReviewProcessor().catch((err) => console.error("Review processor failed:", err));
     }
   });
 
@@ -680,10 +690,9 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     if (!result.success) {
       return res.status(500).json({ error: result.error || "Re-render failed" });
     }
+    // Reviews are queued incrementally as each PDF re-renders; final nudge only.
     if (isReviewEnabled() && result.completedAccessions.length > 0) {
-      Promise.all(result.completedAccessions.map((a) => storage.markFilingForReview(a).catch(() => {})))
-        .then(() => kickReviewProcessor())
-        .catch((err) => console.error("Review processor failed:", err));
+      kickReviewProcessor().catch((err) => console.error("Review processor failed:", err));
     }
     res.json({
       rerendered: result.completedAccessions.length,

@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useState, useRef, useEffect } from "react";
+import { Link } from "wouter";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { queryClient, apiRequest, API_BASE } from "@/lib/queryClient";
 import { Card } from "@/components/ui/card";
@@ -6,6 +7,12 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { Checkbox } from "@/components/ui/checkbox";
+import { Progress } from "@/components/ui/progress";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
 import {
   Select,
   SelectContent,
@@ -40,7 +47,7 @@ import {
 import { format } from "date-fns";
 import type { DateRange } from "react-day-picker";
 import { useToast } from "@/hooks/use-toast";
-import { Search, Download, Loader2, FileText, Calendar as CalendarIcon, Check, X, AlertCircle, ShieldAlert, ShieldCheck, RefreshCw, Wallet, PauseCircle } from "lucide-react";
+import { Search, Download, Loader2, FileText, Calendar as CalendarIcon, Check, X, AlertCircle, ShieldAlert, ShieldCheck, RefreshCw, Wallet, PauseCircle, ChevronDown } from "lucide-react";
 import type { Filing } from "@shared/schema";
 import { CATEGORY_LABELS, parseFindings, estimateReviewCost, formatCostRange } from "@/lib/findings";
 
@@ -136,15 +143,17 @@ export default function FetchFilings() {
     queryKey: ["/api/review/usage"],
     refetchInterval: (query) => {
       const data = query.state.data as { paused?: boolean } | undefined;
-      // Read the filings from the cache (rather than the outer const, which is
-      // declared later) to decide whether a review run is in flight. Fast while
-      // reviewing; slow (not stopped) while paused so this page recovers on its
-      // own if the team-wide cap is raised elsewhere.
+      // Read filings from the cache to decide whether a run is in flight. Poll
+      // through the render phase too so spend starts ticking as soon as the
+      // first reviews run. Fast while active; slow (not stopped) while paused.
       const rows = queryClient.getQueryData<Filing[]>(["/api/filings"]);
+      const rendering = rows?.some((f) => f.status === "rendering");
       const reviewing = rows?.some(
         (f) => f.reviewStatus === "pending" || f.reviewStatus === "reviewing",
       );
-      return reviewing ? (data?.paused ? 30000 : 5000) : false;
+      if (rendering) return 5000;
+      if (reviewing) return data?.paused ? 30000 : 5000;
+      return false;
     },
   });
   const paused = usage?.paused ?? false;
@@ -152,6 +161,26 @@ export default function FetchFilings() {
   // Team-wide Claude spend cap (governs the auto-review that runs on fetch)
   const [budgetOpen, setBudgetOpen] = useState(false);
   const [budgetInput, setBudgetInput] = useState("");
+  const [tickerListOpen, setTickerListOpen] = useState(false);
+
+  // While a (long, synchronous) fetch request is in flight, poll the filings and
+  // spend queries so render/review progress and spend update live during the run
+  // rather than only after the request returns.
+  const fetchPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const startFetchPolling = () => {
+    if (fetchPollRef.current) return;
+    fetchPollRef.current = setInterval(() => {
+      queryClient.invalidateQueries({ queryKey: ["/api/filings"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/review/usage"] });
+    }, 4000);
+  };
+  const stopFetchPolling = () => {
+    if (fetchPollRef.current) {
+      clearInterval(fetchPollRef.current);
+      fetchPollRef.current = null;
+    }
+  };
+  useEffect(() => () => stopFetchPolling(), []);
   const budgetMutation = useMutation<{ budgetUsd: number | null }, Error, number | null>({
     mutationFn: async (budgetUsd) => {
       const res = await apiRequest("POST", "/api/review/budget", { budgetUsd });
@@ -195,17 +224,23 @@ export default function FetchFilings() {
 
   const { data: existingFilings = [], refetch: refetchFilings } = useQuery<Filing[]>({
     queryKey: ["/api/filings"],
-    // While Claude is reviewing filings, poll so flags appear as they complete.
-    // When the spend cap pauses the queue, slow the poll instead of stopping so
-    // the page recovers on its own if the team-wide cap is raised elsewhere.
+    // Poll while a run is active so render + review progress appear live. Track
+    // the render phase too (not just reviews). When the spend cap pauses the
+    // review queue, slow the poll instead of stopping so the page recovers on
+    // its own if the team-wide cap is raised elsewhere.
     refetchInterval: (query) => {
       const rows = query.state.data as Filing[] | undefined;
+      const rendering = rows?.some((f) => f.status === "rendering");
       const reviewing = rows?.some(
         (f) => f.reviewStatus === "pending" || f.reviewStatus === "reviewing",
       );
-      const isPaused =
-        (queryClient.getQueryData(["/api/review/usage"]) as { paused?: boolean } | undefined)?.paused ?? false;
-      return reviewing ? (isPaused ? 30000 : 4000) : false;
+      if (rendering) return 4000;
+      if (reviewing) {
+        const isPaused =
+          (queryClient.getQueryData(["/api/review/usage"]) as { paused?: boolean } | undefined)?.paused ?? false;
+        return isPaused ? 30000 : 4000;
+      }
+      return false;
     },
   });
 
@@ -283,20 +318,28 @@ export default function FetchFilings() {
       }
       return res.json();
     },
+    onMutate: () => {
+      startFetchPolling();
+    },
     onSuccess: (data) => {
-      refetchFilings();
       const parts: string[] = [];
       if (data.totalRendered > 0) parts.push(`${data.totalRendered} new PDF(s) rendered`);
       if (data.totalSkipped > 0) parts.push(`${data.totalSkipped} already in library`);
       if (data.totalErrors > 0) parts.push(`${data.totalErrors} error(s)`);
       if (parts.length === 0) parts.push("No new filings found in range");
       toast({
-        title: `Fetch complete`,
+        title: `Fetch complete — reviews continue below`,
         description: parts.join(", "),
       });
     },
     onError: (err: Error) => {
       toast({ title: "Error", description: err.message, variant: "destructive" });
+    },
+    onSettled: () => {
+      // Hand off to the queries' own progress-aware polling.
+      stopFetchPolling();
+      refetchFilings();
+      queryClient.invalidateQueries({ queryKey: ["/api/review/usage"] });
     },
   });
 
@@ -384,14 +427,63 @@ export default function FetchFilings() {
 
   const completedFilings = filteredFilings.filter((f) => f.status === "complete");
 
-  // Footnoted-style review summary across the currently-shown filings
-  const reviewingCount = filteredFilings.filter(
-    (f) => f.reviewStatus === "pending" || f.reviewStatus === "reviewing",
-  ).length;
-  const reviewedFilings = filteredFilings.filter((f) => f.reviewStatus === "done");
+  // ── Render + review progress across the filings currently in scope ──
+  const renderingCount = filteredFilings.filter((f) => f.status === "rendering").length;
+  const renderErrorCount = filteredFilings.filter((f) => f.status === "error").length;
+
+  const reviewableTotal = completedFilings.length; // only rendered filings get reviewed
+  const reviewedFilings = completedFilings.filter((f) => f.reviewStatus === "done");
+  const reviewedCount = reviewedFilings.length;
+  const reviewingNowCount = filteredFilings.filter((f) => f.reviewStatus === "reviewing").length;
+  const queuedCount = filteredFilings.filter((f) => f.reviewStatus === "pending").length;
+  const reviewErrorCount = filteredFilings.filter((f) => f.reviewStatus === "error").length;
+  const inFlightReviews = reviewingNowCount + queuedCount;
   const interestingCount = reviewedFilings.filter((f) => f.reviewFlagged).length;
   const totalFindings = reviewedFilings.reduce((n, f) => n + parseFindings(f).length, 0);
-  const showReviewBanner = reviewingCount > 0 || reviewedFilings.length > 0;
+
+  const reviewSettled = reviewedCount + reviewErrorCount;
+  const reviewProgressPct =
+    reviewableTotal > 0 ? Math.round((reviewSettled / reviewableTotal) * 100) : 0;
+  const runActive = renderingCount > 0 || inFlightReviews > 0;
+  const showReviewBanner = filteredFilings.length > 0 && (reviewableTotal > 0 || renderingCount > 0);
+
+  // Per-ticker rollup so it's clear which tickers are done vs outstanding.
+  type TickerProgress = {
+    ticker: string;
+    total: number;
+    reviewed: number;
+    inFlight: number;
+    errored: number;
+  };
+  const tickerProgress: TickerProgress[] = (() => {
+    const map = new Map<string, TickerProgress>();
+    for (const f of filteredFilings) {
+      let p = map.get(f.ticker);
+      if (!p) {
+        p = { ticker: f.ticker, total: 0, reviewed: 0, inFlight: 0, errored: 0 };
+        map.set(f.ticker, p);
+      }
+      p.total += 1;
+      if (f.status === "error" || f.reviewStatus === "error") p.errored += 1;
+      else if (f.reviewStatus === "done") p.reviewed += 1;
+      else if (
+        f.status === "rendering" ||
+        f.reviewStatus === "pending" ||
+        f.reviewStatus === "reviewing"
+      )
+        p.inFlight += 1;
+    }
+    // Outstanding/errored tickers first, then by ticker name.
+    return Array.from(map.values()).sort((a, b) => {
+      const aOpen = a.inFlight > 0 || a.errored > 0 ? 0 : 1;
+      const bOpen = b.inFlight > 0 || b.errored > 0 ? 0 : 1;
+      if (aOpen !== bOpen) return aOpen - bOpen;
+      return a.ticker.localeCompare(b.ticker);
+    });
+  })();
+  const outstandingTickerCount = tickerProgress.filter(
+    (t) => t.inFlight > 0 || t.errored > 0,
+  ).length;
 
   return (
     <div className="p-6 max-w-5xl mx-auto">
@@ -648,35 +740,116 @@ export default function FetchFilings() {
       </div>
 
       {showReviewBanner && (
-        <Card className="p-4 mb-4 flex items-center gap-3" data-testid="card-review-summary">
-          {reviewingCount > 0 ? (
-            <>
-              <Loader2 className="w-4 h-4 text-amber-400 animate-spin shrink-0" />
-              <p className="text-sm">
-                Claude is digging through filings for footnoted-worthy items —{" "}
-                <span className="font-medium">{reviewedFilings.length} done</span>,{" "}
-                {reviewingCount} in progress
-                {totalFindings > 0 && <> ({totalFindings} finding{totalFindings !== 1 ? "s" : ""} so far)</>}
+        <Card className="p-4 mb-4 space-y-3" data-testid="card-review-summary">
+          {/* Header: status + live spend */}
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex items-center gap-2 min-w-0">
+              {runActive ? (
+                <Loader2 className="w-4 h-4 text-amber-400 animate-spin shrink-0" />
+              ) : reviewErrorCount > 0 || renderErrorCount > 0 ? (
+                <AlertCircle className="w-4 h-4 text-amber-400 shrink-0" />
+              ) : (
+                <ShieldCheck className="w-4 h-4 text-green-400 shrink-0" />
+              )}
+              <p className="text-sm font-medium">
+                {runActive
+                  ? renderingCount > 0
+                    ? "Fetching, rendering & reviewing…"
+                    : "Reviewing filings…"
+                  : "Last run complete"}
               </p>
-            </>
-          ) : totalFindings > 0 ? (
-            <>
-              <ShieldAlert className="w-4 h-4 text-amber-400 shrink-0" />
-              <p className="text-sm">
-                Claude surfaced <span className="font-medium">{totalFindings}</span> post-worthy finding
-                {totalFindings !== 1 ? "s" : ""} across{" "}
-                <span className="font-medium">{interestingCount}</span> of {reviewedFilings.length} filing
-                {reviewedFilings.length !== 1 ? "s" : ""}.
+            </div>
+            {usage && (
+              <p className="text-xs text-muted-foreground shrink-0 whitespace-nowrap">
+                Spend{" "}
+                <span className="text-foreground font-medium">${usage.costUsd.toFixed(2)}</span>
+                {usage.budgetUsd != null && <> / ${usage.budgetUsd.toFixed(2)} cap</>}
               </p>
-            </>
-          ) : (
-            <>
-              <ShieldCheck className="w-4 h-4 text-green-400 shrink-0" />
-              <p className="text-sm">
-                Claude read {reviewedFilings.length} filing{reviewedFilings.length !== 1 ? "s" : ""} —
-                nothing notable found.
-              </p>
-            </>
+            )}
+          </div>
+
+          {/* Review progress bar */}
+          <div>
+            <div className="flex items-center justify-between text-xs text-muted-foreground mb-1">
+              <span>
+                Reviewed <span className="text-foreground font-medium">{reviewedCount}</span> of{" "}
+                {reviewableTotal} rendered filing{reviewableTotal !== 1 ? "s" : ""}
+              </span>
+              <span>{reviewProgressPct}%</span>
+            </div>
+            <Progress value={reviewProgressPct} className="h-2" />
+          </div>
+
+          {/* Count chips */}
+          <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs">
+            <span className="text-green-400">✓ {reviewedCount} reviewed</span>
+            {reviewingNowCount > 0 && (
+              <span className="text-amber-400">⟳ {reviewingNowCount} reviewing</span>
+            )}
+            {queuedCount > 0 && <span className="text-amber-400">◷ {queuedCount} queued</span>}
+            {reviewErrorCount > 0 && (
+              <span className="text-red-400">⚠ {reviewErrorCount} review error{reviewErrorCount !== 1 ? "s" : ""}</span>
+            )}
+            {renderingCount > 0 && (
+              <span className="text-muted-foreground">{renderingCount} rendering</span>
+            )}
+            {renderErrorCount > 0 && (
+              <span className="text-red-400">{renderErrorCount} render error{renderErrorCount !== 1 ? "s" : ""}</span>
+            )}
+          </div>
+
+          {/* Findings link */}
+          {totalFindings > 0 && (
+            <p className="text-xs text-muted-foreground">
+              <ShieldAlert className="w-3.5 h-3.5 inline -mt-0.5 mr-1 text-amber-400" />
+              <span className="text-foreground font-medium">{totalFindings}</span> finding
+              {totalFindings !== 1 ? "s" : ""} across {interestingCount} filing
+              {interestingCount !== 1 ? "s" : ""} ·{" "}
+              <Link href="/" className="text-primary hover:underline">
+                View in Findings
+              </Link>
+            </p>
+          )}
+
+          {/* Per-ticker progress */}
+          {tickerProgress.length > 0 && (
+            <Collapsible open={tickerListOpen} onOpenChange={setTickerListOpen}>
+              <CollapsibleTrigger className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors" data-testid="toggle-ticker-progress">
+                <ChevronDown
+                  className={`w-3.5 h-3.5 transition-transform ${tickerListOpen ? "" : "-rotate-90"}`}
+                />
+                Per-ticker progress ({tickerProgress.length} ticker{tickerProgress.length !== 1 ? "s" : ""}
+                {outstandingTickerCount > 0 ? `, ${outstandingTickerCount} outstanding` : ""})
+              </CollapsibleTrigger>
+              <CollapsibleContent>
+                <div className="mt-2 max-h-64 overflow-y-auto grid grid-cols-2 sm:grid-cols-3 gap-x-4 gap-y-1 pr-1">
+                  {tickerProgress.map((t) => {
+                    const done = t.errored === 0 && t.inFlight === 0;
+                    return (
+                      <div
+                        key={t.ticker}
+                        className="flex items-center justify-between gap-2 text-xs"
+                        data-testid={`ticker-progress-${t.ticker}`}
+                      >
+                        <span className="font-mono truncate">{t.ticker}</span>
+                        <span className="flex items-center gap-1.5 shrink-0 tabular-nums">
+                          <span className="text-muted-foreground">
+                            {t.reviewed}/{t.total}
+                          </span>
+                          {t.errored > 0 ? (
+                            <span className="text-red-400">⚠{t.errored}</span>
+                          ) : t.inFlight > 0 ? (
+                            <Loader2 className="w-3 h-3 text-amber-400 animate-spin" />
+                          ) : done ? (
+                            <Check className="w-3 h-3 text-green-400" />
+                          ) : null}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </CollapsibleContent>
+            </Collapsible>
           )}
         </Card>
       )}
