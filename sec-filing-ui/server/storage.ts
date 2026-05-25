@@ -377,6 +377,24 @@ export class DatabaseStorage {
     await db.update(filings).set({ reviewStatus: "pending" }).where(eq(filings.reviewStatus, "reviewing"));
   }
 
+  // Filings left at status='rendering' by a crashed/killed/stalled fetch never
+  // produced a PDF, so they'd otherwise spin forever. Flip them to 'error' so
+  // the UI settles and they can be retried via re-fetch. Optionally scope to a
+  // set of tickers (used right after a fetch run).
+  async recoverStaleRenders(tickerList?: string[]): Promise<number> {
+    const conditions: any[] = [eq(filings.status, "rendering")];
+    if (tickerList && tickerList.length > 0) conditions.push(inArray(filings.ticker, tickerList));
+    const rows = await db
+      .update(filings)
+      .set({
+        status: "error",
+        errorMessage: "Render interrupted before completion — re-fetch to retry.",
+      })
+      .where(and(...conditions))
+      .returning({ id: filings.id });
+    return rows.length;
+  }
+
   async getPendingReviewFilings(limit = 5): Promise<Filing[]> {
     return db
       .select()
