@@ -355,7 +355,7 @@ export default function FetchFilings() {
         reviewEnabled && usage?.budgetUsd != null
           ? ` A $${usage.budgetUsd.toFixed(2)} spend cap is set ($${usage.costUsd.toFixed(2)} used) — review pauses automatically if it's reached.`
           : reviewEnabled
-            ? " Tip: set a spend cap on the Findings page to stop reviews automatically at a dollar limit."
+            ? " Tip: use “Set cap” above to stop reviews automatically at a dollar limit."
             : "";
       const costNote = reviewEnabled
         ? ` Estimated Claude review cost: ${formatCostRange(estimateReviewCost(Array(est).fill(undefined)))} (Opus 4.7; rough).${capNote}`
