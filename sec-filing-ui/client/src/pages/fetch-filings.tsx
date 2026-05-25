@@ -47,7 +47,7 @@ import {
 import { format } from "date-fns";
 import type { DateRange } from "react-day-picker";
 import { useToast } from "@/hooks/use-toast";
-import { Search, Download, Loader2, FileText, Calendar as CalendarIcon, Check, X, AlertCircle, ShieldAlert, ShieldCheck, RefreshCw, Wallet, PauseCircle, ChevronDown } from "lucide-react";
+import { Search, Download, Loader2, FileText, Calendar as CalendarIcon, Check, X, AlertCircle, ShieldAlert, ShieldCheck, RefreshCw, Wallet, PauseCircle, ChevronDown, Eye, EyeOff } from "lucide-react";
 import type { Filing } from "@shared/schema";
 import { CATEGORY_LABELS, parseFindings, estimateReviewCost, formatCostRange } from "@/lib/findings";
 
@@ -162,6 +162,25 @@ export default function FetchFilings() {
   const [budgetOpen, setBudgetOpen] = useState(false);
   const [budgetInput, setBudgetInput] = useState("");
   const [tickerListOpen, setTickerListOpen] = useState(false);
+
+  // Show/hide the running Claude spend (persisted) — handy when screen-sharing.
+  const [showSpend, setShowSpend] = useState(() => {
+    try {
+      return localStorage.getItem("hideAiSpend") !== "1";
+    } catch {
+      return true;
+    }
+  });
+  const toggleSpend = () =>
+    setShowSpend((v) => {
+      const next = !v;
+      try {
+        localStorage.setItem("hideAiSpend", next ? "0" : "1");
+      } catch {
+        // ignore (private mode, etc.)
+      }
+      return next;
+    });
 
   // While a (long, synchronous) fetch request is in flight, poll the filings and
   // spend queries so render/review progress and spend update live during the run
@@ -498,7 +517,7 @@ export default function FetchFilings() {
               ? "Newly rendered filings are automatically reviewed by Claude — findings show up in the Findings tab."
               : "Set ANTHROPIC_API_KEY to also have Claude review fetched filings for findings."}
           </p>
-          {reviewEnabled && usage && (usage.reviewedCount > 0 || usage.budgetUsd != null) && (
+          {reviewEnabled && showSpend && usage && (usage.reviewedCount > 0 || usage.budgetUsd != null) && (
             <p className="text-xs text-muted-foreground mt-1" data-testid="text-review-spend">
               Claude review spend so far:{" "}
               <span className="text-foreground font-medium">${usage.costUsd.toFixed(2)}</span>
@@ -760,11 +779,29 @@ export default function FetchFilings() {
               </p>
             </div>
             {usage && (
-              <p className="text-xs text-muted-foreground shrink-0 whitespace-nowrap">
-                Spend{" "}
-                <span className="text-foreground font-medium">${usage.costUsd.toFixed(2)}</span>
-                {usage.budgetUsd != null && <> / ${usage.budgetUsd.toFixed(2)} cap</>}
-              </p>
+              <div className="flex items-center gap-1 shrink-0">
+                <p className="text-xs text-muted-foreground whitespace-nowrap">
+                  {showSpend ? (
+                    <>
+                      Spend{" "}
+                      <span className="text-foreground font-medium">${usage.costUsd.toFixed(2)}</span>
+                      {usage.budgetUsd != null && <> / ${usage.budgetUsd.toFixed(2)} cap</>}
+                    </>
+                  ) : (
+                    "Spend hidden"
+                  )}
+                </p>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-6 w-6 text-muted-foreground"
+                  onClick={toggleSpend}
+                  aria-label={showSpend ? "Hide spend" : "Show spend"}
+                  data-testid="toggle-spend"
+                >
+                  {showSpend ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                </Button>
+              </div>
             )}
           </div>
 
