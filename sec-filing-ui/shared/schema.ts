@@ -107,6 +107,13 @@ export const findingActions = pgTable("finding_actions", {
   index("idx_finding_actions_user").on(table.userId),
 ]);
 
+// ─── App-wide settings (key/value) ─────────────────────────
+
+export const settings = pgTable("settings", {
+  key: text("key").primaryKey(),
+  value: text("value"),
+});
+
 // ─── Insert schemas ────────────────────────────────────────
 
 export const insertUserSchema = createInsertSchema(users).omit({ id: true });
@@ -131,3 +138,4 @@ export type WatchlistShare = typeof watchlistShares.$inferSelect;
 export type InsertWatchlistShare = z.infer<typeof insertWatchlistShareSchema>;
 export type FindingAction = typeof findingActions.$inferSelect;
 export type InsertFindingAction = z.infer<typeof insertFindingActionSchema>;
+export type Setting = typeof settings.$inferSelect;

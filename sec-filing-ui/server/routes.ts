@@ -8,7 +8,7 @@ import fs from "fs";
 import { fileURLToPath } from "url";
 import { hashPassword, verifyPassword, createSession, clearSession, requireAuth } from "./auth";
 import { ensureSP500Seeded } from "./seed-sp500";
-import { isReviewEnabled, kickReviewProcessor } from "./review";
+import { isReviewEnabled, kickReviewProcessor, reviewCostUsd } from "./review";
 import { compareFilings, SECTION_LABELS, type SectionKey } from "./compare";
 import { db } from "./storage";
 import { tickers as tickersTable, filings as filingsTable } from "@shared/schema";
@@ -27,6 +27,41 @@ const PDF_STORAGE_DIR = process.env.PDF_STORAGE_DIR || path.resolve(__dirname_co
 if (!fs.existsSync(PDF_STORAGE_DIR)) {
   fs.mkdirSync(PDF_STORAGE_DIR, { recursive: true });
 }
+
+// Count stored PDFs so we can spot at startup whether a persistent volume is
+// actually mounted (and populated) at PDF_STORAGE_DIR vs. ephemeral disk.
+function countStoredPdfs(dir: string): number {
+  let n = 0;
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  for (const e of entries) {
+    const full = path.join(dir, e.name);
+    if (e.isDirectory()) n += countStoredPdfs(full);
+    else if (e.isFile() && e.name.toLowerCase().endsWith(".pdf")) n += 1;
+  }
+  return n;
+}
+
+// One-line startup diagnostic visible in deploy logs.
+(() => {
+  let writable = false;
+  try {
+    const probe = path.join(PDF_STORAGE_DIR, ".write-probe");
+    fs.writeFileSync(probe, "ok");
+    fs.unlinkSync(probe);
+    writable = true;
+  } catch {
+    writable = false;
+  }
+  console.log(
+    `[storage] PDF_STORAGE_DIR=${PDF_STORAGE_DIR} exists=${fs.existsSync(PDF_STORAGE_DIR)} ` +
+      `writable=${writable} storedPdfs=${countStoredPdfs(PDF_STORAGE_DIR)}`,
+  );
+})();
 
 // Whether a filing's rendered PDF actually exists on disk. The DB row can say
 // "complete" while the file is gone (e.g. ephemeral storage wiped on redeploy),
@@ -662,18 +697,35 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     res.json({ reviewEnabled: isReviewEnabled() });
   });
 
-  // Actual Claude spend so far, from recorded per-filing token usage.
-  // Opus 4.7 pricing per 1M tokens: input $5, output $25, cache read $0.50,
-  // cache write $6.25.
+  // Actual Claude spend so far, from recorded per-filing token usage, plus the
+  // team spend cap (if any) and whether the review queue is currently paused
+  // because that cap has been hit.
   app.get("/api/review/usage", requireAuth, async (_req, res) => {
     const u = await storage.getReviewUsage();
-    const costUsd =
-      (u.inputTokens * 5 +
-        u.outputTokens * 25 +
-        u.cacheReadTokens * 0.5 +
-        u.cacheCreationTokens * 6.25) /
-      1_000_000;
-    res.json({ ...u, costUsd: Math.round(costUsd * 100) / 100 });
+    const rawCost = reviewCostUsd(u);
+    const costUsd = Math.round(rawCost * 100) / 100;
+    const budgetUsd = await storage.getReviewBudgetUsd();
+    const pendingCount = await storage.getPendingReviewCount();
+    const paused = budgetUsd !== null && rawCost >= budgetUsd && pendingCount > 0;
+    res.json({ ...u, costUsd, budgetUsd, pendingCount, paused });
+  });
+
+  // Set or clear the team-wide review spend cap (USD). Pass null/empty to clear.
+  // Applies only to the fetch+review pipeline, never to Compare.
+  app.post("/api/review/budget", requireAuth, async (req, res) => {
+    const { budgetUsd } = req.body as { budgetUsd?: number | null };
+    if (budgetUsd === null || budgetUsd === undefined || budgetUsd === ("" as any)) {
+      await storage.setSetting("review_budget_usd", null);
+      return res.json({ budgetUsd: null });
+    }
+    const n = Number(budgetUsd);
+    if (!Number.isFinite(n) || n < 0) {
+      return res.status(400).json({ error: "budgetUsd must be a non-negative number or null" });
+    }
+    await storage.setSetting("review_budget_usd", String(n));
+    // Raising the cap may unpause a stalled queue — give it a nudge.
+    kickReviewProcessor().catch((err) => console.error("Review processor failed:", err));
+    res.json({ budgetUsd: n });
   });
 
   // Compare a section (e.g. Risk Factors) between two filings of the same company

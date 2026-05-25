@@ -29,10 +29,18 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+} from "@/components/ui/dialog";
 import { format } from "date-fns";
 import type { DateRange } from "react-day-picker";
 import { useToast } from "@/hooks/use-toast";
-import { Search, Download, Loader2, FileText, Calendar as CalendarIcon, Check, X, AlertCircle, ShieldAlert, ShieldCheck, RefreshCw } from "lucide-react";
+import { Search, Download, Loader2, FileText, Calendar as CalendarIcon, Check, X, AlertCircle, ShieldAlert, ShieldCheck, RefreshCw, Wallet, PauseCircle } from "lucide-react";
 import type { Filing } from "@shared/schema";
 import { CATEGORY_LABELS, parseFindings, estimateReviewCost, formatCostRange } from "@/lib/findings";
 
@@ -117,15 +125,87 @@ export default function FetchFilings() {
   });
   const reviewEnabled = config?.reviewEnabled ?? false;
 
+  // Current Claude spend + cap, so we can warn before a big run and flag pauses.
+  const { data: usage } = useQuery<{
+    reviewedCount: number;
+    costUsd: number;
+    budgetUsd: number | null;
+    pendingCount: number;
+    paused: boolean;
+  }>({
+    queryKey: ["/api/review/usage"],
+    refetchInterval: (query) => {
+      const data = query.state.data as { paused?: boolean } | undefined;
+      // Read the filings from the cache (rather than the outer const, which is
+      // declared later) to decide whether a review run is in flight. Fast while
+      // reviewing; slow (not stopped) while paused so this page recovers on its
+      // own if the team-wide cap is raised elsewhere.
+      const rows = queryClient.getQueryData<Filing[]>(["/api/filings"]);
+      const reviewing = rows?.some(
+        (f) => f.reviewStatus === "pending" || f.reviewStatus === "reviewing",
+      );
+      return reviewing ? (data?.paused ? 30000 : 5000) : false;
+    },
+  });
+  const paused = usage?.paused ?? false;
+
+  // Team-wide Claude spend cap (governs the auto-review that runs on fetch)
+  const [budgetOpen, setBudgetOpen] = useState(false);
+  const [budgetInput, setBudgetInput] = useState("");
+  const budgetMutation = useMutation<{ budgetUsd: number | null }, Error, number | null>({
+    mutationFn: async (budgetUsd) => {
+      const res = await apiRequest("POST", "/api/review/budget", { budgetUsd });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || "Failed to update spend cap");
+      }
+      return res.json();
+    },
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ["/api/review/usage"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/filings"] });
+      setBudgetOpen(false);
+      toast({
+        title:
+          data.budgetUsd === null
+            ? "Spend cap removed"
+            : `Spend cap set to $${data.budgetUsd.toFixed(2)}`,
+      });
+    },
+    onError: (err) => toast({ title: "Error", description: err.message, variant: "destructive" }),
+  });
+
+  const openBudgetDialog = () => {
+    setBudgetInput(usage?.budgetUsd != null ? String(usage.budgetUsd) : "");
+    setBudgetOpen(true);
+  };
+  const saveBudget = () => {
+    const trimmed = budgetInput.trim();
+    if (trimmed === "") {
+      budgetMutation.mutate(null);
+      return;
+    }
+    const n = Number(trimmed);
+    if (!Number.isFinite(n) || n < 0) {
+      toast({ title: "Enter a valid amount", description: "Use a non-negative dollar amount.", variant: "destructive" });
+      return;
+    }
+    budgetMutation.mutate(n);
+  };
+
   const { data: existingFilings = [], refetch: refetchFilings } = useQuery<Filing[]>({
     queryKey: ["/api/filings"],
     // While Claude is reviewing filings, poll so flags appear as they complete.
+    // When the spend cap pauses the queue, slow the poll instead of stopping so
+    // the page recovers on its own if the team-wide cap is raised elsewhere.
     refetchInterval: (query) => {
       const rows = query.state.data as Filing[] | undefined;
       const reviewing = rows?.some(
         (f) => f.reviewStatus === "pending" || f.reviewStatus === "reviewing",
       );
-      return reviewing ? 4000 : false;
+      const isPaused =
+        (queryClient.getQueryData(["/api/review/usage"]) as { paused?: boolean } | undefined)?.paused ?? false;
+      return reviewing ? (isPaused ? 30000 : 4000) : false;
     },
   });
 
@@ -271,8 +351,14 @@ export default function FetchFilings() {
     }
     if (selectedTickers.size > CONFIRM_THRESHOLD) {
       const est = selectedTickers.size * limitPerTicker;
+      const capNote =
+        reviewEnabled && usage?.budgetUsd != null
+          ? ` A $${usage.budgetUsd.toFixed(2)} spend cap is set ($${usage.costUsd.toFixed(2)} used) — review pauses automatically if it's reached.`
+          : reviewEnabled
+            ? " Tip: use “Set cap” above to stop reviews automatically at a dollar limit."
+            : "";
       const costNote = reviewEnabled
-        ? ` Estimated Claude review cost: ${formatCostRange(estimateReviewCost(Array(est).fill(undefined)))} (Opus 4.7; rough).`
+        ? ` Estimated Claude review cost: ${formatCostRange(estimateReviewCost(Array(est).fill(undefined)))} (Opus 4.7; rough).${capNote}`
         : "";
       setConfirm({
         title: "Fetch a large batch?",
@@ -309,17 +395,57 @@ export default function FetchFilings() {
 
   return (
     <div className="p-6 max-w-5xl mx-auto">
-      <div className="mb-6">
-        <h1 className="text-xl font-semibold mb-1" data-testid="text-page-title">
-          Fetch &amp; Review Filings
-        </h1>
-        <p className="text-sm text-muted-foreground">
-          Select tickers and a date range, then fetch and render SEC filings as PDFs.{" "}
-          {reviewEnabled
-            ? "Newly rendered filings are automatically reviewed by Claude — findings show up in the Findings tab."
-            : "Set ANTHROPIC_API_KEY to also have Claude review fetched filings for findings."}
-        </p>
+      <div className="mb-6 flex items-start justify-between gap-3">
+        <div>
+          <h1 className="text-xl font-semibold mb-1" data-testid="text-page-title">
+            Fetch &amp; Review Filings
+          </h1>
+          <p className="text-sm text-muted-foreground">
+            Select tickers and a date range, then fetch and render SEC filings as PDFs.{" "}
+            {reviewEnabled
+              ? "Newly rendered filings are automatically reviewed by Claude — findings show up in the Findings tab."
+              : "Set ANTHROPIC_API_KEY to also have Claude review fetched filings for findings."}
+          </p>
+          {reviewEnabled && usage && (usage.reviewedCount > 0 || usage.budgetUsd != null) && (
+            <p className="text-xs text-muted-foreground mt-1" data-testid="text-review-spend">
+              Claude review spend so far:{" "}
+              <span className="text-foreground font-medium">${usage.costUsd.toFixed(2)}</span>
+              {usage.budgetUsd != null && (
+                <>
+                  {" "}
+                  of <span className="text-foreground font-medium">${usage.budgetUsd.toFixed(2)}</span> cap
+                </>
+              )}
+            </p>
+          )}
+        </div>
+        {reviewEnabled && (
+          <Button
+            variant="outline"
+            size="sm"
+            className="shrink-0"
+            onClick={openBudgetDialog}
+            data-testid="button-set-budget"
+          >
+            <Wallet className="w-3.5 h-3.5 mr-1.5" />
+            {usage?.budgetUsd != null ? `Cap $${usage.budgetUsd.toFixed(0)}` : "Set cap"}
+          </Button>
+        )}
       </div>
+
+      {/* Spend-cap paused notice */}
+      {paused && usage && (
+        <Card className="p-3 mb-6 flex items-center gap-2 border-amber-600/40" data-testid="card-review-paused">
+          <PauseCircle className="w-4 h-4 text-amber-400 shrink-0" />
+          <p className="text-xs text-muted-foreground flex-1">
+            Review paused — the ${usage.budgetUsd?.toFixed(2)} spend cap has been reached (${usage.costUsd.toFixed(2)} spent).{" "}
+            {usage.pendingCount} filing{usage.pendingCount !== 1 ? "s" : ""} still queued. Raise the cap to continue.
+          </p>
+          <Button size="sm" variant="secondary" onClick={openBudgetDialog} data-testid="button-raise-budget">
+            Raise cap
+          </Button>
+        </Card>
+      )}
 
       {/* Controls */}
       <Card className="p-5 mb-6">
@@ -723,6 +849,70 @@ export default function FetchFilings() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      {/* Claude spend cap editor */}
+      <Dialog open={budgetOpen} onOpenChange={setBudgetOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Claude review spend cap</DialogTitle>
+            <DialogDescription>
+              Set a maximum total Claude cost for fetching &amp; reviewing filings. When cumulative
+              spend reaches this cap, the auto-review queue pauses and remaining filings stay queued
+              until you raise it. This does not affect the Compare feature. Leave blank to remove the cap.
+            </DialogDescription>
+          </DialogHeader>
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              saveBudget();
+            }}
+          >
+            <div className="relative">
+              <span className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground text-sm">$</span>
+              <Input
+                type="number"
+                min="0"
+                step="1"
+                placeholder="e.g. 50"
+                className="pl-6"
+                value={budgetInput}
+                onChange={(e) => setBudgetInput(e.target.value)}
+                autoFocus
+                data-testid="input-budget"
+              />
+            </div>
+            {usage && (
+              <p className="text-xs text-muted-foreground mt-2">
+                Spent so far: <span className="text-foreground font-medium">${usage.costUsd.toFixed(2)}</span>
+                {usage.pendingCount > 0 && <> · {usage.pendingCount} filing{usage.pendingCount !== 1 ? "s" : ""} queued</>}
+              </p>
+            )}
+            <DialogFooter className="mt-4">
+              {usage?.budgetUsd != null && (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  onClick={() => budgetMutation.mutate(null)}
+                  disabled={budgetMutation.isPending}
+                  data-testid="button-clear-budget"
+                >
+                  Remove cap
+                </Button>
+              )}
+              <Button
+                type="button"
+                variant="secondary"
+                onClick={() => setBudgetOpen(false)}
+              >
+                Cancel
+              </Button>
+              <Button type="submit" disabled={budgetMutation.isPending} data-testid="button-save-budget">
+                {budgetMutation.isPending ? "Saving…" : "Save cap"}
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

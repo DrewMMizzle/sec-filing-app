@@ -38,6 +38,7 @@ import {
   AlertCircle,
   Layers,
   X,
+  PauseCircle,
 } from "lucide-react";
 import type { Filing, FindingAction } from "@shared/schema";
 import { CATEGORY_LABELS, parseFindings, interestColor, estimateReviewCost, formatCostRange, type ReviewFinding } from "@/lib/findings";
@@ -93,7 +94,12 @@ export default function Findings() {
       const reviewing = rows?.some(
         (f) => f.reviewStatus === "pending" || f.reviewStatus === "reviewing",
       );
-      return reviewing ? 4000 : false;
+      // While reviews are in flight, poll fast. When the spend cap has paused
+      // the queue, keep polling slowly: the cap is team-wide, so another
+      // session raising it should still let this page recover on its own.
+      const isPaused =
+        (queryClient.getQueryData(["/api/review/usage"]) as { paused?: boolean } | undefined)?.paused ?? false;
+      return reviewing ? (isPaused ? 30000 : 4000) : false;
     },
   });
 
@@ -111,9 +117,20 @@ export default function Findings() {
   const reviewEnabled = config?.reviewEnabled ?? false;
 
   // Actual Claude spend so far; poll while reviews are running so it ticks up.
-  const { data: usage } = useQuery<{ reviewedCount: number; costUsd: number }>({
+  const { data: usage } = useQuery<{
+    reviewedCount: number;
+    costUsd: number;
+    budgetUsd: number | null;
+    pendingCount: number;
+    paused: boolean;
+  }>({
     queryKey: ["/api/review/usage"],
-    refetchInterval: reviewing ? 5000 : false,
+    refetchInterval: (query) => {
+      const data = query.state.data as { paused?: boolean } | undefined;
+      // Fast while reviewing; slow (not stopped) while paused so the page can
+      // recover on its own if the team-wide cap is raised in another session.
+      return reviewing ? (data?.paused ? 30000 : 5000) : false;
+    },
   });
 
   const { toast } = useToast();
@@ -148,6 +165,8 @@ export default function Findings() {
     },
     onError: (err: Error) => toast({ title: "Error", description: err.message, variant: "destructive" }),
   });
+
+  const paused = usage?.paused ?? false;
 
   const [activeCats, setActiveCats] = useState<Set<string>>(new Set());
   const [interest, setInterest] = useState<string>("all");
@@ -367,12 +386,18 @@ export default function Findings() {
             </Link>{" "}
             → Claude reviews each one → post-worthy details show up here. Triage them, then open the source.
           </p>
-          {usage && usage.reviewedCount > 0 && (
+          {usage && (usage.reviewedCount > 0 || usage.budgetUsd != null) && (
             <p className="text-xs text-muted-foreground mt-1" data-testid="text-review-spend">
               Claude review spend so far:{" "}
-              <span className="text-foreground font-medium">${usage.costUsd.toFixed(2)}</span> across{" "}
-              {usage.reviewedCount} filing{usage.reviewedCount !== 1 ? "s" : ""}
-              {reviewing && <span className="text-amber-400"> · updating…</span>}
+              <span className="text-foreground font-medium">${usage.costUsd.toFixed(2)}</span>
+              {usage.budgetUsd != null && (
+                <>
+                  {" "}
+                  of <span className="text-foreground font-medium">${usage.budgetUsd.toFixed(2)}</span> cap
+                </>
+              )}{" "}
+              across {usage.reviewedCount} filing{usage.reviewedCount !== 1 ? "s" : ""}
+              {reviewing && !paused && <span className="text-amber-400"> · updating…</span>}
             </p>
           )}
         </div>
@@ -384,12 +409,12 @@ export default function Findings() {
               disabled={reviewMutation.isPending || reviewing}
               data-testid="button-review-saved"
             >
-              {reviewMutation.isPending || reviewing ? (
+              {reviewMutation.isPending || (reviewing && !paused) ? (
                 <Loader2 className="w-3.5 h-3.5 mr-1.5 animate-spin" />
               ) : (
                 <Sparkles className="w-3.5 h-3.5 mr-1.5" />
               )}
-              {reviewing ? "Reviewing…" : `Review ${reviewableCount} saved`}
+              {paused ? "Paused" : reviewing ? "Reviewing…" : `Review ${reviewableCount} saved`}
             </Button>
           )}
           <Button
@@ -470,6 +495,20 @@ export default function Findings() {
             <span className="font-medium text-foreground">Review {reviewableCount} saved</span> above to scan
             them.
           </p>
+        </Card>
+      )}
+
+      {/* Spend-cap paused notice */}
+      {paused && usage && (
+        <Card className="p-3 mb-4 flex items-center gap-2 border-amber-600/40" data-testid="card-review-paused">
+          <PauseCircle className="w-4 h-4 text-amber-400 shrink-0" />
+          <p className="text-xs text-muted-foreground flex-1">
+            Review paused — the ${usage.budgetUsd?.toFixed(2)} spend cap has been reached (${usage.costUsd.toFixed(2)} spent).{" "}
+            {usage.pendingCount} filing{usage.pendingCount !== 1 ? "s" : ""} still queued. Raise the cap on Fetch &amp; Review to continue.
+          </p>
+          <Button size="sm" variant="secondary" asChild data-testid="button-raise-budget">
+            <Link href="/fetch">Manage cap</Link>
+          </Button>
         </Card>
       )}
 
