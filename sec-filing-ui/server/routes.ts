@@ -154,29 +154,39 @@ function runFetchPipeline(
             const ticker = event.ticker || "UNKNOWN";
             const safeType = (event.filing_type || "filing").replace(/ /g, "_");
             const destDir = path.join(PDF_STORAGE_DIR, ticker, safeType);
-            if (!fs.existsSync(destDir)) fs.mkdirSync(destDir, { recursive: true });
             const destFile = path.join(destDir, `${event.accession}.pdf`);
-            try {
-              fs.copyFileSync(pipelinePdf, destFile);
-            } catch (copyErr) {
-              console.error(`Failed to copy PDF to app storage: ${copyErr}`);
-            }
             const appRelPath = path.relative(path.resolve(PDF_STORAGE_DIR, ".."), destFile);
             completedAccessions.push(event.accession);
-            storage
-              .updateFilingStatus(event.accession, "complete", appRelPath, event.size)
-              .then(() => {
-                // Queue the review as soon as the PDF is rendered (and nudge the
-                // processor) so spend and review progress move during the run,
-                // instead of only after the entire batch finishes rendering.
-                if (!isReviewEnabled()) return;
-                return storage.markFilingForReview(event.accession).then(() => {
+            // Async fs + DB so a 10-K-sized copy doesn't stall the event loop
+            // and starve other API requests / event handling. Order within the
+            // chain is preserved (mkdir → copy → DB update → queue review).
+            (async () => {
+              try {
+                await fs.promises.mkdir(destDir, { recursive: true });
+                await fs.promises.copyFile(pipelinePdf, destFile);
+              } catch (copyErr) {
+                console.error(`Failed to copy PDF to app storage: ${copyErr}`);
+              }
+              try {
+                await storage.updateFilingStatus(
+                  event.accession,
+                  "complete",
+                  appRelPath,
+                  event.size,
+                );
+                if (isReviewEnabled()) {
+                  // Queue the review as soon as the PDF is rendered (and nudge
+                  // the processor) so spend and review progress move during
+                  // the run, instead of only after the entire batch finishes.
+                  await storage.markFilingForReview(event.accession);
                   kickReviewProcessor().catch((err) =>
                     console.error("Review processor failed:", err),
                   );
-                });
-              })
-              .catch((err) => console.error("Failed to update filing status:", err));
+                }
+              } catch (err) {
+                console.error("Failed to update filing status:", err);
+              }
+            })();
           } else if (event.event === "error" && event.accession) {
             storage
               .updateFilingStatus(event.accession, "error", undefined, undefined, event.message)
@@ -610,6 +620,32 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
   app.get("/api/filings/stats", requireAuth, async (_req, res) => {
     const stats = await storage.getFilingStats();
     res.json(stats);
+  });
+
+  // Paginated/filterable/sortable filings — push filter/sort/pagination to SQL
+  // so the client doesn't ship the whole corpus over the wire to render a page.
+  app.get("/api/filings/page", requireAuth, async (req, res) => {
+    const num = (v: any) => {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : undefined;
+    };
+    const q = req.query as Record<string, string | undefined>;
+    const limit = num(q.limit) ?? 50;
+    const offset = num(q.offset) ?? 0;
+    const result = await storage.getFilingsPage({
+      ticker: q.ticker,
+      filingType: q.filingType,
+      status: q.status,
+      reviewStatus: q.reviewStatus,
+      dateFrom: q.dateFrom,
+      dateTo: q.dateTo,
+      q: q.q,
+      sort: q.sort,
+      dir: q.dir === "asc" ? "asc" : "desc",
+      limit,
+      offset,
+    });
+    res.json({ items: result.items, total: result.total, limit, offset });
   });
 
   app.get("/api/filings", requireAuth, async (req, res) => {
