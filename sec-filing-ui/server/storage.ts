@@ -22,7 +22,7 @@ import {
 } from "@shared/schema";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
-import { eq, and, gte, lte, desc, inArray, sql, or, isNull } from "drizzle-orm";
+import { eq, and, gte, lte, asc, desc, inArray, sql, or, isNull } from "drizzle-orm";
 
 const DATABASE_URL = process.env.DATABASE_URL;
 if (!DATABASE_URL) {
@@ -303,6 +303,71 @@ export class DatabaseStorage {
     const query = db.select().from(filings);
     const rows = conditions.length > 0 ? await query.where(and(...conditions)) : await query;
     return rows.sort((a, b) => (b.filingDate || "").localeCompare(a.filingDate || ""));
+  }
+
+  // Paginated/filterable/sortable variant of getFilings — pushes all of the
+  // PDF-library page's filter/sort/search work into SQL (with indexes on
+  // ticker, status, filingDate, filingType) so the client only ever ships a
+  // page-worth of rows over the wire.
+  async getFilingsPage(opts: {
+    ticker?: string;
+    filingType?: string;
+    status?: string;
+    reviewStatus?: string;
+    dateFrom?: string;
+    dateTo?: string;
+    q?: string;
+    sort?: string;
+    dir?: "asc" | "desc";
+    limit?: number;
+    offset?: number;
+  } = {}): Promise<{ items: Filing[]; total: number }> {
+    const conditions: any[] = [];
+    if (opts.ticker) conditions.push(eq(filings.ticker, opts.ticker));
+    if (opts.filingType) conditions.push(eq(filings.filingType, opts.filingType));
+    if (opts.status) conditions.push(eq(filings.status, opts.status));
+    if (opts.reviewStatus) conditions.push(eq(filings.reviewStatus, opts.reviewStatus));
+    if (opts.dateFrom) conditions.push(gte(filings.filingDate, opts.dateFrom));
+    if (opts.dateTo) conditions.push(lte(filings.filingDate, opts.dateTo));
+    if (opts.q && opts.q.trim()) {
+      const like = `%${opts.q.trim().toLowerCase()}%`;
+      conditions.push(
+        or(
+          sql`LOWER(${filings.ticker}) LIKE ${like}`,
+          sql`LOWER(${filings.accessionNumber}) LIKE ${like}`,
+          sql`LOWER(${filings.filingType}) LIKE ${like}`,
+        ),
+      );
+    }
+    const where = conditions.length > 0 ? and(...conditions) : undefined;
+
+    // Total count for pagination — separate query to keep it cheap.
+    const countQuery = db
+      .select({ c: sql<number>`count(*)::int` })
+      .from(filings);
+    const totalRows = where ? await countQuery.where(where) : await countQuery;
+    const total = totalRows[0]?.c ?? 0;
+
+    const sortMap: Record<string, any> = {
+      filingDate: filings.filingDate,
+      ticker: filings.ticker,
+      filingType: filings.filingType,
+      status: filings.status,
+      pdfSize: filings.pdfSize,
+      reviewedAt: filings.reviewedAt,
+    };
+    const sortColumn = sortMap[opts.sort ?? "filingDate"] ?? filings.filingDate;
+    const orderFn = opts.dir === "asc" ? asc : desc;
+    const limit = Math.max(1, Math.min(opts.limit ?? 50, 200));
+    const offset = Math.max(0, opts.offset ?? 0);
+
+    const base = db.select().from(filings);
+    const items = await (where ? base.where(where) : base)
+      .orderBy(orderFn(sortColumn))
+      .limit(limit)
+      .offset(offset);
+
+    return { items: items as Filing[], total };
   }
 
   async getFilingByAccession(accession: string): Promise<Filing | undefined> {

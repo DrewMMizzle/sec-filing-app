@@ -1,4 +1,4 @@
-import { useState, useMemo } from "react";
+import { useState, useEffect } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { queryClient, apiRequest, API_BASE } from "@/lib/queryClient";
 import { Card } from "@/components/ui/card";
@@ -47,6 +47,8 @@ import {
   FileText,
   BarChart3,
   AlertCircle,
+  ChevronLeft,
+  ChevronRight,
 } from "lucide-react";
 import type { Filing } from "@shared/schema";
 
@@ -71,11 +73,18 @@ export default function PdfLibrary() {
   const [statusFilter, setStatusFilter] = useState<string>("all");
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
+  // Two states for the search: `searchInput` is the live text-box value,
+  // `searchQuery` is the debounced value that drives the server query.
+  const [searchInput, setSearchInput] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
 
   // Sorting
   const [sortField, setSortField] = useState<SortField>("filingDate");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
+
+  // Pagination
+  const PAGE_SIZE = 50;
+  const [page, setPage] = useState(0);
 
   // Selection
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
@@ -84,70 +93,61 @@ export default function PdfLibrary() {
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [pendingDeleteIds, setPendingDeleteIds] = useState<number[]>([]);
 
-  // Data queries
-  const { data: allFilings = [], isLoading: filingsLoading } = useQuery<Filing[]>({
-    queryKey: ["/api/filings"],
-  });
+  // Debounce search input so each keystroke doesn't fire a query.
+  useEffect(() => {
+    const t = setTimeout(() => setSearchQuery(searchInput), 250);
+    return () => clearTimeout(t);
+  }, [searchInput]);
 
+  // Whenever any filter/sort changes, jump back to page 1 so the visible page
+  // matches the new result set.
+  useEffect(() => {
+    setPage(0);
+  }, [tickerFilter, typeFilter, statusFilter, dateFrom, dateTo, searchQuery, sortField, sortDir]);
+
+  // Stats — also gives us the distinct tickers + filing types for the dropdowns
+  // without having to ship the whole corpus to the client.
   const { data: stats } = useQuery<FilingStats>({
     queryKey: ["/api/filings/stats"],
   });
 
-  // Derive unique tickers and types from data
-  const availableTickers = useMemo(() => {
-    const set = new Set(allFilings.map((f) => f.ticker));
-    return Array.from(set).sort();
-  }, [allFilings]);
+  // Paginated filings — all filter/sort/pagination is done in SQL.
+  const filingsQueryKey = [
+    "/api/filings/page",
+    { tickerFilter, typeFilter, statusFilter, dateFrom, dateTo, searchQuery, sortField, sortDir, page },
+  ] as const;
+  const { data: filingsPage, isLoading: filingsLoading } = useQuery<{
+    items: Filing[];
+    total: number;
+    limit: number;
+    offset: number;
+  }>({
+    queryKey: filingsQueryKey as unknown as readonly unknown[],
+    queryFn: async () => {
+      const sp = new URLSearchParams();
+      if (tickerFilter !== "all") sp.set("ticker", tickerFilter);
+      if (typeFilter !== "all") sp.set("filingType", typeFilter);
+      if (statusFilter !== "all") sp.set("status", statusFilter);
+      if (dateFrom) sp.set("dateFrom", dateFrom);
+      if (dateTo) sp.set("dateTo", dateTo);
+      if (searchQuery.trim()) sp.set("q", searchQuery.trim());
+      sp.set("sort", sortField);
+      sp.set("dir", sortDir);
+      sp.set("limit", String(PAGE_SIZE));
+      sp.set("offset", String(page * PAGE_SIZE));
+      const res = await fetch(`${API_BASE}/api/filings/page?${sp.toString()}`, {
+        credentials: "same-origin",
+      });
+      if (!res.ok) throw new Error(`Failed to load filings (${res.status})`);
+      return res.json();
+    },
+  });
+  const filteredFilings = filingsPage?.items ?? [];
+  const totalCount = filingsPage?.total ?? 0;
+  const totalPages = Math.max(1, Math.ceil(totalCount / PAGE_SIZE));
 
-  const availableTypes = useMemo(() => {
-    const set = new Set(allFilings.map((f) => f.filingType));
-    return Array.from(set).sort();
-  }, [allFilings]);
-
-  // Filter + sort logic
-  const filteredFilings = useMemo(() => {
-    let items = [...allFilings];
-
-    if (tickerFilter !== "all") items = items.filter((f) => f.ticker === tickerFilter);
-    if (typeFilter !== "all") items = items.filter((f) => f.filingType === typeFilter);
-    if (statusFilter !== "all") items = items.filter((f) => f.status === statusFilter);
-    if (dateFrom) items = items.filter((f) => f.filingDate && f.filingDate >= dateFrom);
-    if (dateTo) items = items.filter((f) => f.filingDate && f.filingDate <= dateTo);
-    if (searchQuery.trim()) {
-      const q = searchQuery.trim().toLowerCase();
-      items = items.filter(
-        (f) =>
-          f.ticker.toLowerCase().includes(q) ||
-          f.accessionNumber.toLowerCase().includes(q) ||
-          f.filingType.toLowerCase().includes(q),
-      );
-    }
-
-    // Sort
-    items.sort((a, b) => {
-      let cmp = 0;
-      switch (sortField) {
-        case "ticker":
-          cmp = a.ticker.localeCompare(b.ticker);
-          break;
-        case "filingType":
-          cmp = a.filingType.localeCompare(b.filingType);
-          break;
-        case "filingDate":
-          cmp = (a.filingDate || "").localeCompare(b.filingDate || "");
-          break;
-        case "status":
-          cmp = a.status.localeCompare(b.status);
-          break;
-        case "pdfSize":
-          cmp = (a.pdfSize || 0) - (b.pdfSize || 0);
-          break;
-      }
-      return sortDir === "asc" ? cmp : -cmp;
-    });
-
-    return items;
-  }, [allFilings, tickerFilter, typeFilter, statusFilter, dateFrom, dateTo, searchQuery, sortField, sortDir]);
+  const availableTickers = stats?.tickers ?? [];
+  const availableTypes = stats?.filingTypes ?? [];
 
   // Selection helpers
   const allVisibleSelected =
@@ -199,8 +199,12 @@ export default function PdfLibrary() {
       }
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["/api/filings"] });
-      queryClient.invalidateQueries({ queryKey: ["/api/filings/stats"] });
+      // Refetch anything that depends on the filings list (paginated query,
+      // any /api/filings consumer, and the stats cards).
+      queryClient.invalidateQueries({
+        predicate: (q) =>
+          typeof q.queryKey[0] === "string" && (q.queryKey[0] as string).startsWith("/api/filings"),
+      });
       setSelectedIds(new Set());
       toast({ title: `${pendingDeleteIds.length} filing(s) deleted` });
     },
@@ -226,6 +230,7 @@ export default function PdfLibrary() {
     setStatusFilter("all");
     setDateFrom("");
     setDateTo("");
+    setSearchInput("");
     setSearchQuery("");
   };
 
@@ -235,7 +240,7 @@ export default function PdfLibrary() {
     statusFilter !== "all" ||
     dateFrom !== "" ||
     dateTo !== "" ||
-    searchQuery.trim() !== "";
+    searchInput.trim() !== "";
 
   const statusBadge = (status: string) => {
     switch (status) {
@@ -335,8 +340,8 @@ export default function PdfLibrary() {
             <label className="text-xs font-medium text-muted-foreground mb-1 block">Search</label>
             <Input
               placeholder="Ticker, accession, type..."
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
+              value={searchInput}
+              onChange={(e) => setSearchInput(e.target.value)}
               className="h-9"
               data-testid="input-search"
             />
@@ -424,7 +429,11 @@ export default function PdfLibrary() {
       {/* Toolbar: selection count + batch actions */}
       <div className="flex items-center justify-between mb-3 min-h-[36px]">
         <p className="text-sm text-muted-foreground">
-          {filteredFilings.length} filing{filteredFilings.length !== 1 ? "s" : ""}
+          {totalCount === 0
+            ? "0 filings"
+            : `${page * PAGE_SIZE + 1}–${Math.min(totalCount, (page + 1) * PAGE_SIZE)} of ${totalCount.toLocaleString()} filing${
+                totalCount !== 1 ? "s" : ""
+              }`}
           {selectedIds.size > 0 && (
             <span className="ml-2 text-foreground font-medium">
               · {selectedIds.size} selected
@@ -459,7 +468,7 @@ export default function PdfLibrary() {
             </div>
           </div>
           <p className="text-sm text-muted-foreground">
-            {allFilings.length === 0
+            {(stats?.totalCount ?? 0) === 0
               ? "No filings in the library yet. Use Fetch Filings to download SEC filings."
               : "No filings match the current filters."}
           </p>
@@ -617,6 +626,37 @@ export default function PdfLibrary() {
             </Table>
           </div>
         </Card>
+      )}
+
+      {/* Pagination controls */}
+      {totalCount > PAGE_SIZE && (
+        <div className="flex items-center justify-between mt-3 text-sm">
+          <span className="text-muted-foreground">
+            Page {page + 1} of {totalPages}
+          </span>
+          <div className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setPage((p) => Math.max(0, p - 1))}
+              disabled={page === 0 || filingsLoading}
+              data-testid="button-prev-page"
+            >
+              <ChevronLeft className="w-3.5 h-3.5 mr-1" />
+              Previous
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setPage((p) => Math.min(totalPages - 1, p + 1))}
+              disabled={page >= totalPages - 1 || filingsLoading}
+              data-testid="button-next-page"
+            >
+              Next
+              <ChevronRight className="w-3.5 h-3.5 ml-1" />
+            </Button>
+          </div>
+        </div>
       )}
 
       {/* Delete confirmation dialog */}
