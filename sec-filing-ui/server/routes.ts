@@ -9,7 +9,7 @@ import { fileURLToPath } from "url";
 import { hashPassword, verifyPassword, createSession, clearSession, requireAuth } from "./auth";
 import { ensureSP500Seeded } from "./seed-sp500";
 import { isReviewEnabled, kickReviewProcessor, reviewCostUsd } from "./review";
-import { chatAboutFindings } from "./chat";
+import { chatAboutFindings, chatAboutFiling } from "./chat";
 import { compareFilings, SECTION_LABELS, type SectionKey } from "./compare";
 import { db } from "./storage";
 import { tickers as tickersTable, filings as filingsTable } from "@shared/schema";
@@ -859,6 +859,48 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
       });
     } catch (e: any) {
       console.error("Findings chat failed:", e?.message || e);
+      res.status(500).json({ error: e?.message || "Chat failed" });
+    }
+  });
+
+  // Deep-dive chat for one specific filing — answers questions against the
+  // filing's full PDF text (not just the extracted findings). Useful for
+  // routine financial/operational content the corpus chat can't cover.
+  app.post("/api/filings/:accession/ask", requireAuth, async (req, res) => {
+    if (!isReviewEnabled()) {
+      return res
+        .status(409)
+        .json({ error: "Claude is not configured (ANTHROPIC_API_KEY is not set)." });
+    }
+    const accession = req.params.accession as string;
+    const { messages } = req.body as {
+      messages?: Array<{ role: "user" | "assistant"; content: string }>;
+    };
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return res.status(400).json({ error: "messages array is required" });
+    }
+    for (const m of messages) {
+      if (!m || (m.role !== "user" && m.role !== "assistant") || typeof m.content !== "string") {
+        return res.status(400).json({ error: "Each message needs role ('user'|'assistant') and string content" });
+      }
+    }
+    const last = messages[messages.length - 1];
+    if (last.role !== "user" || !last.content.trim()) {
+      return res.status(400).json({ error: "Last message must be a non-empty user question" });
+    }
+    try {
+      const result = await chatAboutFiling(accession, messages);
+      res.json({
+        answer: result.answer,
+        usage: result.usage,
+        costUsd: Math.round(reviewCostUsd(result.usage) * 10000) / 10000,
+        ticker: result.ticker,
+        form: result.form,
+        date: result.date,
+        truncated: result.truncated,
+      });
+    } catch (e: any) {
+      console.error("Filing chat failed:", e?.message || e);
       res.status(500).json({ error: e?.message || "Chat failed" });
     }
   });
