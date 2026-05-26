@@ -179,6 +179,17 @@ async def filing_exists(session: AsyncSession, accession_number: str) -> bool:
     return result.scalar_one_or_none() is not None
 
 
+async def get_known_accessions(session: AsyncSession, cik: str) -> set[str]:
+    """Return every accession number already stored for a CIK in one query.
+
+    Lets callers replace N per-filing ``filing_exists()`` round-trips with a
+    single bulk fetch + an in-memory set lookup.
+    """
+    stmt = select(Filing.accession_number).where(Filing.cik == cik)
+    result = await session.execute(stmt)
+    return {row[0] for row in result.all()}
+
+
 async def get_latest_filing_date(session: AsyncSession, cik: str) -> date | None:
     """Return the most recent filing_date for a CIK, or ``None``."""
     stmt = (
