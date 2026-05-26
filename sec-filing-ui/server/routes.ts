@@ -9,6 +9,7 @@ import { fileURLToPath } from "url";
 import { hashPassword, verifyPassword, createSession, clearSession, requireAuth } from "./auth";
 import { ensureSP500Seeded } from "./seed-sp500";
 import { isReviewEnabled, kickReviewProcessor, reviewCostUsd } from "./review";
+import { chatAboutFindings } from "./chat";
 import { compareFilings, SECTION_LABELS, type SectionKey } from "./compare";
 import { db } from "./storage";
 import { tickers as tickersTable, filings as filingsTable } from "@shared/schema";
@@ -817,6 +818,48 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     } catch (e: any) {
       console.error("Comparison failed:", e?.message || e);
       res.status(500).json({ error: e?.message || "Comparison failed" });
+    }
+  });
+
+  // ─── Findings chat (Claude Q&A over the findings corpus) ─
+  // Takes a chat history (last entry must be the new user question) and
+  // returns Claude's answer + token usage. The findings corpus is sent in the
+  // system prompt with cache_control so follow-up turns are cheap.
+  app.post("/api/findings/chat", requireAuth, async (req, res) => {
+    if (!isReviewEnabled()) {
+      return res
+        .status(409)
+        .json({ error: "Claude is not configured (ANTHROPIC_API_KEY is not set)." });
+    }
+    const { messages } = req.body as {
+      messages?: Array<{ role: "user" | "assistant"; content: string }>;
+    };
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return res.status(400).json({ error: "messages array is required" });
+    }
+    // Validate shape and that the last turn is a non-empty user message.
+    for (const m of messages) {
+      if (!m || (m.role !== "user" && m.role !== "assistant") || typeof m.content !== "string") {
+        return res.status(400).json({ error: "Each message needs role ('user'|'assistant') and string content" });
+      }
+    }
+    const last = messages[messages.length - 1];
+    if (last.role !== "user" || !last.content.trim()) {
+      return res.status(400).json({ error: "Last message must be a non-empty user question" });
+    }
+    try {
+      const result = await chatAboutFindings(messages);
+      res.json({
+        answer: result.answer,
+        usage: result.usage,
+        costUsd: Math.round(reviewCostUsd(result.usage) * 10000) / 10000,
+        corpusFindingsCount: result.corpusFindingsCount,
+        corpusFilingsCount: result.corpusFilingsCount,
+        truncated: result.truncated,
+      });
+    } catch (e: any) {
+      console.error("Findings chat failed:", e?.message || e);
+      res.status(500).json({ error: e?.message || "Chat failed" });
     }
   });
 
