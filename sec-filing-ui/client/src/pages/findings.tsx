@@ -39,6 +39,7 @@ import {
   Layers,
   X,
   PauseCircle,
+  Copy,
 } from "lucide-react";
 import type { Filing, FindingAction } from "@shared/schema";
 import { CATEGORY_LABELS, parseFindings, interestColor, estimateReviewCost, formatCostRange, type ReviewFinding } from "@/lib/findings";
@@ -82,6 +83,69 @@ function downloadCsv(rows: Row[]) {
   a.download = "findings.csv";
   a.click();
   URL.revokeObjectURL(url);
+}
+
+// ─── Rich clipboard (pastes cleanly into Word / Outlook) ───
+const htmlEsc = (v: unknown) =>
+  String(v ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+
+function findingHtml(r: Row): string {
+  const { filing, finding } = r;
+  const meta = [
+    filing.ticker,
+    filing.filingType,
+    filing.filingDate || "",
+    CATEGORY_LABELS[finding.category] || finding.category,
+  ]
+    .filter(Boolean)
+    .map(htmlEsc)
+    .join(" &middot; ");
+  return (
+    `<div style="font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#1a1a1a;margin:0 0 14pt 0;">` +
+    `<div style="font-size:12pt;font-weight:bold;margin:0 0 3pt 0;">${htmlEsc(finding.headline)}</div>` +
+    `<div style="margin:0 0 4pt 0;">${htmlEsc(finding.detail)}</div>` +
+    (finding.why
+      ? `<div style="font-style:italic;color:#555;margin:0 0 4pt 0;"><b>Why it matters:</b> ${htmlEsc(finding.why)}</div>`
+      : "") +
+    `<div style="font-size:9pt;color:#888;">${meta}</div>` +
+    `</div>`
+  );
+}
+
+function findingText(r: Row): string {
+  const { filing, finding } = r;
+  const meta = [
+    filing.ticker,
+    filing.filingType,
+    filing.filingDate || "",
+    CATEGORY_LABELS[finding.category] || finding.category,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  return [finding.headline, finding.detail, finding.why ? `Why it matters: ${finding.why}` : "", meta]
+    .filter(Boolean)
+    .join("\n");
+}
+
+async function copyRich(html: string, text: string): Promise<void> {
+  const wrapped = `<!DOCTYPE html><html><body>${html}</body></html>`;
+  try {
+    if (navigator.clipboard && "write" in navigator.clipboard && typeof ClipboardItem !== "undefined") {
+      await navigator.clipboard.write([
+        new ClipboardItem({
+          "text/html": new Blob([wrapped], { type: "text/html" }),
+          "text/plain": new Blob([text], { type: "text/plain" }),
+        }),
+      ]);
+      return;
+    }
+  } catch {
+    // fall through to plain-text copy
+  }
+  await navigator.clipboard.writeText(text);
 }
 
 const interestRank = (l?: string | null) => (l === "high" ? 3 : l === "medium" ? 2 : l === "low" ? 1 : 0);
@@ -282,6 +346,24 @@ export default function Findings() {
     });
   };
 
+  const copyOne = async (r: Row) => {
+    try {
+      await copyRich(findingHtml(r), findingText(r));
+      toast({ title: "Finding copied — paste into Word or Outlook" });
+    } catch (e: any) {
+      toast({ title: "Copy failed", description: e?.message, variant: "destructive" });
+    }
+  };
+  const copyAll = async () => {
+    if (rows.length === 0) return;
+    try {
+      await copyRich(rows.map(findingHtml).join(""), rows.map(findingText).join("\n\n"));
+      toast({ title: `Copied ${rows.length} finding${rows.length !== 1 ? "s" : ""} — paste into Word or Outlook` });
+    } catch (e: any) {
+      toast({ title: "Copy failed", description: e?.message, variant: "destructive" });
+    }
+  };
+
   const renderRow = (r: Row) => {
     const { filing, finding } = r;
     return (
@@ -360,6 +442,20 @@ export default function Findings() {
                 </TooltipTrigger>
                 <TooltipContent>{r.status === "dismissed" ? "Un-dismiss" : "Dismiss (hide)"}</TooltipContent>
               </Tooltip>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-7 w-7 text-muted-foreground"
+                    onClick={() => copyOne(r)}
+                    data-testid={`action-copy-${r.key}`}
+                  >
+                    <Copy className="w-3.5 h-3.5" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Copy (for Word / Outlook)</TooltipContent>
+              </Tooltip>
             </div>
             {filing.pdfPath && (
               <a
@@ -424,6 +520,16 @@ export default function Findings() {
               {paused ? "Paused" : reviewing ? "Reviewing…" : `Review ${reviewableCount} saved`}
             </Button>
           )}
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={copyAll}
+            disabled={rows.length === 0}
+            data-testid="button-copy-all"
+          >
+            <Copy className="w-3.5 h-3.5 mr-1.5" />
+            Copy all
+          </Button>
           <Button
             variant="secondary"
             size="sm"
