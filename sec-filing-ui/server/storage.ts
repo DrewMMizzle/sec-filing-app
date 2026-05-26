@@ -23,6 +23,7 @@ import {
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
 import { eq, and, gte, lte, asc, desc, inArray, sql, or, isNull } from "drizzle-orm";
+import { runMigrations } from "./migrations";
 
 const DATABASE_URL = process.env.DATABASE_URL;
 if (!DATABASE_URL) {
@@ -38,100 +39,14 @@ const pool = new Pool({
 
 export const db = drizzle(pool);
 
-// Auto-create tables via raw SQL (runs once on startup)
+// Run versioned schema migrations on boot. The bulk of the DDL only runs the
+// first time (or on schema upgrades) — steady-state boot is a single SELECT
+// against schema_migrations.
 export async function initDatabase(): Promise<void> {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS users (
-      id SERIAL PRIMARY KEY,
-      email TEXT NOT NULL UNIQUE,
-      password_hash TEXT NOT NULL,
-      display_name TEXT NOT NULL,
-      created_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS sessions (
-      id TEXT PRIMARY KEY,
-      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      expires_at TEXT NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
-    CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
-
-    -- Add user_id to watchlists (nullable initially for migration, then we'll handle it)
-    ALTER TABLE watchlists ADD COLUMN IF NOT EXISTS user_id INTEGER REFERENCES users(id) ON DELETE CASCADE;
-    -- Remove unique constraint on name if it exists (now scoped per user, not globally unique)
-    ALTER TABLE watchlists DROP CONSTRAINT IF EXISTS watchlists_name_unique;
-
-    CREATE TABLE IF NOT EXISTS tickers (
-      id SERIAL PRIMARY KEY,
-      watchlist_id INTEGER NOT NULL REFERENCES watchlists(id) ON DELETE CASCADE,
-      ticker TEXT NOT NULL,
-      cik TEXT NOT NULL,
-      filing_types TEXT NOT NULL DEFAULT '["10-K","10-Q","8-K"]'
-    );
-
-    -- Add user_id to filings
-    ALTER TABLE filings ADD COLUMN IF NOT EXISTS user_id INTEGER REFERENCES users(id) ON DELETE CASCADE;
-
-    -- Claude material-disclosure review columns
-    ALTER TABLE filings ADD COLUMN IF NOT EXISTS review_status TEXT;
-    ALTER TABLE filings ADD COLUMN IF NOT EXISTS review_flagged BOOLEAN;
-    ALTER TABLE filings ADD COLUMN IF NOT EXISTS review_materiality TEXT;
-    ALTER TABLE filings ADD COLUMN IF NOT EXISTS review_summary TEXT;
-    ALTER TABLE filings ADD COLUMN IF NOT EXISTS review_findings TEXT;
-    ALTER TABLE filings ADD COLUMN IF NOT EXISTS review_error TEXT;
-    ALTER TABLE filings ADD COLUMN IF NOT EXISTS reviewed_at TEXT;
-    ALTER TABLE filings ADD COLUMN IF NOT EXISTS review_input_tokens INTEGER;
-    ALTER TABLE filings ADD COLUMN IF NOT EXISTS review_output_tokens INTEGER;
-    ALTER TABLE filings ADD COLUMN IF NOT EXISTS review_cache_read_tokens INTEGER;
-    ALTER TABLE filings ADD COLUMN IF NOT EXISTS review_cache_creation_tokens INTEGER;
-    CREATE INDEX IF NOT EXISTS idx_filings_review_status ON filings(review_status);
-
-    -- Proxy statements (DEF 14A) are core to footnoted-style review. Add the
-    -- form to any existing watchlist ticker that doesn't already track it.
-    UPDATE tickers
-      SET filing_types = ((filing_types::jsonb) || '["DEF 14A"]'::jsonb)::text
-      WHERE filing_types IS NOT NULL
-        AND NOT ((filing_types::jsonb) ? 'DEF 14A');
-
-    CREATE TABLE IF NOT EXISTS watchlist_shares (
-      id SERIAL PRIMARY KEY,
-      watchlist_id INTEGER NOT NULL REFERENCES watchlists(id) ON DELETE CASCADE,
-      shared_with_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      permission TEXT NOT NULL DEFAULT 'view',
-      created_at TEXT NOT NULL
-    );
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_share_unique ON watchlist_shares(watchlist_id, shared_with_user_id);
-    CREATE INDEX IF NOT EXISTS idx_shares_user ON watchlist_shares(shared_with_user_id);
-
-    CREATE TABLE IF NOT EXISTS finding_actions (
-      id SERIAL PRIMARY KEY,
-      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      accession_number TEXT NOT NULL,
-      finding_index INTEGER NOT NULL,
-      status TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_finding_action_unique ON finding_actions(user_id, accession_number, finding_index);
-    CREATE INDEX IF NOT EXISTS idx_finding_actions_user ON finding_actions(user_id);
-
-    -- App-wide key/value settings (e.g. the review spend cap)
-    CREATE TABLE IF NOT EXISTS settings (
-      key TEXT PRIMARY KEY,
-      value TEXT
-    );
-
-    -- Indexes for performance at scale
-    CREATE INDEX IF NOT EXISTS idx_tickers_watchlist ON tickers(watchlist_id);
-    CREATE INDEX IF NOT EXISTS idx_tickers_ticker ON tickers(ticker);
-    CREATE INDEX IF NOT EXISTS idx_filings_ticker ON filings(ticker);
-    CREATE INDEX IF NOT EXISTS idx_filings_status ON filings(status);
-    CREATE INDEX IF NOT EXISTS idx_filings_date ON filings(filing_date);
-    CREATE INDEX IF NOT EXISTS idx_filings_type ON filings(filing_type);
-    CREATE INDEX IF NOT EXISTS idx_filings_ticker_status ON filings(ticker, status);
-    CREATE INDEX IF NOT EXISTS idx_filings_user ON filings(user_id);
-    CREATE INDEX IF NOT EXISTS idx_watchlists_user ON watchlists(user_id);
-  `);
+  const { applied } = await runMigrations(pool);
+  if (applied.length === 0) {
+    console.log("[migrations] Schema already up to date.");
+  }
 }
 
 export class DatabaseStorage {

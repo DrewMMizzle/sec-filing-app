@@ -21,8 +21,8 @@ from src.edgar.rate_limiter import sec_get
 from src.storage.db import (
     async_session,
     create_filing,
+    get_known_accessions,
     get_latest_filing_date,
-    filing_exists,
 )
 
 logger = logging.getLogger(__name__)
@@ -104,32 +104,34 @@ async def poll_cik(
     watched = set(filing_types)
     filings = _parse_recent_filings(data, watched)
 
+    # One session per CIK: prefetch what we already have, batch every new
+    # filing into a single transaction, then commit on context exit. Replaces
+    # the previous 2N+1 separate sessions per CIK with exactly one session and
+    # two read queries up front.
+    enqueue_after_commit: list[tuple[str, str]] = []  # (filing_type, accession)
     async with async_session() as session:
         latest_date = await get_latest_filing_date(session, cik)
+        known = await get_known_accessions(session, cik)
 
-    new_count = 0
-    for f in filings:
-        filing_date_str = f["filing_date"]
-        if filing_date_str:
-            filing_date = date.fromisoformat(filing_date_str)
-        else:
-            filing_date = None
+        for f in filings:
+            filing_date_str = f["filing_date"]
+            filing_date = (
+                date.fromisoformat(filing_date_str) if filing_date_str else None
+            )
 
-        # Skip filings we already know about.
-        if latest_date and filing_date and filing_date <= latest_date:
-            continue
-
-        accession = f["accession_number_dashed"]
-        async with async_session() as session:
-            if await filing_exists(session, accession):
+            # Skip filings older than the most recent one we have for this CIK.
+            if latest_date and filing_date and filing_date <= latest_date:
                 continue
 
-        primary_doc_url = _build_primary_doc_url(
-            cik, accession, f["primary_doc"]
-        ) if f["primary_doc"] else None
+            accession = f["accession_number_dashed"]
+            if accession in known:
+                continue
 
-        # Persist the new filing record.
-        async with async_session() as session:
+            primary_doc_url = (
+                _build_primary_doc_url(cik, accession, f["primary_doc"])
+                if f["primary_doc"]
+                else None
+            )
             await create_filing(
                 session,
                 cik=cik,
@@ -140,8 +142,12 @@ async def poll_cik(
                 filed_at=datetime.now(timezone.utc),
                 primary_doc_url=primary_doc_url,
             )
+            enqueue_after_commit.append((f["filing_type"], accession))
+        # The async_session context manager commits on successful exit.
 
-        # Enqueue a render job.
+    # Enqueue render jobs after the DB transaction commits so workers never see
+    # a row that isn't actually persisted yet.
+    for filing_type, accession in enqueue_after_commit:
         queue.enqueue(
             "src.queue.worker.process_filing",
             accession,
@@ -150,11 +156,11 @@ async def poll_cik(
         logger.info(
             "Enqueued render job for %s %s (%s)",
             ticker,
-            f["filing_type"],
+            filing_type,
             accession,
         )
-        new_count += 1
 
+    new_count = len(enqueue_after_commit)
     logger.info("CIK %s (%s): %d new filing(s)", cik, ticker, new_count)
     return new_count
 
