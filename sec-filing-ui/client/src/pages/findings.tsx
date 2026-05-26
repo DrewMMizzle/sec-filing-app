@@ -40,7 +40,9 @@ import {
   X,
   PauseCircle,
   Copy,
+  MessageSquare,
 } from "lucide-react";
+import { FilingChatDialog } from "@/components/filing-chat-dialog";
 import type { Filing, FindingAction } from "@shared/schema";
 import { CATEGORY_LABELS, parseFindings, interestColor, estimateReviewCost, formatCostRange, type ReviewFinding } from "@/lib/findings";
 
@@ -239,6 +241,12 @@ export default function Findings() {
   const [sortBy, setSortBy] = useState<string>("date");
   const [groupByTicker, setGroupByTicker] = useState(false);
   const [confirmReview, setConfirmReview] = useState(false);
+  const [askFiling, setAskFiling] = useState<{
+    accession: string;
+    ticker: string;
+    form: string;
+    date: string | null;
+  } | null>(null);
   const [showHowTo, setShowHowTo] = useState(() => {
     try {
       return localStorage.getItem("howItWorksDismissed") !== "1";
@@ -455,6 +463,27 @@ export default function Findings() {
                   </Button>
                 </TooltipTrigger>
                 <TooltipContent>Copy (for Word / Outlook)</TooltipContent>
+              </Tooltip>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-7 w-7 text-muted-foreground"
+                    onClick={() =>
+                      setAskFiling({
+                        accession: filing.accessionNumber,
+                        ticker: filing.ticker,
+                        form: filing.filingType,
+                        date: filing.filingDate,
+                      })
+                    }
+                    data-testid={`action-ask-filing-${r.key}`}
+                  >
+                    <MessageSquare className="w-3.5 h-3.5" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Ask this filing (full text)</TooltipContent>
               </Tooltip>
             </div>
             {filing.pdfPath && (
@@ -768,6 +797,17 @@ export default function Findings() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      {askFiling && (
+        <FilingChatDialog
+          open={!!askFiling}
+          onOpenChange={(o) => !o && setAskFiling(null)}
+          accession={askFiling.accession}
+          ticker={askFiling.ticker}
+          form={askFiling.form}
+          date={askFiling.date}
+        />
+      )}
     </div>
   );
 }
