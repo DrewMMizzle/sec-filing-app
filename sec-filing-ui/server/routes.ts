@@ -644,18 +644,23 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
       dir: q.dir === "asc" ? "asc" : "desc",
       limit,
       offset,
+      slim: q.slim === "true" || q.slim === "1",
     });
     res.json({ items: result.items, total: result.total, limit, offset });
   });
 
   app.get("/api/filings", requireAuth, async (req, res) => {
-    const { ticker, filingType, dateFrom, dateTo, status } = req.query as Record<string, string | undefined>;
+    const { ticker, filingType, dateFrom, dateTo, status, slim } = req.query as Record<
+      string,
+      string | undefined
+    >;
     const results = await storage.getFilings({
       ticker,
       filingType,
       dateFrom,
       dateTo,
       status,
+      slim: slim === "true" || slim === "1",
     });
     res.json(results);
   });

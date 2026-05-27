@@ -78,6 +78,7 @@ STRIP_XBRL_JS = """
 # Singleton browser management.
 _browser: Browser | None = None
 _playwright_instance = None
+_context: BrowserContext | None = None
 
 
 async def _get_browser() -> Browser:
@@ -88,6 +89,27 @@ async def _get_browser() -> Browser:
         _browser = await _playwright_instance.chromium.launch(headless=True)
         logger.info("Launched headless Chromium browser")
     return _browser
+
+
+async def _get_context() -> BrowserContext:
+    """Return a singleton BrowserContext shared across renders.
+
+    Each render still uses a fresh page (so pages stay isolated), but we no
+    longer create+close a whole context per filing — that's a few ms each
+    that adds up over hundreds of renders. The retry path in fetch_filings.py
+    calls ``close_browser()`` between failed attempts, which also clears the
+    cached context so a wedged/crashed Chromium gets a clean slate.
+    """
+    global _context
+    if _context is None:
+        settings = get_settings()
+        browser = await _get_browser()
+        _context = await browser.new_context(
+            java_script_enabled=True,
+            bypass_csp=True,
+            user_agent=settings.sec_user_agent,
+        )
+    return _context
 
 
 async def render_html_to_pdf(
@@ -107,17 +129,9 @@ async def render_html_to_pdf(
     Returns:
         PDF content as bytes.
     """
-    settings = get_settings()
-    browser = await _get_browser()
-    context: BrowserContext = await browser.new_context(
-        java_script_enabled=True,
-        bypass_csp=True,
-        user_agent=settings.sec_user_agent,
-    )
-
+    context = await _get_context()
+    page = await context.new_page()
     try:
-        page = await context.new_page()
-
         # Emulate print media for proper styling.
         await page.emulate_media(media="print")
 
@@ -130,7 +144,7 @@ async def render_html_to_pdf(
         return pdf_bytes
 
     finally:
-        await context.close()
+        await page.close()
 
 
 async def render_url_to_pdf(
@@ -157,16 +171,9 @@ async def render_url_to_pdf(
     Returns:
         PDF content as bytes.
     """
-    settings = get_settings()
-    browser = await _get_browser()
-    context: BrowserContext = await browser.new_context(
-        java_script_enabled=True,
-        bypass_csp=True,
-        user_agent=settings.sec_user_agent,
-    )
-
+    context = await _get_context()
+    page = await context.new_page()
     try:
-        page = await context.new_page()
         await page.emulate_media(media="print")
 
         logger.info("Navigating to %s", url)
@@ -181,12 +188,18 @@ async def render_url_to_pdf(
         return pdf_bytes
 
     finally:
-        await context.close()
+        await page.close()
 
 
 async def close_browser() -> None:
     """Shut down the singleton browser cleanly."""
-    global _browser, _playwright_instance
+    global _browser, _playwright_instance, _context
+    if _context is not None:
+        try:
+            await _context.close()
+        except Exception:
+            pass
+        _context = None
     if _browser is not None:
         await _browser.close()
         _browser = None
