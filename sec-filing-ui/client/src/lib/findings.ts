@@ -25,6 +25,16 @@ export function parseFindings(f: Filing): ReviewFinding[] {
   }
 }
 
+// Count findings without parsing the heavy JSON. Slim-mode list endpoints set
+// findingsCount alongside a nulled reviewFindings so polled views can render
+// "N findings" badges without pulling the full payload; full-mode endpoints
+// fall back to parsing reviewFindings.
+export function findingsCount(f: Filing): number {
+  const slim = (f as Filing & { findingsCount?: number }).findingsCount;
+  if (typeof slim === "number") return slim;
+  return parseFindings(f).length;
+}
+
 export function interestColor(level: string | null | undefined): string {
   if (level === "high") return "text-red-400";
   if (level === "medium") return "text-amber-400";

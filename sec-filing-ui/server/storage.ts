@@ -39,14 +39,27 @@ const pool = new Pool({
 
 export const db = drizzle(pool);
 
-// Slim-mode helper: null out the heavy review-text fields before returning a
-// list so the client doesn't get megabytes of findings JSON it isn't going to
-// render. Detail endpoints fetch the full row.
+// Slim-mode helper: null out the heavy reviewFindings JSON blob (often hundreds
+// of KB per filing) before returning a list, so polled views don't ship MB of
+// JSON the consumer isn't going to render. Short text fields (reviewSummary,
+// reviewError) stay so the list can still show status messages without an
+// extra round-trip. We attach a findingsCount integer so the UI can still show
+// "N findings" without needing to parse the full array. Detail endpoints fetch
+// the full row.
 function stripHeavyReviewFields(rows: Filing[]): void {
   for (const r of rows) {
+    const extras = r as Filing & { findingsCount?: number };
+    let count = 0;
+    if (r.reviewFindings) {
+      try {
+        const parsed = JSON.parse(r.reviewFindings);
+        if (Array.isArray(parsed)) count = parsed.length;
+      } catch {
+        // Leave count at 0 on parse failure.
+      }
+    }
+    extras.findingsCount = count;
     r.reviewFindings = null;
-    r.reviewSummary = null;
-    r.reviewError = null;
   }
 }
 

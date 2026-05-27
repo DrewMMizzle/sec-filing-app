@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link } from "wouter";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { API_BASE, apiRequest, queryClient } from "@/lib/queryClient";
@@ -153,23 +153,41 @@ async function copyRich(html: string, text: string): Promise<void> {
 const interestRank = (l?: string | null) => (l === "high" ? 3 : l === "medium" ? 2 : l === "low" ? 1 : 0);
 
 export default function Findings() {
-  const { data: filings = [] } = useQuery<Filing[]>({
-    queryKey: ["/api/filings"],
+  // Slim list — cheap to poll. Drives progress detection + reviewing banner;
+  // also bumps the full query below when a new "done" review lands so newly
+  // written findings appear without polling the megabyte-sized full payload
+  // every few seconds.
+  const { data: slimFilings = [] } = useQuery<Filing[]>({
+    queryKey: ["/api/filings?slim=true"],
     refetchInterval: (query) => {
       const rows = query.state.data as Filing[] | undefined;
       const reviewing = rows?.some(
         (f) => f.reviewStatus === "pending" || f.reviewStatus === "reviewing",
       );
-      // While reviews are in flight, poll fast. When the spend cap has paused
-      // the queue, keep polling slowly: the cap is team-wide, so another
-      // session raising it should still let this page recover on its own.
       const isPaused =
         (queryClient.getQueryData(["/api/review/usage"]) as { paused?: boolean } | undefined)?.paused ?? false;
       return reviewing ? (isPaused ? 30000 : 4000) : false;
     },
   });
 
-  const reviewing = filings.some(
+  // Full payload (with reviewFindings JSON) for actually rendering the
+  // findings list. Not polled — the slim query above invalidates this one
+  // when a new review completes.
+  const { data: filings = [] } = useQuery<Filing[]>({
+    queryKey: ["/api/filings"],
+    refetchInterval: false,
+  });
+
+  const doneCount = slimFilings.filter((f) => f.reviewStatus === "done").length;
+  const lastDoneCount = useRef(doneCount);
+  useEffect(() => {
+    if (doneCount !== lastDoneCount.current) {
+      lastDoneCount.current = doneCount;
+      queryClient.invalidateQueries({ queryKey: ["/api/filings"], exact: true });
+    }
+  }, [doneCount]);
+
+  const reviewing = slimFilings.some(
     (f) => f.reviewStatus === "pending" || f.reviewStatus === "reviewing",
   );
 
@@ -221,6 +239,7 @@ export default function Findings() {
       return res.json();
     },
     onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ["/api/filings?slim=true"] });
       queryClient.invalidateQueries({ queryKey: ["/api/filings"] });
       toast({
         title:
