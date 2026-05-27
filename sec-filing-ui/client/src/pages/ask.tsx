@@ -1,13 +1,25 @@
 import { useEffect, useRef, useState } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
-import { apiRequest } from "@/lib/queryClient";
+import { API_BASE, apiRequest } from "@/lib/queryClient";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { useToast } from "@/hooks/use-toast";
 import { MessageSquare, Send, Loader2, Sparkles, User, AlertCircle } from "lucide-react";
 
-type Turn = { role: "user" | "assistant"; content: string };
+type Turn = {
+  role: "user" | "assistant";
+  content: string;
+  // Citations attached to assistant turns so [TICKER FORM DATE] strings can be
+  // rendered as clickable links to the underlying PDF.
+  citations?: Citation[];
+};
+type Citation = {
+  ticker: string;
+  form: string;
+  date: string | null;
+  accession: string;
+};
 type ChatResponse = {
   answer: string;
   usage: {
@@ -21,6 +33,7 @@ type ChatResponse = {
   corpusFilingsCount: number;
   truncated: boolean;
   scopedTickers?: string[];
+  citations?: Citation[];
 };
 
 const SUGGESTIONS = [
@@ -31,25 +44,73 @@ const SUGGESTIONS = [
   "Which companies had unusually high say-on-pay opposition?",
 ];
 
-// Render assistant text: split on blank lines into paragraphs, preserve newlines
-// inside a paragraph, and turn the [TICKER form date] citations into a faint
-// inline badge so they read like citations rather than body text.
-function renderAnswer(text: string) {
+// Citation parser. Citations look like "TICKER FORM DATE" where FORM can be
+// multi-word ("DEF 14A"), so we capture ticker, then whatever's between
+// ticker and a YYYY-MM-DD date.
+const CITATION_RE = /^(\S+)\s+(.+?)\s+(\d{4}-\d{2}-\d{2})$/;
+
+function buildCitationMap(citations: Citation[]): Map<string, Citation> {
+  const m = new Map<string, Citation>();
+  for (const c of citations) m.set(`${c.ticker}|${c.form}|${c.date ?? ""}`, c);
+  return m;
+}
+
+const badgeClass =
+  "inline-block text-[11px] px-1.5 py-0.5 mx-0.5 rounded bg-primary/10 text-primary font-mono";
+const badgeLinkClass = badgeClass + " hover:bg-primary/20 hover:underline cursor-pointer";
+
+function renderCitation(raw: string, idx: number, citationMap: Map<string, Citation>) {
+  const trimmed = raw.trim();
+  const m = trimmed.match(CITATION_RE);
+  if (m) {
+    const [, ticker, form, date] = m;
+    const hit = citationMap.get(`${ticker}|${form}|${date}`);
+    if (hit) {
+      return (
+        <a
+          key={idx}
+          href={`${API_BASE}/api/filings/${encodeURIComponent(hit.accession)}/pdf?inline=1`}
+          target="_blank"
+          rel="noreferrer"
+          className={badgeLinkClass}
+          title="Open this filing's PDF in a new tab"
+          data-testid={`citation-link-${hit.accession}`}
+        >
+          {trimmed}
+        </a>
+      );
+    }
+  }
+  return (
+    <span key={idx} className={badgeClass}>
+      {trimmed}
+    </span>
+  );
+}
+
+// Render assistant text: split on blank lines into paragraphs, preserve
+// newlines inside a paragraph, and turn the [TICKER FORM DATE] citations (and
+// semicolon-separated lists of them) into clickable badges when we can match
+// them back to a filing in this turn's citation map.
+function renderAnswer(text: string, citationMap: Map<string, Citation>) {
   const paragraphs = text.split(/\n{2,}/);
   return paragraphs.map((para, i) => (
     <p key={i} className="whitespace-pre-wrap leading-relaxed mb-3 last:mb-0">
-      {para.split(/(\[[^\]]+\])/g).map((chunk, j) =>
-        /^\[[^\]]+\]$/.test(chunk) ? (
-          <span
-            key={j}
-            className="inline-block text-[11px] px-1.5 py-0.5 mx-0.5 rounded bg-primary/10 text-primary font-mono"
-          >
-            {chunk.slice(1, -1)}
+      {para.split(/(\[[^\]]+\])/g).map((chunk, j) => {
+        if (!/^\[[^\]]+\]$/.test(chunk)) return <span key={j}>{chunk}</span>;
+        const inner = chunk.slice(1, -1);
+        const parts = inner.split(/\s*;\s*/);
+        return (
+          <span key={j}>
+            {parts.map((p, k) => (
+              <span key={k}>
+                {k > 0 && <span className="text-muted-foreground"> · </span>}
+                {renderCitation(p, k, citationMap)}
+              </span>
+            ))}
           </span>
-        ) : (
-          <span key={j}>{chunk}</span>
-        ),
-      )}
+        );
+      })}
     </p>
   ));
 }
@@ -76,7 +137,10 @@ export default function Ask() {
       return res.json();
     },
     onSuccess: (data, messages) => {
-      setTurns([...messages, { role: "assistant", content: data.answer }]);
+      setTurns([
+        ...messages,
+        { role: "assistant", content: data.answer, citations: data.citations ?? [] },
+      ]);
       setLastMeta(data);
     },
     onError: (err) => {
@@ -179,7 +243,9 @@ export default function Ask() {
               {t.role === "user" ? (
                 <p className="text-sm font-medium whitespace-pre-wrap leading-relaxed">{t.content}</p>
               ) : (
-                <div className="text-sm">{renderAnswer(t.content)}</div>
+                <div className="text-sm">
+                  {renderAnswer(t.content, buildCitationMap(t.citations ?? []))}
+                </div>
               )}
             </div>
           </div>

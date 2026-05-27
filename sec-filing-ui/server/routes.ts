@@ -898,6 +898,7 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
         corpusFilingsCount: result.corpusFilingsCount,
         truncated: result.truncated,
         scopedTickers: result.scopedTickers,
+        citations: result.citations,
       });
     } catch (e: any) {
       console.error("Findings chat failed:", e?.message || e);
@@ -1024,7 +1025,14 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     }
 
     const filename = `${filing.ticker}_${filing.filingType.replace(/ /g, "_")}_${filing.filingDate || filing.accessionNumber}.pdf`;
-    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    // `?inline=1` tells the browser to display the PDF in-place (used by chat
+    // citation links that open in a new tab). Default stays `attachment` so
+    // the PDF Library's Download button still triggers a save.
+    const inline = req.query.inline === "1" || req.query.inline === "true";
+    res.setHeader(
+      "Content-Disposition",
+      `${inline ? "inline" : "attachment"}; filename="${filename}"`,
+    );
     res.setHeader("Content-Type", "application/pdf");
     res.sendFile(fullPath);
   });
