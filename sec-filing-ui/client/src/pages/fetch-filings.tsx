@@ -87,9 +87,10 @@ type FetchResult = {
 export default function FetchFilings() {
   const { toast } = useToast();
 
-  // Date range state (kept as YYYY-MM-DD strings for the API + filtering)
-  const [dateFrom, setDateFrom] = useState("");
-  const [dateTo, setDateTo] = useState("");
+  // Default the range to 2026 YTD so the common "what's been filed this year?"
+  // case is one click away.
+  const [dateFrom, setDateFrom] = useState("2026-01-01");
+  const [dateTo, setDateTo] = useState(() => toYmd(new Date()));
 
   const dateRange: DateRange | undefined =
     dateFrom || dateTo ? { from: parseYmd(dateFrom), to: parseYmd(dateTo) } : undefined;
