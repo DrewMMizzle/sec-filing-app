@@ -48,6 +48,8 @@ const SUGGESTIONS = [
 // multi-word ("DEF 14A"), so we capture ticker, then whatever's between
 // ticker and a YYYY-MM-DD date.
 const CITATION_RE = /^(\S+)\s+(.+?)\s+(\d{4}-\d{2}-\d{2})$/;
+// Match a quoted passage (straight or curly quotes, 10–500 chars).
+const QUOTE_RE = /["“]([^"”]{10,500})["”]/g;
 
 function buildCitationMap(citations: Citation[]): Map<string, Citation> {
   const m = new Map<string, Citation>();
@@ -55,11 +57,35 @@ function buildCitationMap(citations: Citation[]): Map<string, Citation> {
   return m;
 }
 
+// Return the last quoted passage found in this prose chunk, if any. We track
+// this as we walk a paragraph so each citation can deep-link into the PDF at
+// the page of the most recently quoted text.
+function lastQuoteIn(text: string): string | null {
+  let last: RegExpExecArray | null = null;
+  let m: RegExpExecArray | null;
+  while ((m = QUOTE_RE.exec(text)) !== null) last = m;
+  return last ? last[1] : null;
+}
+
 const badgeClass =
   "inline-block text-[11px] px-1.5 py-0.5 mx-0.5 rounded bg-primary/10 text-primary font-mono";
 const badgeLinkClass = badgeClass + " hover:bg-primary/20 hover:underline cursor-pointer";
 
-function renderCitation(raw: string, idx: number, citationMap: Map<string, Citation>) {
+function citationHref(accession: string, quote: string | null): string {
+  // Use the /view endpoint when we have a quote so the server can find the
+  // page; otherwise just open the PDF inline at page 1.
+  if (quote) {
+    return `${API_BASE}/api/filings/${encodeURIComponent(accession)}/view?q=${encodeURIComponent(quote)}`;
+  }
+  return `${API_BASE}/api/filings/${encodeURIComponent(accession)}/pdf?inline=1`;
+}
+
+function renderCitation(
+  raw: string,
+  idx: number,
+  citationMap: Map<string, Citation>,
+  quote: string | null,
+) {
   const trimmed = raw.trim();
   const m = trimmed.match(CITATION_RE);
   if (m) {
@@ -69,11 +95,11 @@ function renderCitation(raw: string, idx: number, citationMap: Map<string, Citat
       return (
         <a
           key={idx}
-          href={`${API_BASE}/api/filings/${encodeURIComponent(hit.accession)}/pdf?inline=1`}
+          href={citationHref(hit.accession, quote)}
           target="_blank"
           rel="noreferrer"
           className={badgeLinkClass}
-          title="Open this filing's PDF in a new tab"
+          title={quote ? `Jump to "${quote.slice(0, 80)}${quote.length > 80 ? "…" : ""}" in this filing` : "Open this filing's PDF in a new tab"}
           data-testid={`citation-link-${hit.accession}`}
         >
           {trimmed}
@@ -88,31 +114,40 @@ function renderCitation(raw: string, idx: number, citationMap: Map<string, Citat
   );
 }
 
-// Render assistant text: split on blank lines into paragraphs, preserve
-// newlines inside a paragraph, and turn the [TICKER FORM DATE] citations (and
-// semicolon-separated lists of them) into clickable badges when we can match
-// them back to a filing in this turn's citation map.
+// Render assistant text. Per paragraph, walk left-to-right tracking the most
+// recently quoted passage so each citation deep-links into the PDF at the
+// page of that quote (via /view?q=...). Semicolon-separated multi-cites get
+// split into individual badges.
 function renderAnswer(text: string, citationMap: Map<string, Citation>) {
   const paragraphs = text.split(/\n{2,}/);
-  return paragraphs.map((para, i) => (
-    <p key={i} className="whitespace-pre-wrap leading-relaxed mb-3 last:mb-0">
-      {para.split(/(\[[^\]]+\])/g).map((chunk, j) => {
-        if (!/^\[[^\]]+\]$/.test(chunk)) return <span key={j}>{chunk}</span>;
-        const inner = chunk.slice(1, -1);
-        const parts = inner.split(/\s*;\s*/);
-        return (
-          <span key={j}>
-            {parts.map((p, k) => (
-              <span key={k}>
-                {k > 0 && <span className="text-muted-foreground"> · </span>}
-                {renderCitation(p, k, citationMap)}
-              </span>
-            ))}
-          </span>
-        );
-      })}
-    </p>
-  ));
+  return paragraphs.map((para, i) => {
+    const chunks = para.split(/(\[[^\]]+\])/g);
+    let runningQuote: string | null = null;
+    return (
+      <p key={i} className="whitespace-pre-wrap leading-relaxed mb-3 last:mb-0">
+        {chunks.map((chunk, j) => {
+          if (!/^\[[^\]]+\]$/.test(chunk)) {
+            const q = lastQuoteIn(chunk);
+            if (q) runningQuote = q;
+            return <span key={j}>{chunk}</span>;
+          }
+          const inner = chunk.slice(1, -1);
+          const parts = inner.split(/\s*;\s*/);
+          const quoteForThis = runningQuote;
+          return (
+            <span key={j}>
+              {parts.map((p, k) => (
+                <span key={k}>
+                  {k > 0 && <span className="text-muted-foreground"> · </span>}
+                  {renderCitation(p, k, citationMap, quoteForThis)}
+                </span>
+              ))}
+            </span>
+          );
+        })}
+      </p>
+    );
+  });
 }
 
 export default function Ask() {
