@@ -10,6 +10,7 @@ import { hashPassword, verifyPassword, createSession, clearSession, requireAuth 
 import { ensureSP500Seeded } from "./seed-sp500";
 import { isReviewEnabled, kickReviewProcessor, reviewCostUsd } from "./review";
 import { chatAboutFindings, chatAboutFiling } from "./chat";
+import { findPageForQuote } from "./pdf-locate";
 import { compareFilings, SECTION_LABELS, type SectionKey } from "./compare";
 import { db } from "./storage";
 import { tickers as tickersTable, filings as filingsTable } from "@shared/schema";
@@ -1009,6 +1010,36 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
   });
 
   // Download a PDF by accession number
+  // Citation deep-link: look up which page of the PDF contains the cited
+  // quote, then redirect to the inline PDF with `#page=N` so the browser's
+  // native PDF viewer jumps to that page. Falls back to page 1 if the quote
+  // can't be located (e.g. it spans pages or the wording was paraphrased).
+  app.get("/api/filings/:accession/view", requireAuth, async (req, res) => {
+    const filing = await storage.getFilingByAccession(req.params.accession as string);
+    if (!filing || !filing.pdfPath) {
+      return res.status(404).json({ error: "PDF not found" });
+    }
+    const appPath = path.resolve(PDF_STORAGE_DIR, "..", filing.pdfPath);
+    const pipelinePath = path.join(PIPELINE_ROOT, filing.pdfPath);
+    const fullPath = fs.existsSync(appPath) ? appPath : fs.existsSync(pipelinePath) ? pipelinePath : null;
+    if (!fullPath) {
+      return res.status(404).json({ error: "PDF file missing from disk" });
+    }
+    const quote = typeof req.query.q === "string" ? req.query.q : "";
+    let page: number | null = null;
+    if (quote.trim()) {
+      try {
+        page = await findPageForQuote(fullPath, quote);
+      } catch (err) {
+        console.error("[view] page lookup failed:", err);
+      }
+    }
+    const target =
+      `/api/filings/${encodeURIComponent(req.params.accession as string)}/pdf?inline=1` +
+      `#page=${page ?? 1}`;
+    res.redirect(302, target);
+  });
+
   app.get("/api/filings/:accession/pdf", requireAuth, async (req, res) => {
     const filing = await storage.getFilingByAccession(req.params.accession as string);
     if (!filing || !filing.pdfPath) {
