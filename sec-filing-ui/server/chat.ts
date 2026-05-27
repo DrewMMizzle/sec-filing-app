@@ -124,6 +124,13 @@ Answer questions based ONLY on the filing text below. Quote concrete language an
 
 type Turn = { role: "user" | "assistant"; content: string };
 
+export type Citation = {
+  ticker: string;
+  form: string;
+  date: string | null;
+  accession: string;
+};
+
 export type ChatResult = {
   answer: string;
   usage: {
@@ -138,6 +145,9 @@ export type ChatResult = {
   // Tickers the question was auto-scoped to (empty when the question was
   // general and the full corpus was sent).
   scopedTickers: string[];
+  // Filings included in the corpus this turn — the client uses this to turn
+  // [TICKER FORM DATE] citations in the answer into clickable links.
+  citations: Citation[];
 };
 
 export type FilingChatResult = ChatResult & {
@@ -171,10 +181,12 @@ async function buildFindingsCorpus(scopedTickers?: Set<string>): Promise<{
   findingsCount: number;
   filingsCount: number;
   truncated: boolean;
+  citations: Citation[];
 }> {
   // Already sorted by filingDate desc.
   const filings: Filing[] = await storage.getFilings({ status: "complete" });
   const blocks: string[] = [];
+  const citations: Citation[] = [];
   let totalLen = 0;
   let truncated = false;
   let findingsCount = 0;
@@ -205,11 +217,17 @@ async function buildFindingsCorpus(scopedTickers?: Set<string>): Promise<{
       break;
     }
     blocks.push(filingBlock);
+    citations.push({
+      ticker: f.ticker,
+      form: f.filingType,
+      date: f.filingDate,
+      accession: f.accessionNumber,
+    });
     totalLen += filingBlock.length;
     findingsCount += findings.length;
     filingsCount += 1;
   }
-  return { text: blocks.join("\n\n"), findingsCount, filingsCount, truncated };
+  return { text: blocks.join("\n\n"), findingsCount, filingsCount, truncated, citations };
 }
 
 export async function chatAboutFindings(history: Turn[]): Promise<ChatResult> {
@@ -289,6 +307,7 @@ export async function chatAboutFindings(history: Turn[]): Promise<ChatResult> {
       corpusFilingsCount: corpus.filingsCount,
       truncated: corpus.truncated,
       scopedTickers: Array.from(scope).sort(),
+      citations: corpus.citations,
     };
   } catch (err: any) {
     if (controller.signal.aborted) {
@@ -366,6 +385,14 @@ export async function chatAboutFiling(
       corpusFilingsCount: 1,
       truncated,
       scopedTickers: [filing.ticker],
+      citations: [
+        {
+          ticker: filing.ticker,
+          form: filing.filingType,
+          date: filing.filingDate,
+          accession: filing.accessionNumber,
+        },
+      ],
       ticker: filing.ticker,
       form: filing.filingType,
       date: filing.filingDate,
