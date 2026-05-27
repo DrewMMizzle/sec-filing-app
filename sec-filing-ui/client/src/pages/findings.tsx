@@ -317,14 +317,23 @@ export default function Findings() {
     return true;
   });
 
-  const byDateDesc = (a: Row, b: Row) => (b.filing.filingDate || "").localeCompare(a.filing.filingDate || "");
+  // "Newest" on the findings panel = most recently reviewed (not SEC filing
+  // date), so a filing you reviewed minutes ago shows up first even if it was
+  // filed years before something already in the library. Tiebreak on filingDate
+  // so reviews finished in the same batch stay in filing-date order.
+  const reviewedKey = (r: Row) => r.filing.reviewedAt || "";
+  const filedKey = (r: Row) => r.filing.filingDate || "";
+  const byReviewedDesc = (a: Row, b: Row) =>
+    reviewedKey(b).localeCompare(reviewedKey(a)) || filedKey(b).localeCompare(filedKey(a));
+  const byReviewedAsc = (a: Row, b: Row) =>
+    reviewedKey(a).localeCompare(reviewedKey(b)) || filedKey(a).localeCompare(filedKey(b));
   const rows = [...filtered].sort((a, b) => {
     if (sortBy === "ticker")
-      return a.filing.ticker.localeCompare(b.filing.ticker) || byDateDesc(a, b);
+      return a.filing.ticker.localeCompare(b.filing.ticker) || byReviewedDesc(a, b);
     if (sortBy === "interest")
-      return interestRank(b.filing.reviewMateriality) - interestRank(a.filing.reviewMateriality) || byDateDesc(a, b);
-    if (sortBy === "oldest") return (a.filing.filingDate || "").localeCompare(b.filing.filingDate || "");
-    return byDateDesc(a, b);
+      return interestRank(b.filing.reviewMateriality) - interestRank(a.filing.reviewMateriality) || byReviewedDesc(a, b);
+    if (sortBy === "oldest") return byReviewedAsc(a, b);
+    return byReviewedDesc(a, b);
   });
 
   // Group rows by ticker, ordered by finding count (most first)
@@ -712,8 +721,8 @@ export default function Findings() {
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="date">Newest first</SelectItem>
-              <SelectItem value="oldest">Oldest first</SelectItem>
+              <SelectItem value="date">Recently reviewed</SelectItem>
+              <SelectItem value="oldest">Oldest reviewed</SelectItem>
               <SelectItem value="ticker">Ticker A–Z</SelectItem>
               <SelectItem value="interest">Interest</SelectItem>
             </SelectContent>

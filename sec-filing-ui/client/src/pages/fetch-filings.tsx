@@ -470,6 +470,9 @@ export default function FetchFilings() {
         });
       }
       if (resolved.length === 0) return;
+      // Scope the filings list + summary card to just what was quick-fetched
+      // so the user sees their run's progress, not the whole library state.
+      setSelectedTickers(new Set(resolved.map((r) => r.ticker)));
       setQuickInput("");
       submitFetch(
         resolved.map((r) => ({
@@ -567,6 +570,27 @@ export default function FetchFilings() {
   const outstandingTickerCount = tickerProgress.filter(
     (t) => t.inFlight > 0 || t.errored > 0,
   ).length;
+
+  // Human-readable scope so the summary card never looks like a one-ticker
+  // quick-fetch reviewed the entire library. Reflects the same filters the
+  // counts are derived from (selected tickers + date range).
+  const selectedTickerList = Array.from(selectedTickers);
+  const scopeTickerLabel =
+    selectedTickerList.length === 0
+      ? "your library"
+      : selectedTickerList.length <= 3
+        ? selectedTickerList.join(", ")
+        : `${selectedTickerList.length} selected tickers`;
+  const scopeDateLabel =
+    dateFrom && dateTo
+      ? ` · ${dateFrom} → ${dateTo}`
+      : dateFrom
+        ? ` · from ${dateFrom}`
+        : dateTo
+          ? ` · through ${dateTo}`
+          : "";
+  const scopeLabel = `${scopeTickerLabel}${scopeDateLabel}`;
+  const filingsWord = (n: number) => `filing${n !== 1 ? "s" : ""}`;
 
   return (
     <div className="p-6 max-w-5xl mx-auto">
@@ -846,14 +870,20 @@ export default function FetchFilings() {
 
       {/* Results */}
       <div className="mb-4 flex items-center justify-between gap-3">
-        <h2 className="text-lg font-semibold">
-          Rendered PDFs
-          {completedFilings.length > 0 && (
-            <span className="ml-2 text-sm font-normal text-muted-foreground">
-              ({completedFilings.length} available)
-            </span>
-          )}
-        </h2>
+        <div>
+          <h2 className="text-lg font-semibold">
+            Rendered PDFs
+            {completedFilings.length > 0 && (
+              <span className="ml-2 text-sm font-normal text-muted-foreground">
+                ({completedFilings.length} in view)
+              </span>
+            )}
+          </h2>
+          <p className="text-xs text-muted-foreground">
+            Showing <span className="font-mono">{scopeTickerLabel}</span>
+            {scopeDateLabel}
+          </p>
+        </div>
         {completedFilings.length > 0 && (
           <Button
             variant="outline"
@@ -887,15 +917,25 @@ export default function FetchFilings() {
               ) : (
                 <ShieldCheck className="w-4 h-4 text-green-400 shrink-0" />
               )}
-              <p className="text-sm font-medium">
-                {paused
-                  ? `Review paused — ${usage?.budgetUsd != null ? `$${usage.budgetUsd.toFixed(2)} ` : ""}spend cap reached`
-                  : runActive
-                    ? renderingCount > 0
-                      ? "Fetching, rendering & reviewing…"
-                      : "Reviewing filings…"
-                    : "Last run complete"}
-              </p>
+              <div className="min-w-0">
+                <p className="text-sm font-medium">
+                  {paused
+                    ? `Review paused — ${usage?.budgetUsd != null ? `$${usage.budgetUsd.toFixed(2)} ` : ""}spend cap reached`
+                    : runActive
+                      ? renderingCount > 0
+                        ? "Fetching, rendering & reviewing…"
+                        : "Reviewing filings…"
+                      : "Last run complete"}
+                </p>
+                <p
+                  className="text-xs text-muted-foreground truncate"
+                  data-testid="text-review-scope"
+                  title={scopeLabel}
+                >
+                  Showing <span className="font-mono">{scopeTickerLabel}</span>
+                  {scopeDateLabel}
+                </p>
+              </div>
               {paused && (
                 <Button
                   size="sm"
@@ -940,7 +980,7 @@ export default function FetchFilings() {
             <div className="flex items-center justify-between text-xs text-muted-foreground mb-1">
               <span>
                 Reviewed <span className="text-foreground font-medium">{reviewedCount}</span> of{" "}
-                {reviewableTotal} rendered filing{reviewableTotal !== 1 ? "s" : ""}
+                {reviewableTotal} rendered {filingsWord(reviewableTotal)} in {scopeTickerLabel}
               </span>
               <span>{reviewProgressPct}%</span>
             </div>
@@ -986,8 +1026,8 @@ export default function FetchFilings() {
             <p className="text-xs text-muted-foreground">
               <ShieldAlert className="w-3.5 h-3.5 inline -mt-0.5 mr-1 text-amber-400" />
               <span className="text-foreground font-medium">{totalFindings}</span> finding
-              {totalFindings !== 1 ? "s" : ""} across {interestingCount} filing
-              {interestingCount !== 1 ? "s" : ""} ·{" "}
+              {totalFindings !== 1 ? "s" : ""} across {interestingCount} {filingsWord(interestingCount)} in{" "}
+              {scopeTickerLabel} ·{" "}
               <Link href="/" className="text-primary hover:underline">
                 View in Findings
               </Link>
