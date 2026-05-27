@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from "react";
+import { useState } from "react";
 import { Link } from "wouter";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { queryClient, apiRequest, API_BASE } from "@/lib/queryClient";
@@ -49,7 +49,7 @@ import type { DateRange } from "react-day-picker";
 import { useToast } from "@/hooks/use-toast";
 import { Search, Download, Loader2, FileText, Calendar as CalendarIcon, Check, X, AlertCircle, ShieldAlert, ShieldCheck, RefreshCw, Wallet, PauseCircle, ChevronDown, Eye, EyeOff } from "lucide-react";
 import type { Filing } from "@shared/schema";
-import { CATEGORY_LABELS, parseFindings, estimateReviewCost, formatCostRange } from "@/lib/findings";
+import { findingsCount, estimateReviewCost, formatCostRange } from "@/lib/findings";
 
 // SEC filing dates are plain calendar dates (YYYY-MM-DD); convert to/from local
 // Date objects so the calendar never shifts a day across timezones.
@@ -144,10 +144,11 @@ export default function FetchFilings() {
     queryKey: ["/api/review/usage"],
     refetchInterval: (query) => {
       const data = query.state.data as { paused?: boolean } | undefined;
+      if (fetchInFlight) return 5000;
       // Read filings from the cache to decide whether a run is in flight. Poll
       // through the render phase too so spend starts ticking as soon as the
       // first reviews run. Fast while active; slow (not stopped) while paused.
-      const rows = queryClient.getQueryData<Filing[]>(["/api/filings"]);
+      const rows = queryClient.getQueryData<Filing[]>(["/api/filings?slim=true"]);
       const rendering = rows?.some((f) => f.status === "rendering");
       const reviewing = rows?.some(
         (f) => f.reviewStatus === "pending" || f.reviewStatus === "reviewing",
@@ -183,24 +184,11 @@ export default function FetchFilings() {
       return next;
     });
 
-  // While a (long, synchronous) fetch request is in flight, poll the filings and
-  // spend queries so render/review progress and spend update live during the run
-  // rather than only after the request returns.
-  const fetchPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const startFetchPolling = () => {
-    if (fetchPollRef.current) return;
-    fetchPollRef.current = setInterval(() => {
-      queryClient.invalidateQueries({ queryKey: ["/api/filings"] });
-      queryClient.invalidateQueries({ queryKey: ["/api/review/usage"] });
-    }, 4000);
-  };
-  const stopFetchPolling = () => {
-    if (fetchPollRef.current) {
-      clearInterval(fetchPollRef.current);
-      fetchPollRef.current = null;
-    }
-  };
-  useEffect(() => () => stopFetchPolling(), []);
+  // A long-running fetch can briefly have no filings in "rendering" yet — the
+  // data-driven refetchInterval below would idle in that gap. This flag bridges
+  // it so polling keeps running while the request is in flight, without a
+  // second setInterval competing with React Query's own polling.
+  const [fetchInFlight, setFetchInFlight] = useState(false);
   const budgetMutation = useMutation<{ budgetUsd: number | null }, Error, number | null>({
     mutationFn: async (budgetUsd) => {
       const res = await apiRequest("POST", "/api/review/budget", { budgetUsd });
@@ -212,6 +200,7 @@ export default function FetchFilings() {
     },
     onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ["/api/review/usage"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/filings?slim=true"] });
       queryClient.invalidateQueries({ queryKey: ["/api/filings"] });
       setBudgetOpen(false);
       toast({
@@ -242,13 +231,17 @@ export default function FetchFilings() {
     budgetMutation.mutate(n);
   };
 
+  // Use the slim list (no heavy findings JSON) so the polled payload stays
+  // small. Inline finding details are fetched lazily per-row via a detail
+  // endpoint when the row is expanded.
   const { data: existingFilings = [], refetch: refetchFilings } = useQuery<Filing[]>({
-    queryKey: ["/api/filings"],
+    queryKey: ["/api/filings?slim=true"],
     // Poll while a run is active so render + review progress appear live. Track
     // the render phase too (not just reviews). When the spend cap pauses the
     // review queue, slow the poll instead of stopping so the page recovers on
     // its own if the team-wide cap is raised elsewhere.
     refetchInterval: (query) => {
+      if (fetchInFlight) return 4000;
       const rows = query.state.data as Filing[] | undefined;
       const rendering = rows?.some((f) => f.status === "rendering");
       const reviewing = rows?.some(
@@ -333,7 +326,11 @@ export default function FetchFilings() {
       return res.json();
     },
     onMutate: () => {
-      startFetchPolling();
+      setFetchInFlight(true);
+      // Kick the queries immediately so the user sees activity instead of
+      // waiting up to refetchInterval for the first progress update.
+      queryClient.invalidateQueries({ queryKey: ["/api/filings?slim=true"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/review/usage"] });
     },
     onSuccess: (data) => {
       const parts: string[] = [];
@@ -351,7 +348,7 @@ export default function FetchFilings() {
     },
     onSettled: () => {
       // Hand off to the queries' own progress-aware polling.
-      stopFetchPolling();
+      setFetchInFlight(false);
       refetchFilings();
       queryClient.invalidateQueries({ queryKey: ["/api/review/usage"] });
     },
@@ -524,7 +521,7 @@ export default function FetchFilings() {
   const reviewErrorCount = filteredFilings.filter((f) => f.reviewStatus === "error").length;
   const inFlightReviews = reviewingNowCount + queuedCount;
   const interestingCount = reviewedFilings.filter((f) => f.reviewFlagged).length;
-  const totalFindings = reviewedFilings.reduce((n, f) => n + parseFindings(f).length, 0);
+  const totalFindings = reviewedFilings.reduce((n, f) => n + findingsCount(f), 0);
 
   // Percent reflects successfully-reviewed filings only, so it matches the
   // "Reviewed X of Y" headline. Errors keep the bar below 100% until resolved.
@@ -1124,7 +1121,7 @@ export default function FetchFilings() {
                     </Badge>
                   )}
                   {f.reviewStatus === "done" && f.reviewFlagged && (() => {
-                    const n = parseFindings(f).length;
+                    const n = findingsCount(f);
                     const high = f.reviewMateriality === "high";
                     return (
                       <Badge
@@ -1183,23 +1180,15 @@ export default function FetchFilings() {
                     {f.reviewSummary}
                   </p>
                 )}
-                {f.reviewStatus === "done" && parseFindings(f).length > 0 && (
-                  <div className="mt-2 space-y-2" data-testid={`review-findings-${f.accessionNumber}`}>
-                    {parseFindings(f).map((finding, i) => (
-                      <div key={i} className="rounded-md border border-border/60 bg-muted/30 p-2.5">
-                        <div className="flex items-center gap-2 mb-0.5">
-                          <Badge variant="secondary" className="text-[10px] uppercase tracking-wide">
-                            {CATEGORY_LABELS[finding.category] || finding.category}
-                          </Badge>
-                          <span className="text-xs font-semibold">{finding.headline}</span>
-                        </div>
-                        <p className="text-xs text-muted-foreground">{finding.detail}</p>
-                        {finding.why && (
-                          <p className="text-xs text-muted-foreground/80 italic mt-0.5">{finding.why}</p>
-                        )}
-                      </div>
-                    ))}
-                  </div>
+                {f.reviewStatus === "done" && findingsCount(f) > 0 && (
+                  <p
+                    className="text-xs mt-1.5 text-muted-foreground"
+                    data-testid={`review-findings-link-${f.accessionNumber}`}
+                  >
+                    <Link href="/" className="text-primary hover:underline">
+                      View {findingsCount(f)} finding{findingsCount(f) !== 1 ? "s" : ""} in Findings →
+                    </Link>
+                  </p>
                 )}
               </div>
               {f.status === "complete" && f.pdfPath && (
