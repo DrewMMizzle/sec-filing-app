@@ -135,6 +135,9 @@ export default function PdfLibrary() {
       sp.set("dir", sortDir);
       sp.set("limit", String(PAGE_SIZE));
       sp.set("offset", String(page * PAGE_SIZE));
+      // The library only renders columns; it doesn't need the heavy review
+      // text fields, so ask for slim rows over the wire.
+      sp.set("slim", "true");
       const res = await fetch(`${API_BASE}/api/filings/page?${sp.toString()}`, {
         credentials: "same-origin",
       });

@@ -49,7 +49,13 @@ export const queryClient = new QueryClient({
       queryFn: getQueryFn({ on401: "throw" }),
       refetchInterval: false,
       refetchOnWindowFocus: false,
-      staleTime: Infinity,
+      // A short stale window instead of Infinity. The old default kept large
+      // filing/findings payloads resident forever and made every mutation rely
+      // on manual invalidation. 30s lets re-mounts pick up fresh data on their
+      // own; queries that genuinely need always-fresh polling still set their
+      // own refetchInterval.
+      staleTime: 30_000,
+      gcTime: 5 * 60_000,
       retry: false,
     },
     mutations: {

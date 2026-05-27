@@ -39,6 +39,17 @@ const pool = new Pool({
 
 export const db = drizzle(pool);
 
+// Slim-mode helper: null out the heavy review-text fields before returning a
+// list so the client doesn't get megabytes of findings JSON it isn't going to
+// render. Detail endpoints fetch the full row.
+function stripHeavyReviewFields(rows: Filing[]): void {
+  for (const r of rows) {
+    r.reviewFindings = null;
+    r.reviewSummary = null;
+    r.reviewError = null;
+  }
+}
+
 // Run versioned schema migrations on boot. The bulk of the DDL only runs the
 // first time (or on schema upgrades) — steady-state boot is a single SELECT
 // against schema_migrations.
@@ -206,7 +217,17 @@ export class DatabaseStorage {
   // ─── Filings (scoped by userId) ────────────────────────
 
   // Filings are a shared team corpus (no per-user filter).
-  async getFilings(filters?: { ticker?: string; filingType?: string; dateFrom?: string; dateTo?: string; status?: string }): Promise<Filing[]> {
+  // Pass `slim: true` to strip the heavy text fields (reviewFindings,
+  // reviewSummary, reviewError) from the response — list views don't need them,
+  // and they can dominate the payload size on filings with rich reviews.
+  async getFilings(filters?: {
+    ticker?: string;
+    filingType?: string;
+    dateFrom?: string;
+    dateTo?: string;
+    status?: string;
+    slim?: boolean;
+  }): Promise<Filing[]> {
     const conditions: any[] = [];
 
     if (filters?.ticker) conditions.push(eq(filings.ticker, filters.ticker));
@@ -217,13 +238,16 @@ export class DatabaseStorage {
 
     const query = db.select().from(filings);
     const rows = conditions.length > 0 ? await query.where(and(...conditions)) : await query;
-    return rows.sort((a, b) => (b.filingDate || "").localeCompare(a.filingDate || ""));
+    const sorted = rows.sort((a, b) => (b.filingDate || "").localeCompare(a.filingDate || ""));
+    if (filters?.slim) stripHeavyReviewFields(sorted);
+    return sorted;
   }
 
   // Paginated/filterable/sortable variant of getFilings — pushes all of the
   // PDF-library page's filter/sort/search work into SQL (with indexes on
   // ticker, status, filingDate, filingType) so the client only ever ships a
-  // page-worth of rows over the wire.
+  // page-worth of rows over the wire. Pass `slim: true` to also strip the
+  // heavy review-text fields from the response.
   async getFilingsPage(opts: {
     ticker?: string;
     filingType?: string;
@@ -236,6 +260,7 @@ export class DatabaseStorage {
     dir?: "asc" | "desc";
     limit?: number;
     offset?: number;
+    slim?: boolean;
   } = {}): Promise<{ items: Filing[]; total: number }> {
     const conditions: any[] = [];
     if (opts.ticker) conditions.push(eq(filings.ticker, opts.ticker));
@@ -282,7 +307,9 @@ export class DatabaseStorage {
       .limit(limit)
       .offset(offset);
 
-    return { items: items as Filing[], total };
+    const typedItems = items as Filing[];
+    if (opts.slim) stripHeavyReviewFields(typedItems);
+    return { items: typedItems, total };
   }
 
   async getFilingByAccession(accession: string): Promise<Filing | undefined> {
