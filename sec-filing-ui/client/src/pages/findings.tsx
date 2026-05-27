@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "wouter";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { API_BASE, apiRequest, queryClient } from "@/lib/queryClient";
@@ -283,14 +283,19 @@ export default function Findings() {
   };
 
   // Saved PDFs that haven't been (successfully) reviewed yet
-  const reviewableFilings = filings.filter(
-    (f) =>
-      f.status === "complete" &&
-      !["done", "pending", "reviewing"].includes(f.reviewStatus || ""),
+  const reviewableFilings = useMemo(
+    () =>
+      filings.filter(
+        (f) =>
+          f.status === "complete" &&
+          !["done", "pending", "reviewing"].includes(f.reviewStatus || ""),
+      ),
+    [filings],
   );
   const reviewableCount = reviewableFilings.length;
-  const reviewCostRange = formatCostRange(
-    estimateReviewCost(reviewableFilings.map((f) => f.filingType)),
+  const reviewCostRange = useMemo(
+    () => formatCostRange(estimateReviewCost(reviewableFilings.map((f) => f.filingType))),
+    [reviewableFilings],
   );
 
   const handleReviewSaved = () => {
@@ -301,62 +306,82 @@ export default function Findings() {
     reviewMutation.mutate();
   };
 
-  const statusMap = new Map<string, string>();
-  for (const a of actions) statusMap.set(`${a.accessionNumber}#${a.findingIndex}`, a.status);
+  const statusMap = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const a of actions) m.set(`${a.accessionNumber}#${a.findingIndex}`, a.status);
+    return m;
+  }, [actions]);
 
-  const allRows: Row[] = filings
-    .filter((f) => f.reviewStatus === "done")
-    .flatMap((f) =>
-      parseFindings(f).map((finding, index) => {
-        const key = `${f.accessionNumber}#${index}`;
-        return { filing: f, finding, index, key, status: statusMap.get(key) };
-      }),
-    );
+  // Flatten reviewed filings into per-finding rows. Re-parses the heavy
+  // reviewFindings JSON only when the filings list or triage statuses change,
+  // not on every keystroke in the search box.
+  const allRows: Row[] = useMemo(
+    () =>
+      filings
+        .filter((f) => f.reviewStatus === "done")
+        .flatMap((f) =>
+          parseFindings(f).map((finding, index) => {
+            const key = `${f.accessionNumber}#${index}`;
+            return { filing: f, finding, index, key, status: statusMap.get(key) };
+          }),
+        ),
+    [filings, statusMap],
+  );
 
-  const term = q.trim().toLowerCase();
   // If the query exactly matches a known ticker, filter by that ticker rather
   // than substring-matching it inside finding text (so "BA" → ticker BA, not
   // every finding containing the letters "ba").
-  const knownTickers = new Set(filings.map((f) => f.ticker.toLowerCase()));
+  const knownTickers = useMemo(
+    () => new Set(filings.map((f) => f.ticker.toLowerCase())),
+    [filings],
+  );
+  const term = q.trim().toLowerCase();
   const tickerExact = term && knownTickers.has(term) ? term : null;
-  const filtered = allRows.filter((r) => {
-    if (activeCats.size > 0 && !activeCats.has(r.finding.category)) return false;
-    if (interest !== "all" && r.filing.reviewMateriality !== interest) return false;
-    if (triage === "active" && r.status === "dismissed") return false;
-    if (triage === "untriaged" && r.status) return false;
-    if (triage === "starred" && r.status !== "starred") return false;
-    if (triage === "posted" && r.status !== "posted") return false;
-    if (triage === "dismissed" && r.status !== "dismissed") return false;
-    if (tickerExact) {
-      if (r.filing.ticker.toLowerCase() !== tickerExact) return false;
-    } else if (term) {
-      const hay = `${r.finding.headline} ${r.finding.detail} ${r.finding.why} ${r.filing.ticker}`.toLowerCase();
-      if (!hay.includes(term)) return false;
-    }
-    return true;
-  });
+
+  const filtered = useMemo(
+    () =>
+      allRows.filter((r) => {
+        if (activeCats.size > 0 && !activeCats.has(r.finding.category)) return false;
+        if (interest !== "all" && r.filing.reviewMateriality !== interest) return false;
+        if (triage === "active" && r.status === "dismissed") return false;
+        if (triage === "untriaged" && r.status) return false;
+        if (triage === "starred" && r.status !== "starred") return false;
+        if (triage === "posted" && r.status !== "posted") return false;
+        if (triage === "dismissed" && r.status !== "dismissed") return false;
+        if (tickerExact) {
+          if (r.filing.ticker.toLowerCase() !== tickerExact) return false;
+        } else if (term) {
+          const hay = `${r.finding.headline} ${r.finding.detail} ${r.finding.why} ${r.filing.ticker}`.toLowerCase();
+          if (!hay.includes(term)) return false;
+        }
+        return true;
+      }),
+    [allRows, activeCats, interest, triage, tickerExact, term],
+  );
 
   // "Newest" on the findings panel = most recently reviewed (not SEC filing
   // date), so a filing you reviewed minutes ago shows up first even if it was
   // filed years before something already in the library. Tiebreak on filingDate
   // so reviews finished in the same batch stay in filing-date order.
-  const reviewedKey = (r: Row) => r.filing.reviewedAt || "";
-  const filedKey = (r: Row) => r.filing.filingDate || "";
-  const byReviewedDesc = (a: Row, b: Row) =>
-    reviewedKey(b).localeCompare(reviewedKey(a)) || filedKey(b).localeCompare(filedKey(a));
-  const byReviewedAsc = (a: Row, b: Row) =>
-    reviewedKey(a).localeCompare(reviewedKey(b)) || filedKey(a).localeCompare(filedKey(b));
-  const rows = [...filtered].sort((a, b) => {
-    if (sortBy === "ticker")
-      return a.filing.ticker.localeCompare(b.filing.ticker) || byReviewedDesc(a, b);
-    if (sortBy === "interest")
-      return interestRank(b.filing.reviewMateriality) - interestRank(a.filing.reviewMateriality) || byReviewedDesc(a, b);
-    if (sortBy === "oldest") return byReviewedAsc(a, b);
-    return byReviewedDesc(a, b);
-  });
+  const rows = useMemo(() => {
+    const reviewedKey = (r: Row) => r.filing.reviewedAt || "";
+    const filedKey = (r: Row) => r.filing.filingDate || "";
+    const byReviewedDesc = (a: Row, b: Row) =>
+      reviewedKey(b).localeCompare(reviewedKey(a)) || filedKey(b).localeCompare(filedKey(a));
+    const byReviewedAsc = (a: Row, b: Row) =>
+      reviewedKey(a).localeCompare(reviewedKey(b)) || filedKey(a).localeCompare(filedKey(b));
+    return [...filtered].sort((a, b) => {
+      if (sortBy === "ticker")
+        return a.filing.ticker.localeCompare(b.filing.ticker) || byReviewedDesc(a, b);
+      if (sortBy === "interest")
+        return interestRank(b.filing.reviewMateriality) - interestRank(a.filing.reviewMateriality) || byReviewedDesc(a, b);
+      if (sortBy === "oldest") return byReviewedAsc(a, b);
+      return byReviewedDesc(a, b);
+    });
+  }, [filtered, sortBy]);
 
   // Group rows by ticker, ordered by finding count (most first)
-  const tickerGroups: Array<[string, Row[]]> = (() => {
+  const tickerGroups: Array<[string, Row[]]> = useMemo(() => {
     const m = new Map<string, Row[]>();
     for (const r of rows) {
       const arr = m.get(r.filing.ticker);
@@ -364,7 +389,7 @@ export default function Findings() {
       else m.set(r.filing.ticker, [r]);
     }
     return Array.from(m.entries()).sort((a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]));
-  })();
+  }, [rows]);
 
   const toggleCat = (c: string) =>
     setActiveCats((prev) => {
