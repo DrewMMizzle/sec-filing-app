@@ -1,34 +1,18 @@
 import { storage } from "./storage";
 import { getAnthropicClient, MODEL, resolvePdfPath, extractPdfText } from "./review";
+import { getSecTickerIndex } from "./sec-index";
 import type { Filing } from "@shared/schema";
 
-// Lazy cache of ticker → official company name from SEC's company_tickers.json.
-// Used for entity detection (e.g. "Thermo Fisher" → TMO) so we can scope the
-// chat to a few filings instead of the whole corpus.
-const SEC_COMPANY_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json";
-const SEC_USER_AGENT = process.env.SEC_USER_AGENT || "DotAdda ameister@dotadda.com";
-let _tickerNameCache: Promise<Map<string, string>> | null = null;
-
+// Ticker → official company name, projected from the shared SEC index. Used
+// for entity detection (e.g. "Thermo Fisher" → TMO) so we can scope the chat
+// to a few filings instead of the whole corpus.
 async function getTickerNameIndex(): Promise<Map<string, string>> {
-  if (!_tickerNameCache) {
-    _tickerNameCache = (async () => {
-      try {
-        const res = await fetch(SEC_COMPANY_TICKERS_URL, { headers: { "User-Agent": SEC_USER_AGENT } });
-        if (!res.ok) throw new Error(`SEC company_tickers returned ${res.status}`);
-        const data = (await res.json()) as Record<string, { cik_str: number; ticker: string; title: string }>;
-        const map = new Map<string, string>();
-        for (const e of Object.values(data)) {
-          if (e.ticker && e.title) map.set(e.ticker.toUpperCase(), e.title);
-        }
-        return map;
-      } catch (err) {
-        // Don't permanently cache a failure — try again next time someone asks.
-        _tickerNameCache = null;
-        throw err;
-      }
-    })();
-  }
-  return _tickerNameCache;
+  const idx = await getSecTickerIndex();
+  const map = new Map<string, string>();
+  Array.from(idx.entries()).forEach(([ticker, entry]) => {
+    if (entry.name) map.set(ticker, entry.name);
+  });
+  return map;
 }
 
 // Tokens to drop from company names so a match doesn't require "Inc."/"Corp."

@@ -8,6 +8,7 @@ import fs from "fs";
 import { fileURLToPath } from "url";
 import { hashPassword, verifyPassword, createSession, clearSession, requireAuth } from "./auth";
 import { ensureSP500Seeded } from "./seed-sp500";
+import { getSecTickerIndex } from "./sec-index";
 import { isReviewEnabled, kickReviewProcessor, reviewCostUsd } from "./review";
 import { chatAboutFindings, chatAboutFiling } from "./chat";
 import { findPageForQuote } from "./pdf-locate";
@@ -613,6 +614,50 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     const userId = req.user!.id;
     const data = await storage.getAllTickers(userId);
     res.json(data);
+  });
+
+  // Resolve a raw list of ticker symbols against SEC's company_tickers.json so
+  // the Quick fetch flow on Fetch & Review can skip the watchlist step. Returns
+  // resolved {ticker, cik, name} plus any unresolved input symbols so the UI
+  // can surface them to the user.
+  app.post("/api/resolve-tickers", requireAuth, async (req, res) => {
+    const { tickers } = req.body as { tickers?: unknown };
+    if (!Array.isArray(tickers) || tickers.length === 0) {
+      return res.status(400).json({ error: "tickers array is required" });
+    }
+    try {
+      const idx = await getSecTickerIndex();
+      const resolved: Array<{ ticker: string; cik: string; name: string }> = [];
+      const unresolved: string[] = [];
+      const seen = new Set<string>();
+      for (const raw of tickers) {
+        if (typeof raw !== "string") continue;
+        const symbol = raw.trim().toUpperCase();
+        if (!symbol) continue;
+        // SEC uses "-" where index lists use "." (e.g. BRK.B -> BRK-B).
+        const variants = symbol.includes(".") ? [symbol.replace(/\./g, "-"), symbol] : [symbol];
+        let hit: { ticker: string; cik: string; name: string } | null = null;
+        for (const v of variants) {
+          const entry = idx.get(v);
+          if (entry) {
+            hit = { ticker: v, cik: entry.cik, name: entry.name };
+            break;
+          }
+        }
+        if (hit) {
+          if (!seen.has(hit.ticker)) {
+            seen.add(hit.ticker);
+            resolved.push(hit);
+          }
+        } else {
+          unresolved.push(symbol);
+        }
+      }
+      res.json({ resolved, unresolved });
+    } catch (e: any) {
+      console.error("Error resolving tickers:", e);
+      res.status(500).json({ error: "Failed to resolve tickers with SEC" });
+    }
   });
 
   // ─── Filings: list, stats, fetch, download, manage ────────

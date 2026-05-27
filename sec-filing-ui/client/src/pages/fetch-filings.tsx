@@ -313,17 +313,11 @@ export default function FetchFilings() {
     setSelectedTickers(new Set());
   };
 
-  // Fetch mutation
-  const fetchMutation = useMutation<FetchResult>({
-    mutationFn: async () => {
-      const tickersToFetch = displayTickers
-        .filter((t: TickerInfo) => selectedTickers.has(t.ticker))
-        .map((t: TickerInfo) => ({
-          ticker: t.ticker,
-          cik: t.cik,
-          filing_types: t.filingTypes,
-        }));
-
+  // Fetch mutation. Takes the tickers payload as the mutation variable so both
+  // the pill-selection flow and the quick-fetch input can share it.
+  type FetchPayloadTicker = { ticker: string; cik: string; filing_types: string[] };
+  const fetchMutation = useMutation<FetchResult, Error, FetchPayloadTicker[]>({
+    mutationFn: async (tickersToFetch) => {
       const res = await apiRequest("POST", "/api/filings/fetch", {
         tickers: tickersToFetch,
         dateFrom: dateFrom || undefined,
@@ -406,13 +400,15 @@ export default function FetchFilings() {
     onError: (err: Error) => toast({ title: "Error", description: err.message, variant: "destructive" }),
   });
 
-  const handleFetch = () => {
-    if (selectedTickers.size === 0) {
+  // Shared submit path so pill-selection and quick-fetch get the same large-
+  // batch confirmation + cost estimate before kicking off the pipeline.
+  const submitFetch = (payload: FetchPayloadTicker[]) => {
+    if (payload.length === 0) {
       toast({ title: "Select at least one ticker", variant: "destructive" });
       return;
     }
-    if (selectedTickers.size > CONFIRM_THRESHOLD) {
-      const est = selectedTickers.size * limitPerTicker;
+    if (payload.length > CONFIRM_THRESHOLD) {
+      const est = payload.length * limitPerTicker;
       const capNote =
         reviewEnabled && usage?.budgetUsd != null
           ? ` A $${usage.budgetUsd.toFixed(2)} spend cap is set ($${usage.costUsd.toFixed(2)} used) — review pauses automatically if it's reached.`
@@ -425,15 +421,81 @@ export default function FetchFilings() {
       setConfirm({
         title: "Fetch a large batch?",
         body:
-          `This will fetch up to ~${est} filings across ${selectedTickers.size} tickers` +
+          `This will fetch up to ~${est} filings across ${payload.length} tickers` +
           (reviewEnabled ? " and run a Claude review on each new one" : "") +
           `. It can take a while.` +
           costNote,
-        action: () => fetchMutation.mutate(),
+        action: () => fetchMutation.mutate(payload),
       });
       return;
     }
-    fetchMutation.mutate();
+    fetchMutation.mutate(payload);
+  };
+
+  const handleFetch = () => {
+    const payload: FetchPayloadTicker[] = displayTickers
+      .filter((t: TickerInfo) => selectedTickers.has(t.ticker))
+      .map((t: TickerInfo) => ({
+        ticker: t.ticker,
+        cik: t.cik,
+        filing_types: t.filingTypes,
+      }));
+    submitFetch(payload);
+  };
+
+  // ── Quick fetch: type/paste tickers, resolve via SEC, kick the pipeline ──
+  const QUICK_FETCH_FILING_TYPES = ["10-K", "10-Q", "8-K", "DEF 14A"];
+  const [quickInput, setQuickInput] = useState("");
+
+  const quickFetchMutation = useMutation<
+    { resolved: Array<{ ticker: string; cik: string; name: string }>; unresolved: string[] },
+    Error,
+    string[]
+  >({
+    mutationFn: async (symbols) => {
+      const res = await apiRequest("POST", "/api/resolve-tickers", { tickers: symbols });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || "Couldn't resolve tickers");
+      }
+      return res.json();
+    },
+    onSuccess: ({ resolved, unresolved }) => {
+      if (unresolved.length > 0) {
+        toast({
+          title: `Skipped ${unresolved.length} ticker${unresolved.length !== 1 ? "s" : ""}`,
+          description: `Not found in SEC: ${unresolved.join(", ")}`,
+          variant: "destructive",
+        });
+      }
+      if (resolved.length === 0) return;
+      setQuickInput("");
+      submitFetch(
+        resolved.map((r) => ({
+          ticker: r.ticker,
+          cik: r.cik,
+          filing_types: QUICK_FETCH_FILING_TYPES,
+        })),
+      );
+    },
+    onError: (err) => toast({ title: "Error", description: err.message, variant: "destructive" }),
+  });
+
+  const handleQuickFetch = () => {
+    const symbols = Array.from(
+      new Set(
+        quickInput
+          .split(/[\s,;\n]+/)
+          .map((s) => s.trim())
+          .filter(Boolean)
+          .map((s) => s.toUpperCase()),
+      ),
+    );
+    if (symbols.length === 0) {
+      toast({ title: "Enter at least one ticker", variant: "destructive" });
+      return;
+    }
+    quickFetchMutation.mutate(symbols);
   };
 
   // Filter existing filings by current date range
@@ -558,6 +620,57 @@ export default function FetchFilings() {
           </Button>
         </Card>
       )}
+
+      {/* Quick fetch — type/paste tickers, skip the watchlist + pill picker */}
+      <Card className="p-5 mb-4">
+        <div className="space-y-2">
+          <div>
+            <label className="text-sm font-medium" htmlFor="quick-fetch-input">
+              Quick fetch
+            </label>
+            <p className="text-xs text-muted-foreground">
+              Type or paste ticker symbols (separated by spaces, commas, or new lines) to fetch
+              recent 10-K, 10-Q, 8-K, and DEF 14A filings — no watchlist needed.
+            </p>
+          </div>
+          <div className="flex items-center gap-2">
+            <Input
+              id="quick-fetch-input"
+              value={quickInput}
+              onChange={(e) => setQuickInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  handleQuickFetch();
+                }
+              }}
+              placeholder="e.g. AAPL MSFT NVDA"
+              className="font-mono"
+              disabled={quickFetchMutation.isPending || fetchMutation.isPending}
+              data-testid="input-quick-fetch"
+            />
+            <Button
+              onClick={handleQuickFetch}
+              disabled={
+                !quickInput.trim() || quickFetchMutation.isPending || fetchMutation.isPending
+              }
+              data-testid="button-quick-fetch"
+            >
+              {quickFetchMutation.isPending ? (
+                <>
+                  <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                  Resolving…
+                </>
+              ) : (
+                <>
+                  <Search className="w-4 h-4 mr-2" />
+                  Fetch &amp; review
+                </>
+              )}
+            </Button>
+          </div>
+        </div>
+      </Card>
 
       {/* Controls */}
       <Card className="p-5 mb-6">
