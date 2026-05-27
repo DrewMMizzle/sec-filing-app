@@ -897,6 +897,7 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
         corpusFindingsCount: result.corpusFindingsCount,
         corpusFilingsCount: result.corpusFilingsCount,
         truncated: result.truncated,
+        scopedTickers: result.scopedTickers,
       });
     } catch (e: any) {
       console.error("Findings chat failed:", e?.message || e);

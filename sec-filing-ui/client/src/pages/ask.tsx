@@ -20,6 +20,7 @@ type ChatResponse = {
   corpusFindingsCount: number;
   corpusFilingsCount: number;
   truncated: boolean;
+  scopedTickers?: string[];
 };
 
 const SUGGESTIONS = [
@@ -200,7 +201,10 @@ export default function Ask() {
           <p className="text-[10px] text-muted-foreground/70 pl-10">
             {lastMeta.corpusFindingsCount} findings searched across {lastMeta.corpusFilingsCount}{" "}
             filing{lastMeta.corpusFilingsCount !== 1 ? "s" : ""}
-            {lastMeta.truncated && " (older filings omitted)"} · cost ${lastMeta.costUsd.toFixed(3)}
+            {lastMeta.scopedTickers && lastMeta.scopedTickers.length > 0 && (
+              <> · scoped to <span className="font-mono">{lastMeta.scopedTickers.join(", ")}</span></>
+            )}
+            {lastMeta.truncated && " · older filings omitted"} · cost ${lastMeta.costUsd.toFixed(3)}
           </p>
         )}
       </div>

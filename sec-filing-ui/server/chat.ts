@@ -2,6 +2,98 @@ import { storage } from "./storage";
 import { getAnthropicClient, MODEL, resolvePdfPath, extractPdfText } from "./review";
 import type { Filing } from "@shared/schema";
 
+// Lazy cache of ticker → official company name from SEC's company_tickers.json.
+// Used for entity detection (e.g. "Thermo Fisher" → TMO) so we can scope the
+// chat to a few filings instead of the whole corpus.
+const SEC_COMPANY_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json";
+const SEC_USER_AGENT = process.env.SEC_USER_AGENT || "DotAdda ameister@dotadda.com";
+let _tickerNameCache: Promise<Map<string, string>> | null = null;
+
+async function getTickerNameIndex(): Promise<Map<string, string>> {
+  if (!_tickerNameCache) {
+    _tickerNameCache = (async () => {
+      try {
+        const res = await fetch(SEC_COMPANY_TICKERS_URL, { headers: { "User-Agent": SEC_USER_AGENT } });
+        if (!res.ok) throw new Error(`SEC company_tickers returned ${res.status}`);
+        const data = (await res.json()) as Record<string, { cik_str: number; ticker: string; title: string }>;
+        const map = new Map<string, string>();
+        for (const e of Object.values(data)) {
+          if (e.ticker && e.title) map.set(e.ticker.toUpperCase(), e.title);
+        }
+        return map;
+      } catch (err) {
+        // Don't permanently cache a failure — try again next time someone asks.
+        _tickerNameCache = null;
+        throw err;
+      }
+    })();
+  }
+  return _tickerNameCache;
+}
+
+// Tokens to drop from company names so a match doesn't require "Inc."/"Corp."
+const NAME_SUFFIXES = new Set([
+  "INC", "INC.", "CORP", "CORP.", "CORPORATION", "CO", "CO.", "COMPANY",
+  "LLC", "LTD", "LTD.", "PLC", "HOLDINGS", "GROUP", "TRUST", "FUND",
+  "CLASS", "COMMON", "NEW", "&", "THE", "L.P.", "LP",
+]);
+
+function nameTokens(rawName: string): string[] {
+  return rawName
+    .toUpperCase()
+    .split(/[\s,.()]+/)
+    .filter((t) => t && !NAME_SUFFIXES.has(t));
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// Detect which tickers in the corpus the user is asking about. Returns a Set
+// of matched tickers, or an empty Set if no entity is mentioned (caller falls
+// back to the full corpus). Conservative — single-word matches require >= 6
+// characters and a word boundary, to avoid false positives on common English
+// words.
+function detectScopedTickers(
+  question: string,
+  corpusTickers: Set<string>,
+  tickerToName: Map<string, string>,
+): Set<string> {
+  const matched = new Set<string>();
+  // 1) Exact ticker symbol mentions (uppercase tokens in the question).
+  const tokenRe = /\b[A-Z]{1,5}(?:[.\-][A-Z]{1,2})?\b/g;
+  const tickMatches = Array.from(question.match(tokenRe) ?? []);
+  for (const tok of tickMatches) {
+    if (corpusTickers.has(tok)) matched.add(tok);
+  }
+  // 2) Company-name mentions. Try increasingly specific match patterns per
+  //    ticker so e.g. "Thermo Fisher" matches "Thermo Fisher Scientific Inc.".
+  const lower = question.toLowerCase();
+  for (const ticker of Array.from(corpusTickers)) {
+    if (matched.has(ticker)) continue;
+    const name = tickerToName.get(ticker);
+    if (!name) continue;
+    const tokens = nameTokens(name);
+    if (tokens.length === 0) continue;
+    let hit = false;
+    // 2a) Full normalized name as a substring.
+    const full = tokens.join(" ").toLowerCase();
+    if (full.length >= 5 && lower.includes(full)) hit = true;
+    // 2b) Two-word prefix (covers "Thermo Fisher" → TMO).
+    if (!hit && tokens.length >= 2) {
+      const two = (tokens[0] + " " + tokens[1]).toLowerCase();
+      if (two.length >= 5 && lower.includes(two)) hit = true;
+    }
+    // 2c) A single distinctive first word, ≥6 chars, on a word boundary.
+    if (!hit && tokens[0].length >= 6) {
+      const re = new RegExp(`\\b${escapeRegExp(tokens[0].toLowerCase())}\\b`);
+      if (re.test(lower)) hit = true;
+    }
+    if (hit) matched.add(ticker);
+  }
+  return matched;
+}
+
 // Larger cap now that we've validated the chat. ~1.6M chars ≈ ~400k tokens —
 // fits the full corpus today and still leaves ~600k headroom in the 1M context
 // for chat history, thinking, and the answer.
@@ -43,6 +135,9 @@ export type ChatResult = {
   corpusFindingsCount: number;
   corpusFilingsCount: number;
   truncated: boolean;
+  // Tickers the question was auto-scoped to (empty when the question was
+  // general and the full corpus was sent).
+  scopedTickers: string[];
 };
 
 export type FilingChatResult = ChatResult & {
@@ -71,7 +166,7 @@ function parseFindingsField(raw: string | null | undefined): Array<{
 // containing the editorial summary plus its discrete findings — gives the
 // chat broader context than findings alone (without dragging in raw filing
 // text).
-async function buildFindingsCorpus(): Promise<{
+async function buildFindingsCorpus(scopedTickers?: Set<string>): Promise<{
   text: string;
   findingsCount: number;
   filingsCount: number;
@@ -86,6 +181,7 @@ async function buildFindingsCorpus(): Promise<{
   let filingsCount = 0;
   for (const f of filings) {
     if (f.reviewStatus !== "done") continue;
+    if (scopedTickers && scopedTickers.size > 0 && !scopedTickers.has(f.ticker)) continue;
     const findings = parseFindingsField(f.reviewFindings);
     if (findings.length === 0 && !f.reviewSummary) continue;
     const findingBlocks = findings
@@ -121,15 +217,44 @@ export async function chatAboutFindings(history: Turn[]): Promise<ChatResult> {
   if (!last || last.role !== "user" || !last.content.trim()) {
     throw new Error("Last message must be a non-empty user message");
   }
-  const corpus = await buildFindingsCorpus();
+
+  // Entity scoping: try to detect which tickers the question is about and
+  // filter the corpus to just those filings. Falls back to the full corpus
+  // when no entity is detected. A scoped query against ~5 filings is ~50x
+  // cheaper than caching the whole library.
+  const allFilings = await storage.getFilings({ status: "complete" });
+  const corpusTickers = new Set<string>();
+  for (const f of allFilings) {
+    if (f.reviewStatus === "done") corpusTickers.add(f.ticker);
+  }
+  let scope: Set<string> = new Set();
+  try {
+    const nameIndex = await getTickerNameIndex();
+    scope = detectScopedTickers(last.content, corpusTickers, nameIndex);
+  } catch {
+    // If the SEC index fails to load, fall back to ticker-symbol-only detection
+    // (still useful for queries like "what did TMO say…").
+    scope = detectScopedTickers(last.content, corpusTickers, new Map());
+  }
+
+  let corpus = await buildFindingsCorpus(scope.size > 0 ? scope : undefined);
+  // If a scope was detected but yielded nothing (e.g. the user mentioned an
+  // entity we don't have reviews for), drop back to the full corpus rather
+  // than refusing to answer.
+  if (scope.size > 0 && corpus.findingsCount === 0 && corpus.filingsCount === 0) {
+    scope = new Set();
+    corpus = await buildFindingsCorpus();
+  }
   if (corpus.findingsCount === 0 && corpus.filingsCount === 0) {
     throw new Error(
       "No reviewed findings in the database yet. Run a fetch & review first.",
     );
   }
 
+  const scopeLabel =
+    scope.size > 0 ? ` scoped to ${Array.from(scope).sort().join(", ")}` : "";
   const corpusBlock =
-    `Findings corpus (${corpus.findingsCount} findings across ${corpus.filingsCount} filings` +
+    `Findings corpus (${corpus.findingsCount} findings across ${corpus.filingsCount} filings${scopeLabel}` +
     (corpus.truncated ? ", truncated to most recent — older filings may be omitted" : "") +
     `):\n\n${corpus.text}`;
 
@@ -163,6 +288,7 @@ export async function chatAboutFindings(history: Turn[]): Promise<ChatResult> {
       corpusFindingsCount: corpus.findingsCount,
       corpusFilingsCount: corpus.filingsCount,
       truncated: corpus.truncated,
+      scopedTickers: Array.from(scope).sort(),
     };
   } catch (err: any) {
     if (controller.signal.aborted) {
@@ -239,6 +365,7 @@ export async function chatAboutFiling(
       corpusFindingsCount: 0,
       corpusFilingsCount: 1,
       truncated,
+      scopedTickers: [filing.ticker],
       ticker: filing.ticker,
       form: filing.filingType,
       date: filing.filingDate,
