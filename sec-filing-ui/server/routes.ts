@@ -568,6 +568,53 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     }
   });
 
+  // Add several already-resolved tickers (ticker + cik) to a watchlist in one
+  // call, skipping any the watchlist already has. Used by Quick Fetch, which
+  // has already resolved CIKs via /api/resolve-tickers — so unlike the single
+  // endpoint above this trusts the supplied cik and never re-downloads SEC's
+  // full company-tickers file.
+  app.post("/api/watchlists/:id/tickers/bulk", requireAuth, async (req, res) => {
+    const watchlistId = Number(req.params.id);
+    const userId = req.user!.id;
+    const { access, watchlist: wl } = await checkWatchlistAccess(watchlistId, userId);
+
+    if (!wl) return res.status(404).json({ error: "Watchlist not found" });
+    if (!access) return res.status(403).json({ error: "Access denied" });
+    if (access === "view") return res.status(403).json({ error: "View-only access cannot add tickers" });
+
+    const { tickers: incoming } = req.body as {
+      tickers?: Array<{ ticker?: unknown; cik?: unknown }>;
+    };
+    if (!Array.isArray(incoming) || incoming.length === 0) {
+      return res.status(400).json({ error: "tickers array is required" });
+    }
+
+    const existing = await storage.getTickersByWatchlist(watchlistId);
+    const have = new Set(existing.map((t) => t.ticker.toUpperCase()));
+
+    let added = 0;
+    let skipped = 0;
+    for (const row of incoming) {
+      const ticker = typeof row?.ticker === "string" ? row.ticker.toUpperCase().trim() : "";
+      const cik = typeof row?.cik === "string" ? row.cik.trim() : "";
+      if (!ticker || !cik) continue;
+      if (have.has(ticker)) {
+        skipped += 1;
+        continue;
+      }
+      await storage.addTicker({
+        watchlistId,
+        ticker,
+        cik,
+        filingTypes: JSON.stringify(["10-K", "10-Q", "8-K", "DEF 14A"]),
+      });
+      have.add(ticker);
+      added += 1;
+    }
+
+    res.status(201).json({ added, skipped });
+  });
+
   app.delete("/api/tickers/:id", requireAuth, async (req, res) => {
     // We need to verify the ticker belongs to a watchlist the user owns or has edit access to
     const id = Number(req.params.id);

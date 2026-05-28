@@ -464,8 +464,15 @@ export default function FetchFilings() {
   const QUICK_FETCH_FILING_TYPES = ["10-K", "10-Q", "8-K", "DEF 14A"];
   const [quickInput, setQuickInput] = useState("");
 
+  type ResolvedTicker = { ticker: string; cik: string; name: string };
+  // Holds the resolved tickers from a quick fetch while we ask whether to add
+  // them to a watchlist. Quick fetch only puts filings in the shared library;
+  // adding the ticker to a watchlist is what makes it reappear in the picker.
+  const [quickAdd, setQuickAdd] = useState<ResolvedTicker[] | null>(null);
+  const [quickAddTarget, setQuickAddTarget] = useState<string>("");
+
   const quickFetchMutation = useMutation<
-    { resolved: Array<{ ticker: string; cik: string; name: string }>; unresolved: string[] },
+    { resolved: ResolvedTicker[]; unresolved: string[] },
     Error,
     string[]
   >({
@@ -486,20 +493,59 @@ export default function FetchFilings() {
         });
       }
       if (resolved.length === 0) return;
-      // Scope the filings list + summary card to just what was quick-fetched
-      // so the user sees their run's progress, not the whole library state.
-      setSelectedTickers(new Set(resolved.map((r) => r.ticker)));
-      setQuickInput("");
-      submitFetch(
-        resolved.map((r) => ({
-          ticker: r.ticker,
-          cik: r.cik,
-          filing_types: QUICK_FETCH_FILING_TYPES,
-        })),
+      // Don't fetch yet — ask which watchlist (if any) to persist these tickers
+      // to first, so a quick-fetched ticker can show up in the picker next time.
+      setQuickAdd(resolved);
+      setQuickAddTarget(
+        selectedWatchlist !== "all"
+          ? selectedWatchlist
+          : watchlists[0]
+            ? String(watchlists[0].id)
+            : "",
       );
     },
     onError: (err) => toast({ title: "Error", description: err.message, variant: "destructive" }),
   });
+
+  // Persist quick-fetched tickers into a watchlist (idempotent server-side).
+  const bulkAddMutation = useMutation<
+    { added: number; skipped: number },
+    Error,
+    { watchlistId: string; tickers: Array<{ ticker: string; cik: string }> }
+  >({
+    mutationFn: async ({ watchlistId, tickers }) => {
+      const res = await apiRequest("POST", `/api/watchlists/${watchlistId}/tickers/bulk`, { tickers });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || "Failed to add tickers to watchlist");
+      }
+      return res.json();
+    },
+    onSuccess: ({ added, skipped }) => {
+      queryClient.invalidateQueries({ queryKey: ["/api/watchlists"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/all-tickers"] });
+      const parts: string[] = [];
+      if (added) parts.push(`Added ${added} to watchlist`);
+      if (skipped) parts.push(`${skipped} already in list`);
+      toast({ title: parts.join(" · ") || "No changes" });
+    },
+    onError: (err) => toast({ title: "Error", description: err.message, variant: "destructive" }),
+  });
+
+  // Kick the fetch for resolved tickers and close the add prompt. Scopes the
+  // filings list to this run so the user watches their own progress.
+  const runQuickFetch = (resolved: ResolvedTicker[]) => {
+    setSelectedTickers(new Set(resolved.map((r) => r.ticker)));
+    setQuickInput("");
+    setQuickAdd(null);
+    submitFetch(
+      resolved.map((r) => ({
+        ticker: r.ticker,
+        cik: r.cik,
+        filing_types: QUICK_FETCH_FILING_TYPES,
+      })),
+    );
+  };
 
   const handleQuickFetch = () => {
     const symbols = Array.from(
@@ -1253,6 +1299,66 @@ export default function FetchFilings() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      {/* Quick fetch: offer to save the resolved tickers to a watchlist */}
+      <Dialog open={quickAdd !== null} onOpenChange={(open) => { if (!open) setQuickAdd(null); }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Add to a watchlist?</DialogTitle>
+            <DialogDescription>
+              Quick fetch pulls these filings into the shared library either way. Adding the
+              ticker{quickAdd && quickAdd.length !== 1 ? "s" : ""} to a watchlist is what makes
+              {quickAdd && quickAdd.length !== 1 ? " them" : " it"} reappear in the Tickers picker later.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex flex-wrap gap-1.5">
+            {quickAdd?.map((r) => (
+              <Badge key={r.ticker} variant="secondary" title={r.name}>{r.ticker}</Badge>
+            ))}
+          </div>
+          {watchlists.length > 0 ? (
+            <Select value={quickAddTarget} onValueChange={setQuickAddTarget}>
+              <SelectTrigger data-testid="select-quick-add-watchlist">
+                <SelectValue placeholder="Choose a watchlist" />
+              </SelectTrigger>
+              <SelectContent>
+                {watchlists.map((w) => (
+                  <SelectItem key={w.id} value={String(w.id)}>{w.name}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          ) : (
+            <p className="text-sm text-muted-foreground">
+              You don't have any watchlists yet — create one to save tickers for later.
+            </p>
+          )}
+          <DialogFooter>
+            <Button
+              variant="ghost"
+              onClick={() => quickAdd && runQuickFetch(quickAdd)}
+              data-testid="button-quick-skip-add"
+            >
+              Skip &amp; fetch
+            </Button>
+            <Button
+              disabled={!quickAddTarget || watchlists.length === 0}
+              onClick={() => {
+                if (!quickAdd) return;
+                if (quickAddTarget) {
+                  bulkAddMutation.mutate({
+                    watchlistId: quickAddTarget,
+                    tickers: quickAdd.map((r) => ({ ticker: r.ticker, cik: r.cik })),
+                  });
+                }
+                runQuickFetch(quickAdd);
+              }}
+              data-testid="button-quick-add-fetch"
+            >
+              Add &amp; fetch
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* Claude spend cap editor */}
       <Dialog open={budgetOpen} onOpenChange={setBudgetOpen}>
