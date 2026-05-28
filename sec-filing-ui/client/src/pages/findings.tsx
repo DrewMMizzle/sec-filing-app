@@ -386,12 +386,18 @@ export default function Findings() {
       reviewedKey(b).localeCompare(reviewedKey(a)) || filedKey(b).localeCompare(filedKey(a));
     const byReviewedAsc = (a: Row, b: Row) =>
       reviewedKey(a).localeCompare(reviewedKey(b)) || filedKey(a).localeCompare(filedKey(b));
+    const byFiledDesc = (a: Row, b: Row) =>
+      filedKey(b).localeCompare(filedKey(a)) || reviewedKey(b).localeCompare(reviewedKey(a));
+    const byFiledAsc = (a: Row, b: Row) =>
+      filedKey(a).localeCompare(filedKey(b)) || reviewedKey(a).localeCompare(reviewedKey(b));
     return [...filtered].sort((a, b) => {
       if (sortBy === "ticker")
         return a.filing.ticker.localeCompare(b.filing.ticker) || byReviewedDesc(a, b);
       if (sortBy === "interest")
         return interestRank(b.filing.reviewMateriality) - interestRank(a.filing.reviewMateriality) || byReviewedDesc(a, b);
       if (sortBy === "oldest") return byReviewedAsc(a, b);
+      if (sortBy === "filed") return byFiledDesc(a, b);
+      if (sortBy === "filedOldest") return byFiledAsc(a, b);
       return byReviewedDesc(a, b);
     });
   }, [filtered, sortBy]);
@@ -800,12 +806,14 @@ export default function Findings() {
             </SelectContent>
           </Select>
           <Select value={sortBy} onValueChange={setSortBy}>
-            <SelectTrigger className="w-36" data-testid="select-sort">
+            <SelectTrigger className="w-44" data-testid="select-sort">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
               <SelectItem value="date">Recently reviewed</SelectItem>
               <SelectItem value="oldest">Oldest reviewed</SelectItem>
+              <SelectItem value="filed">Filing date (newest)</SelectItem>
+              <SelectItem value="filedOldest">Filing date (oldest)</SelectItem>
               <SelectItem value="ticker">Ticker A–Z</SelectItem>
               <SelectItem value="interest">Interest</SelectItem>
             </SelectContent>
