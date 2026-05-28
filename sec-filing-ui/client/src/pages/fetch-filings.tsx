@@ -100,6 +100,13 @@ export default function FetchFilings() {
     setDateTo(range?.to ? toYmd(range.to) : "");
   };
 
+  // Quick presets: collapse the range to a single day.
+  const setSingleDay = (d: Date) => {
+    const ymd = toYmd(d);
+    setDateFrom(ymd);
+    setDateTo(ymd);
+  };
+
   const rangeLabel = (() => {
     const from = parseYmd(dateFrom);
     const to = parseYmd(dateTo);
@@ -789,7 +796,31 @@ export default function FetchFilings() {
                     disabled={{ after: new Date() }}
                     initialFocus
                   />
-                  <div className="flex justify-end border-t p-2">
+                  <div className="flex items-center justify-between border-t p-2">
+                    <div className="flex items-center gap-1">
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="text-xs h-7"
+                        onClick={() => {
+                          const d = new Date();
+                          d.setDate(d.getDate() - 1);
+                          setSingleDay(d);
+                        }}
+                        data-testid="button-date-yesterday"
+                      >
+                        Yesterday
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="text-xs h-7"
+                        onClick={() => setSingleDay(new Date())}
+                        data-testid="button-date-today"
+                      >
+                        Today
+                      </Button>
+                    </div>
                     <Button
                       variant="ghost"
                       size="sm"
