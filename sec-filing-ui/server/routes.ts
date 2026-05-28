@@ -1,6 +1,6 @@
 import type { Express } from "express";
 import type { Server } from "http";
-import { storage, initDatabase } from "./storage";
+import { storage, initDatabase, parseFilingTypesSafe } from "./storage";
 import { insertWatchlistSchema } from "@shared/schema";
 import { spawn } from "child_process";
 import path from "path";
@@ -374,12 +374,16 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     if (!access) return res.status(403).json({ error: "Access denied" });
 
     const tickerRows = await storage.getTickersByWatchlist(id);
+    const tickers = tickerRows.map((t) => ({
+      ...t,
+      filingTypes: parseFilingTypesSafe(t.filingTypes),
+    }));
     let ownerName: string | undefined;
     if (access !== "owner") {
       const owner = await storage.getUserById(wl.userId);
       ownerName = owner?.displayName;
     }
-    res.json({ ...wl, tickers: tickerRows, access, ownerName });
+    res.json({ ...wl, tickers, access, ownerName });
   });
 
   app.post("/api/watchlists", requireAuth, async (req, res) => {
@@ -501,7 +505,7 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     const tickerRows = await storage.getTickersByWatchlist(id);
     const result = tickerRows.map((t) => ({
       ...t,
-      filingTypes: JSON.parse(t.filingTypes) as string[],
+      filingTypes: parseFilingTypesSafe(t.filingTypes),
     }));
     res.json(result);
   });
