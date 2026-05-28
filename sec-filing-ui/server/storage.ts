@@ -39,6 +39,23 @@ const pool = new Pool({
 
 export const db = drizzle(pool);
 
+// Parse a ticker row's filingTypes column without ever throwing. The column is
+// stored as a JSON-encoded string, but a corrupted or hand-edited value used
+// to crash callers — and on the client, leak through to a blank Fetch page.
+// Anything unrecognizable becomes an empty array so callers keep working.
+export function parseFilingTypesSafe(raw: unknown): string[] {
+  if (Array.isArray(raw)) return raw.filter((v): v is string => typeof v === "string");
+  if (typeof raw !== "string" || raw.trim() === "") return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed)
+      ? parsed.filter((v): v is string => typeof v === "string")
+      : [];
+  } catch {
+    return [];
+  }
+}
+
 // Slim-mode helper: null out the heavy reviewFindings JSON blob (often hundreds
 // of KB per filing) before returning a list, so polled views don't ship MB of
 // JSON the consumer isn't going to render. Short text fields (reviewSummary,
@@ -682,7 +699,7 @@ export class DatabaseStorage {
     }
     const byCik = new Map<string, { cik: string; ticker: string; filing_types: Set<string> }>();
     for (const t of allTickers) {
-      const types: string[] = JSON.parse(t.filingTypes);
+      const types: string[] = parseFilingTypesSafe(t.filingTypes);
       if (byCik.has(t.cik)) {
         const existing = byCik.get(t.cik)!;
         types.forEach((ft) => existing.filing_types.add(ft));
@@ -706,7 +723,7 @@ export class DatabaseStorage {
     }
     const seen = new Map<string, { ticker: string; cik: string; filingTypes: Set<string> }>();
     for (const t of allTickers) {
-      const types: string[] = JSON.parse(t.filingTypes);
+      const types: string[] = parseFilingTypesSafe(t.filingTypes);
       if (seen.has(t.ticker)) {
         types.forEach((ft) => seen.get(t.ticker)!.filingTypes.add(ft));
       } else {
