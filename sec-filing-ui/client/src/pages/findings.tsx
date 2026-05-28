@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useWindowVirtualizer } from "@tanstack/react-virtual";
 import { Link } from "wouter";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { API_BASE, apiRequest, queryClient } from "@/lib/queryClient";
@@ -152,44 +153,51 @@ async function copyRich(html: string, text: string): Promise<void> {
 
 const interestRank = (l?: string | null) => (l === "high" ? 3 : l === "medium" ? 2 : l === "low" ? 1 : 0);
 
+type FilingsProgress = {
+  totalCount: number;
+  rendering: number;
+  renderError: number;
+  pendingReview: number;
+  reviewing: number;
+  doneReview: number;
+  reviewError: number;
+  lastReviewedAt: string | null;
+};
+
 export default function Findings() {
-  // Slim list — cheap to poll. Drives progress detection + reviewing banner;
-  // also bumps the full query below when a new "done" review lands so newly
-  // written findings appear without polling the megabyte-sized full payload
-  // every few seconds.
-  const { data: slimFilings = [] } = useQuery<Filing[]>({
-    queryKey: ["/api/filings?slim=true"],
+  // Tiny progress poll — constant-size payload that just tells us whether
+  // anything is in flight and when a new review lands. Drives both the
+  // reviewing banner and the lazy refetch of the heavy full filings list
+  // below.
+  const { data: progress } = useQuery<FilingsProgress>({
+    queryKey: ["/api/filings/progress"],
     refetchInterval: (query) => {
-      const rows = query.state.data as Filing[] | undefined;
-      const reviewing = rows?.some(
-        (f) => f.reviewStatus === "pending" || f.reviewStatus === "reviewing",
-      );
+      const p = query.state.data as FilingsProgress | undefined;
+      const active = (p?.pendingReview ?? 0) + (p?.reviewing ?? 0) + (p?.rendering ?? 0) > 0;
       const isPaused =
         (queryClient.getQueryData(["/api/review/usage"]) as { paused?: boolean } | undefined)?.paused ?? false;
-      return reviewing ? (isPaused ? 30000 : 4000) : false;
+      return active ? (isPaused ? 30000 : 4000) : false;
     },
   });
 
   // Full payload (with reviewFindings JSON) for actually rendering the
-  // findings list. Not polled — the slim query above invalidates this one
-  // when a new review completes.
+  // findings list. Not polled — refetched only when the progress poll above
+  // signals a new review has landed.
   const { data: filings = [] } = useQuery<Filing[]>({
     queryKey: ["/api/filings"],
     refetchInterval: false,
   });
 
-  const doneCount = slimFilings.filter((f) => f.reviewStatus === "done").length;
-  const lastDoneCount = useRef(doneCount);
+  const lastReviewedSig = useRef(progress?.lastReviewedAt ?? null);
   useEffect(() => {
-    if (doneCount !== lastDoneCount.current) {
-      lastDoneCount.current = doneCount;
+    const sig = progress?.lastReviewedAt ?? null;
+    if (sig !== lastReviewedSig.current) {
+      lastReviewedSig.current = sig;
       queryClient.invalidateQueries({ queryKey: ["/api/filings"], exact: true });
     }
-  }, [doneCount]);
+  }, [progress?.lastReviewedAt]);
 
-  const reviewing = slimFilings.some(
-    (f) => f.reviewStatus === "pending" || f.reviewStatus === "reviewing",
-  );
+  const reviewing = (progress?.pendingReview ?? 0) + (progress?.reviewing ?? 0) > 0;
 
   const { data: actions = [] } = useQuery<FindingAction[]>({
     queryKey: ["/api/finding-actions"],
@@ -239,7 +247,7 @@ export default function Findings() {
       return res.json();
     },
     onSuccess: (data) => {
-      queryClient.invalidateQueries({ queryKey: ["/api/filings?slim=true"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/filings/progress"] });
       queryClient.invalidateQueries({ queryKey: ["/api/filings"] });
       toast({
         title:
@@ -256,7 +264,15 @@ export default function Findings() {
   const [activeCats, setActiveCats] = useState<Set<string>>(new Set());
   const [interest, setInterest] = useState<string>("all");
   const [triage, setTriage] = useState<string>("active");
+  // qInput drives the input field for instant visual feedback; q is the
+  // debounced value the filter pipeline actually reads. Without this, every
+  // keystroke re-ran the filter/sort/group chain.
+  const [qInput, setQInput] = useState("");
   const [q, setQ] = useState("");
+  useEffect(() => {
+    const t = setTimeout(() => setQ(qInput), 200);
+    return () => clearTimeout(t);
+  }, [qInput]);
   const [sortBy, setSortBy] = useState<string>("date");
   const [groupByTicker, setGroupByTicker] = useState(false);
   const [confirmReview, setConfirmReview] = useState(false);
@@ -390,6 +406,29 @@ export default function Findings() {
     }
     return Array.from(m.entries()).sort((a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]));
   }, [rows]);
+
+  // Flatten the rendered list into a single positional sequence so the
+  // virtualizer can address every visible thing (header or row) by index.
+  // In group-by-ticker mode each ticker header gets its own item; the flat
+  // mode is just the row sequence.
+  type VirtualItem = { kind: "header"; ticker: string; count: number } | { kind: "row"; row: Row };
+  const virtualItems: VirtualItem[] = useMemo(() => {
+    if (groupByTicker) {
+      return tickerGroups.flatMap(([tk, rs]): VirtualItem[] => [
+        { kind: "header", ticker: tk, count: rs.length },
+        ...rs.map((r): VirtualItem => ({ kind: "row", row: r })),
+      ]);
+    }
+    return rows.map((r): VirtualItem => ({ kind: "row", row: r }));
+  }, [groupByTicker, tickerGroups, rows]);
+
+  const listRef = useRef<HTMLDivElement>(null);
+  const virtualizer = useWindowVirtualizer({
+    count: virtualItems.length,
+    estimateSize: (i) => (virtualItems[i]?.kind === "header" ? 40 : 180),
+    overscan: 8,
+    scrollMargin: listRef.current?.offsetTop ?? 0,
+  });
 
   const toggleCat = (c: string) =>
     setActiveCats((prev) => {
@@ -729,8 +768,8 @@ export default function Findings() {
           <div className="relative flex-1 min-w-[200px]">
             <Search className="w-4 h-4 absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground" />
             <Input
-              value={q}
-              onChange={(e) => setQ(e.target.value)}
+              value={qInput}
+              onChange={(e) => setQInput(e.target.value)}
               placeholder="Search findings or ticker…"
               className="pl-8"
               data-testid="input-findings-search"
@@ -807,22 +846,40 @@ export default function Findings() {
                   : "No findings yet. Fetch filings on the Fetch Filings page, then review them."}
           </p>
         </Card>
-      ) : groupByTicker ? (
-        <div className="space-y-6">
-          {tickerGroups.map(([tk, rs]) => (
-            <div key={tk} className="space-y-2">
-              <div className="flex items-center gap-2 border-b pb-1.5">
-                <span className="font-mono font-semibold text-sm">{tk}</span>
-                <Badge variant="secondary" className="text-[10px]">
-                  {rs.length} finding{rs.length !== 1 ? "s" : ""}
-                </Badge>
-              </div>
-              {rs.map(renderRow)}
-            </div>
-          ))}
-        </div>
       ) : (
-        <div className="space-y-2">{rows.map(renderRow)}</div>
+        // Virtualized list: only the items in view (plus overscan) are mounted.
+        // Using a window-bound virtualizer so the page still scrolls naturally
+        // and the surrounding chrome (filters, header) scrolls with it.
+        <div ref={listRef} style={{ position: "relative", height: virtualizer.getTotalSize() }}>
+          {virtualizer.getVirtualItems().map((v) => {
+            const item = virtualItems[v.index];
+            return (
+              <div
+                key={v.key}
+                ref={virtualizer.measureElement}
+                data-index={v.index}
+                style={{
+                  position: "absolute",
+                  top: 0,
+                  left: 0,
+                  width: "100%",
+                  transform: `translateY(${v.start - (listRef.current?.offsetTop ?? 0)}px)`,
+                }}
+              >
+                {item.kind === "header" ? (
+                  <div className="flex items-center gap-2 border-b pb-1.5 pt-4 mb-2">
+                    <span className="font-mono font-semibold text-sm">{item.ticker}</span>
+                    <Badge variant="secondary" className="text-[10px]">
+                      {item.count} finding{item.count !== 1 ? "s" : ""}
+                    </Badge>
+                  </div>
+                ) : (
+                  <div className="pb-2">{renderRow(item.row)}</div>
+                )}
+              </div>
+            );
+          })}
+        </div>
       )}
 
       <AlertDialog open={confirmReview} onOpenChange={setConfirmReview}>

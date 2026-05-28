@@ -668,6 +668,15 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     res.json(stats);
   });
 
+  // Constant-size progress poll — both pages use this to detect run activity +
+  // changes without re-fetching the full filings list. lastReviewedAt advances
+  // each time a new review lands, so the client can lazily refetch row data
+  // only when there's actually something new to show.
+  app.get("/api/filings/progress", requireAuth, async (_req, res) => {
+    const progress = await storage.getFilingsProgress();
+    res.json(progress);
+  });
+
   // Paginated/filterable/sortable filings — push filter/sort/pagination to SQL
   // so the client doesn't ship the whole corpus over the wire to render a page.
   app.get("/api/filings/page", requireAuth, async (req, res) => {

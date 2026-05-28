@@ -579,6 +579,45 @@ export class DatabaseStorage {
     return ids.length;
   }
 
+  // Tiny aggregate intended for fast polling. Carries enough signal for the
+  // Fetch & Review and Findings pages to detect activity (rendering /
+  // reviewing in flight) and changes (lastReviewedAt advances when a new
+  // review lands) without shipping any row data.
+  async getFilingsProgress(): Promise<{
+    totalCount: number;
+    rendering: number;
+    renderError: number;
+    pendingReview: number;
+    reviewing: number;
+    doneReview: number;
+    reviewError: number;
+    lastReviewedAt: string | null;
+  }> {
+    const result = await pool.query(`
+      SELECT
+        COUNT(*) as total_count,
+        COUNT(*) FILTER (WHERE status = 'rendering') as rendering,
+        COUNT(*) FILTER (WHERE status = 'error') as render_error,
+        COUNT(*) FILTER (WHERE review_status = 'pending') as pending_review,
+        COUNT(*) FILTER (WHERE review_status = 'reviewing') as reviewing,
+        COUNT(*) FILTER (WHERE review_status = 'done') as done_review,
+        COUNT(*) FILTER (WHERE review_status = 'error') as review_error,
+        MAX(reviewed_at) as last_reviewed_at
+      FROM filings
+    `);
+    const row = result.rows[0];
+    return {
+      totalCount: parseInt(row.total_count),
+      rendering: parseInt(row.rendering),
+      renderError: parseInt(row.render_error),
+      pendingReview: parseInt(row.pending_review),
+      reviewing: parseInt(row.reviewing),
+      doneReview: parseInt(row.done_review),
+      reviewError: parseInt(row.review_error),
+      lastReviewedAt: row.last_reviewed_at ?? null,
+    };
+  }
+
   // Team-wide stats (shared corpus).
   async getFilingStats(): Promise<{ totalCount: number; completeCount: number; errorCount: number; totalSizeMb: number; tickers: string[]; filingTypes: string[] }> {
     const countResult = await pool.query(`
