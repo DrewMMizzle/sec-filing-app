@@ -133,6 +133,15 @@ export default function FetchFilings() {
   });
   const reviewEnabled = config?.reviewEnabled ?? false;
 
+  // A long-running fetch can briefly have no filings in "rendering" yet — the
+  // data-driven refetchInterval below would idle in that gap. This flag bridges
+  // it so polling keeps running while the request is in flight, without a
+  // second setInterval competing with React Query's own polling. Declared above
+  // the usage query because TanStack Query invokes refetchInterval synchronously
+  // during the initial hook call to schedule the first timer — reading it here
+  // before declaration would be a TDZ error in production (minified to "R").
+  const [fetchInFlight, setFetchInFlight] = useState(false);
+
   // Current Claude spend + cap, so we can warn before a big run and flag pauses.
   const { data: usage } = useQuery<{
     reviewedCount: number;
@@ -184,11 +193,6 @@ export default function FetchFilings() {
       return next;
     });
 
-  // A long-running fetch can briefly have no filings in "rendering" yet — the
-  // data-driven refetchInterval below would idle in that gap. This flag bridges
-  // it so polling keeps running while the request is in flight, without a
-  // second setInterval competing with React Query's own polling.
-  const [fetchInFlight, setFetchInFlight] = useState(false);
   const budgetMutation = useMutation<{ budgetUsd: number | null }, Error, number | null>({
     mutationFn: async (budgetUsd) => {
       const res = await apiRequest("POST", "/api/review/budget", { budgetUsd });
