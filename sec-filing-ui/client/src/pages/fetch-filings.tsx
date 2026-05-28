@@ -268,12 +268,27 @@ export default function FetchFilings() {
     enabled: selectedWatchlist !== "all",
   });
 
+  // Parse the per-ticker filingTypes column defensively. It's stored as a
+  // JSON string in Postgres but a malformed value (corrupted row, hand-edited
+  // entry, schema drift) used to take the whole route down with an uncaught
+  // SyntaxError during render and a blank screen with no console output.
+  const parseFilingTypes = (raw: unknown): string[] => {
+    if (Array.isArray(raw)) return raw as string[];
+    if (typeof raw !== "string" || raw.trim() === "") return [];
+    try {
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  };
+
   const displayTickers = selectedWatchlist === "all"
     ? allTickers
     : (watchlistTickersQuery.data?.tickers || []).map((t: any) => ({
         ticker: t.ticker,
         cik: t.cik,
-        filingTypes: typeof t.filingTypes === "string" ? JSON.parse(t.filingTypes) : t.filingTypes,
+        filingTypes: parseFilingTypes(t.filingTypes),
       }));
 
   // Tickers visible after the in-list search filter

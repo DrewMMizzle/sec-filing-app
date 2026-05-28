@@ -6,6 +6,7 @@ import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
 import { AppSidebar } from "@/components/app-sidebar";
+import { ErrorBoundary } from "@/components/error-boundary";
 import { AuthProvider, useAuth } from "@/hooks/use-auth";
 import Home from "@/pages/home";
 import WatchlistPage from "@/pages/watchlist";
@@ -86,15 +87,17 @@ function AppRouter() {
 
 export default function App() {
   return (
-    <QueryClientProvider client={queryClient}>
-      <TooltipProvider>
-        <Router hook={useHashLocation}>
-          <AuthProvider>
-            <AppRouter />
-            <Toaster />
-          </AuthProvider>
-        </Router>
-      </TooltipProvider>
-    </QueryClientProvider>
+    <ErrorBoundary>
+      <QueryClientProvider client={queryClient}>
+        <TooltipProvider>
+          <Router hook={useHashLocation}>
+            <AuthProvider>
+              <AppRouter />
+              <Toaster />
+            </AuthProvider>
+          </Router>
+        </TooltipProvider>
+      </QueryClientProvider>
+    </ErrorBoundary>
   );
 }
