@@ -13,6 +13,15 @@ type Turn = {
   // Citations attached to assistant turns so [TICKER FORM DATE] strings can be
   // rendered as clickable links to the underlying PDF.
   citations?: Citation[];
+  // Per-answer metadata (cost, corpus stats) shown beneath the response.
+  meta?: AssistantMeta;
+};
+type AssistantMeta = {
+  costUsd: number;
+  corpusFindingsCount: number;
+  corpusFilingsCount: number;
+  truncated: boolean;
+  scopedTickers?: string[];
 };
 type Citation = {
   ticker: string;
@@ -154,7 +163,6 @@ export default function Ask() {
   const { toast } = useToast();
   const [turns, setTurns] = useState<Turn[]>([]);
   const [input, setInput] = useState("");
-  const [lastMeta, setLastMeta] = useState<ChatResponse | null>(null);
   const scrollerRef = useRef<HTMLDivElement>(null);
 
   const { data: config } = useQuery<{ reviewEnabled: boolean }>({
@@ -174,9 +182,19 @@ export default function Ask() {
     onSuccess: (data, messages) => {
       setTurns([
         ...messages,
-        { role: "assistant", content: data.answer, citations: data.citations ?? [] },
+        {
+          role: "assistant",
+          content: data.answer,
+          citations: data.citations ?? [],
+          meta: {
+            costUsd: data.costUsd,
+            corpusFindingsCount: data.corpusFindingsCount,
+            corpusFilingsCount: data.corpusFilingsCount,
+            truncated: data.truncated,
+            scopedTickers: data.scopedTickers,
+          },
+        },
       ]);
-      setLastMeta(data);
     },
     onError: (err) => {
       toast({ title: "Couldn't get an answer", description: err.message, variant: "destructive" });
@@ -203,7 +221,6 @@ export default function Ask() {
 
   const reset = () => {
     setTurns([]);
-    setLastMeta(null);
     setInput("");
   };
 
@@ -280,6 +297,16 @@ export default function Ask() {
               ) : (
                 <div className="text-sm">
                   {renderAnswer(t.content, buildCitationMap(t.citations ?? []))}
+                  {t.meta && (
+                    <p className="text-[10px] text-muted-foreground/70 mt-1.5" data-testid="answer-cost">
+                      {t.meta.corpusFindingsCount} findings searched across{" "}
+                      {t.meta.corpusFilingsCount} filing{t.meta.corpusFilingsCount !== 1 ? "s" : ""}
+                      {t.meta.scopedTickers && t.meta.scopedTickers.length > 0 && (
+                        <> · scoped to <span className="font-mono">{t.meta.scopedTickers.join(", ")}</span></>
+                      )}
+                      {t.meta.truncated && " · older filings omitted"} · cost ${t.meta.costUsd.toFixed(3)}
+                    </p>
+                  )}
                 </div>
               )}
             </div>
@@ -296,17 +323,6 @@ export default function Ask() {
               Searching the findings…
             </div>
           </div>
-        )}
-
-        {lastMeta && !askMutation.isPending && (
-          <p className="text-[10px] text-muted-foreground/70 pl-10">
-            {lastMeta.corpusFindingsCount} findings searched across {lastMeta.corpusFilingsCount}{" "}
-            filing{lastMeta.corpusFilingsCount !== 1 ? "s" : ""}
-            {lastMeta.scopedTickers && lastMeta.scopedTickers.length > 0 && (
-              <> · scoped to <span className="font-mono">{lastMeta.scopedTickers.join(", ")}</span></>
-            )}
-            {lastMeta.truncated && " · older filings omitted"} · cost ${lastMeta.costUsd.toFixed(3)}
-          </p>
         )}
       </div>
 
