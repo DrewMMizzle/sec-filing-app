@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useState } from "react";
 import { Link } from "wouter";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { queryClient, apiRequest, API_BASE } from "@/lib/queryClient";
@@ -84,17 +84,6 @@ type FetchResult = {
   events: any[];
 };
 
-type FilingsProgress = {
-  totalCount: number;
-  rendering: number;
-  renderError: number;
-  pendingReview: number;
-  reviewing: number;
-  doneReview: number;
-  reviewError: number;
-  lastReviewedAt: string | null;
-};
-
 export default function FetchFilings() {
   const { toast } = useToast();
 
@@ -156,11 +145,14 @@ export default function FetchFilings() {
     refetchInterval: (query) => {
       const data = query.state.data as { paused?: boolean } | undefined;
       if (fetchInFlight) return 5000;
-      // Read activity from the progress cache so we don't have to keep the
-      // full filings list around just for this decision.
-      const p = queryClient.getQueryData(["/api/filings/progress"]) as FilingsProgress | undefined;
-      const rendering = (p?.rendering ?? 0) > 0;
-      const reviewing = (p?.pendingReview ?? 0) + (p?.reviewing ?? 0) > 0;
+      // Read filings from the cache to decide whether a run is in flight. Poll
+      // through the render phase too so spend starts ticking as soon as the
+      // first reviews run. Fast while active; slow (not stopped) while paused.
+      const rows = queryClient.getQueryData<Filing[]>(["/api/filings?slim=true"]);
+      const rendering = rows?.some((f) => f.status === "rendering");
+      const reviewing = rows?.some(
+        (f) => f.reviewStatus === "pending" || f.reviewStatus === "reviewing",
+      );
       if (rendering) return 5000;
       if (reviewing) return data?.paused ? 30000 : 5000;
       return false;
@@ -239,43 +231,31 @@ export default function FetchFilings() {
     budgetMutation.mutate(n);
   };
 
-  // Tiny progress poll — constant-size payload that drives activity detection
-  // (rendering / reviewing in flight) without shipping any row data. Picks up
-  // a new run within ~4s of it starting via fetchInFlight.
-  const { data: progress } = useQuery<FilingsProgress>({
-    queryKey: ["/api/filings/progress"],
-    refetchInterval: (query) => {
-      if (fetchInFlight) return 4000;
-      const p = query.state.data as FilingsProgress | undefined;
-      const active = (p?.rendering ?? 0) + (p?.pendingReview ?? 0) + (p?.reviewing ?? 0) > 0;
-      if (!active) return false;
-      const isPaused =
-        (queryClient.getQueryData(["/api/review/usage"]) as { paused?: boolean } | undefined)?.paused ?? false;
-      return isPaused ? 30000 : 4000;
-    },
-  });
-
-  // Full row data (slim — no heavy findings JSON). Not polled directly; the
-  // progress poll above invalidates this when something changes, so we
-  // refetch row data only when there's actually new state to display.
+  // Use the slim list (no heavy findings JSON) so the polled payload stays
+  // small. Inline finding details are fetched lazily per-row via a detail
+  // endpoint when the row is expanded.
   const { data: existingFilings = [], refetch: refetchFilings } = useQuery<Filing[]>({
     queryKey: ["/api/filings?slim=true"],
-    refetchInterval: false,
+    // Poll while a run is active so render + review progress appear live. Track
+    // the render phase too (not just reviews). When the spend cap pauses the
+    // review queue, slow the poll instead of stopping so the page recovers on
+    // its own if the team-wide cap is raised elsewhere.
+    refetchInterval: (query) => {
+      if (fetchInFlight) return 4000;
+      const rows = query.state.data as Filing[] | undefined;
+      const rendering = rows?.some((f) => f.status === "rendering");
+      const reviewing = rows?.some(
+        (f) => f.reviewStatus === "pending" || f.reviewStatus === "reviewing",
+      );
+      if (rendering) return 4000;
+      if (reviewing) {
+        const isPaused =
+          (queryClient.getQueryData(["/api/review/usage"]) as { paused?: boolean } | undefined)?.paused ?? false;
+        return isPaused ? 30000 : 4000;
+      }
+      return false;
+    },
   });
-
-  // Drive list refetches off progress transitions. A composite signature
-  // covers status flips, review completions, and render errors so any
-  // relevant change wakes the list, but stable polls (paused or idle) don't.
-  const progressSig = progress
-    ? `${progress.rendering}|${progress.pendingReview}|${progress.reviewing}|${progress.doneReview}|${progress.renderError}|${progress.reviewError}|${progress.lastReviewedAt ?? ""}`
-    : "";
-  const lastProgressSig = useRef(progressSig);
-  useEffect(() => {
-    if (progressSig && progressSig !== lastProgressSig.current) {
-      lastProgressSig.current = progressSig;
-      queryClient.invalidateQueries({ queryKey: ["/api/filings?slim=true"], exact: true });
-    }
-  }, [progressSig]);
 
   // Filter tickers by selected watchlist
   const watchlistTickersQuery = useQuery<any>({
@@ -349,7 +329,6 @@ export default function FetchFilings() {
       setFetchInFlight(true);
       // Kick the queries immediately so the user sees activity instead of
       // waiting up to refetchInterval for the first progress update.
-      queryClient.invalidateQueries({ queryKey: ["/api/filings/progress"] });
       queryClient.invalidateQueries({ queryKey: ["/api/filings?slim=true"] });
       queryClient.invalidateQueries({ queryKey: ["/api/review/usage"] });
     },
@@ -370,7 +349,6 @@ export default function FetchFilings() {
     onSettled: () => {
       // Hand off to the queries' own progress-aware polling.
       setFetchInFlight(false);
-      queryClient.invalidateQueries({ queryKey: ["/api/filings/progress"] });
       refetchFilings();
       queryClient.invalidateQueries({ queryKey: ["/api/review/usage"] });
     },
