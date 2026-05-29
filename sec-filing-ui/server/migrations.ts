@@ -106,6 +106,21 @@ const MIGRATIONS: Migration[] = [
       CREATE INDEX IF NOT EXISTS idx_watchlists_user ON watchlists(user_id);
     `,
   },
+  {
+    version: 2,
+    name: "mdna_digest",
+    sql: `
+      ALTER TABLE filings ADD COLUMN IF NOT EXISTS mdna_status TEXT;
+      ALTER TABLE filings ADD COLUMN IF NOT EXISTS mdna_digest TEXT;
+      ALTER TABLE filings ADD COLUMN IF NOT EXISTS mdna_error TEXT;
+      ALTER TABLE filings ADD COLUMN IF NOT EXISTS mdna_analyzed_at TEXT;
+      ALTER TABLE filings ADD COLUMN IF NOT EXISTS mdna_input_tokens INTEGER;
+      ALTER TABLE filings ADD COLUMN IF NOT EXISTS mdna_output_tokens INTEGER;
+      ALTER TABLE filings ADD COLUMN IF NOT EXISTS mdna_cache_read_tokens INTEGER;
+      ALTER TABLE filings ADD COLUMN IF NOT EXISTS mdna_cache_creation_tokens INTEGER;
+      CREATE INDEX IF NOT EXISTS idx_filings_mdna_status ON filings(mdna_status);
+    `,
+  },
 ];
 
 export async function runMigrations(pool: Pool): Promise<{ applied: number[] }> {

@@ -10,6 +10,7 @@ import { hashPassword, verifyPassword, createSession, clearSession, requireAuth 
 import { ensureSP500Seeded } from "./seed-sp500";
 import { getSecTickerIndex } from "./sec-index";
 import { isReviewEnabled, kickReviewProcessor, reviewCostUsd } from "./review";
+import { analyzeMdna, isMdnaEligible } from "./mdna";
 import { chatAboutFindings, chatAboutFiling } from "./chat";
 import { findPageForQuote } from "./pdf-locate";
 import { compareFilings, SECTION_LABELS, type SectionKey } from "./compare";
@@ -1112,6 +1113,90 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     await storage.markFilingForReview(accession);
     kickReviewProcessor().catch((err) => console.error("Review processor failed:", err));
     res.json({ ok: true });
+  });
+
+  // ─── MD&A digest (analyst view) ──────────────────────────
+
+  function mdnaCost(f: {
+    mdnaInputTokens: number | null;
+    mdnaOutputTokens: number | null;
+    mdnaCacheReadTokens: number | null;
+    mdnaCacheCreationTokens: number | null;
+  }): number | null {
+    if (f.mdnaInputTokens == null && f.mdnaOutputTokens == null) return null;
+    return (
+      Math.round(
+        reviewCostUsd({
+          inputTokens: f.mdnaInputTokens ?? 0,
+          outputTokens: f.mdnaOutputTokens ?? 0,
+          cacheReadTokens: f.mdnaCacheReadTokens ?? 0,
+          cacheCreationTokens: f.mdnaCacheCreationTokens ?? 0,
+        }) * 10000,
+      ) / 10000
+    );
+  }
+
+  function parseDigest(raw: string | null): unknown {
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+
+  // List every rendered 10-K/10-Q with its MD&A digest state, for the MD&A tab.
+  app.get("/api/mdna", requireAuth, async (_req, res) => {
+    const filings = await storage.getFilings({ status: "complete" });
+    const items = filings
+      .filter((f) => isMdnaEligible(f.filingType))
+      .map((f) => ({
+        accession: f.accessionNumber,
+        ticker: f.ticker,
+        form: f.filingType,
+        date: f.filingDate,
+        mdnaStatus: f.mdnaStatus,
+        analyzedAt: f.mdnaAnalyzedAt,
+        error: f.mdnaError,
+        costUsd: mdnaCost(f),
+        digest: parseDigest(f.mdnaDigest),
+      }));
+    res.json(items);
+  });
+
+  // Generate (or regenerate) the MD&A digest for one filing. Synchronous —
+  // the analyst is waiting on it. Tracked in its own mdna_* columns, so it
+  // never counts against the editorial review spend cap.
+  app.post("/api/filings/:accession/mdna", requireAuth, async (req, res) => {
+    if (!isReviewEnabled()) {
+      return res
+        .status(409)
+        .json({ error: "Claude is not configured (ANTHROPIC_API_KEY is not set)." });
+    }
+    const accession = req.params.accession as string;
+    const filing = await storage.getFilingByAccession(accession);
+    if (!filing) return res.status(404).json({ error: "Filing not found" });
+    if (!isMdnaEligible(filing.filingType)) {
+      return res.status(400).json({ error: "MD&A analysis only applies to 10-K and 10-Q filings." });
+    }
+    if (filing.status !== "complete") {
+      return res.status(400).json({ error: "Filing isn't rendered yet — fetch and render it first." });
+    }
+    await storage.setFilingMdnaStatus(accession, "analyzing");
+    try {
+      const result = await analyzeMdna(filing);
+      await storage.setFilingMdnaResult(accession, result.digest, result.usage);
+      res.json({
+        digest: result.digest,
+        costUsd: Math.round(reviewCostUsd(result.usage) * 10000) / 10000,
+        analyzedAt: new Date().toISOString(),
+      });
+    } catch (e: any) {
+      const message = e?.message || "MD&A analysis failed";
+      await storage.setFilingMdnaError(accession, String(message));
+      console.error("MD&A analysis failed:", message);
+      res.status(500).json({ error: message });
+    }
   });
 
   // Download a PDF by accession number

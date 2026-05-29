@@ -77,6 +77,8 @@ function stripHeavyReviewFields(rows: Filing[]): void {
     }
     extras.findingsCount = count;
     r.reviewFindings = null;
+    // The MD&A digest JSON is likewise heavy and only rendered on its own tab.
+    r.mdnaDigest = null;
   }
 }
 
@@ -534,6 +536,44 @@ export class DatabaseStorage {
     await db
       .update(filings)
       .set({ reviewStatus: "error", reviewError: message, reviewedAt: new Date().toISOString() })
+      .where(eq(filings.accessionNumber, accession));
+  }
+
+  // ─── MD&A digest (analyst-oriented, on demand) ──────────
+
+  async setFilingMdnaStatus(accession: string, status: string): Promise<void> {
+    await db.update(filings).set({ mdnaStatus: status }).where(eq(filings.accessionNumber, accession));
+  }
+
+  async setFilingMdnaResult(
+    accession: string,
+    digest: unknown,
+    usage?: {
+      inputTokens: number;
+      outputTokens: number;
+      cacheReadTokens: number;
+      cacheCreationTokens: number;
+    },
+  ): Promise<void> {
+    await db
+      .update(filings)
+      .set({
+        mdnaStatus: "done",
+        mdnaDigest: JSON.stringify(digest),
+        mdnaError: null,
+        mdnaAnalyzedAt: new Date().toISOString(),
+        mdnaInputTokens: usage?.inputTokens ?? null,
+        mdnaOutputTokens: usage?.outputTokens ?? null,
+        mdnaCacheReadTokens: usage?.cacheReadTokens ?? null,
+        mdnaCacheCreationTokens: usage?.cacheCreationTokens ?? null,
+      })
+      .where(eq(filings.accessionNumber, accession));
+  }
+
+  async setFilingMdnaError(accession: string, message: string): Promise<void> {
+    await db
+      .update(filings)
+      .set({ mdnaStatus: "error", mdnaError: message, mdnaAnalyzedAt: new Date().toISOString() })
       .where(eq(filings.accessionNumber, accession));
   }
 
