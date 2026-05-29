@@ -13,7 +13,12 @@ import { Textarea } from "@/components/ui/textarea";
 import { useToast } from "@/hooks/use-toast";
 import { Send, Loader2, MessageSquare, User } from "lucide-react";
 
-type Turn = { role: "user" | "assistant"; content: string };
+type Turn = {
+  role: "user" | "assistant";
+  content: string;
+  // Per-answer metadata shown beneath the response.
+  meta?: { costUsd: number; truncated: boolean };
+};
 type FilingChatResponse = {
   answer: string;
   costUsd: number;
@@ -46,8 +51,6 @@ export function FilingChatDialog({ open, onOpenChange, accession, ticker, form, 
   const { toast } = useToast();
   const [turns, setTurns] = useState<Turn[]>([]);
   const [input, setInput] = useState("");
-  const [lastCost, setLastCost] = useState<number | null>(null);
-  const [truncated, setTruncated] = useState(false);
   const scrollerRef = useRef<HTMLDivElement>(null);
 
   // Reset chat state when switching filings or closing.
@@ -55,8 +58,6 @@ export function FilingChatDialog({ open, onOpenChange, accession, ticker, form, 
     if (!open) {
       setTurns([]);
       setInput("");
-      setLastCost(null);
-      setTruncated(false);
     }
   }, [open]);
 
@@ -74,9 +75,14 @@ export function FilingChatDialog({ open, onOpenChange, accession, ticker, form, 
       return res.json();
     },
     onSuccess: (data, messages) => {
-      setTurns([...messages, { role: "assistant", content: data.answer }]);
-      setLastCost(data.costUsd);
-      setTruncated(data.truncated);
+      setTurns([
+        ...messages,
+        {
+          role: "assistant",
+          content: data.answer,
+          meta: { costUsd: data.costUsd, truncated: data.truncated },
+        },
+      ]);
     },
     onError: (err) => {
       toast({ title: "Couldn't get an answer", description: err.message, variant: "destructive" });
@@ -143,7 +149,15 @@ export function FilingChatDialog({ open, onOpenChange, accession, ticker, form, 
                     {t.content}
                   </p>
                 ) : (
-                  <div>{renderAnswer(t.content)}</div>
+                  <div>
+                    {renderAnswer(t.content)}
+                    {t.meta && (
+                      <p className="text-[10px] text-muted-foreground/70 mt-1.5" data-testid="filing-answer-cost">
+                        cost ${t.meta.costUsd.toFixed(3)}
+                        {t.meta.truncated && " · filing text was truncated to fit"}
+                      </p>
+                    )}
+                  </div>
                 )}
               </div>
             </div>
@@ -158,12 +172,6 @@ export function FilingChatDialog({ open, onOpenChange, accession, ticker, form, 
                 Reading the filing…
               </div>
             </div>
-          )}
-          {lastCost !== null && !askMutation.isPending && (
-            <p className="text-[10px] text-muted-foreground/70 pl-10">
-              cost ${lastCost.toFixed(3)}
-              {truncated && " · filing text was truncated to fit"}
-            </p>
           )}
         </div>
 
