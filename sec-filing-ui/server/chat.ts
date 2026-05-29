@@ -83,9 +83,12 @@ function detectScopedTickers(
 // for chat history, thinking, and the answer.
 const MAX_CORPUS_CHARS = 1_600_000;
 
-// Cap a single filing's text the same way the review does (avoid runaway
-// context on giant 10-Ks).
-const MAX_FILING_CHARS = 400_000;
+// Cap a single filing's text for the deep-dive chat. Sized to fit the full
+// primary document of essentially every 10-K/10-Q — including the complete
+// MD&A (Item 7 in a 10-K, Item 2 in a 10-Q) — so MD&A questions are never
+// answered against a truncated section. Relies on the 1M-token context window
+// enabled via the beta header in getAnthropicClient().
+const MAX_FILING_CHARS = 1_200_000;
 
 // Bound any single chat request — same rationale as the review timeout.
 const CHAT_TIMEOUT_MS = 3 * 60 * 1000;

@@ -26,7 +26,11 @@ const SECTION_MAX_CHARS = 80_000;
 // Extract a named section from filing text. Heuristic: find each occurrence of
 // the heading, capture to the next "Item N" header, and keep the longest
 // capture (the real section, not the short table-of-contents entry).
-export function extractSection(text: string, key: SectionKey): string | null {
+export function extractSection(
+  text: string,
+  key: SectionKey,
+  maxChars: number = SECTION_MAX_CHARS,
+): string | null {
   const heading = new RegExp(SECTION_HEADINGS[key].source, "gi");
   let best = "";
   let m: RegExpExecArray | null;
@@ -41,7 +45,7 @@ export function extractSection(text: string, key: SectionKey): string | null {
   // The longest candidate filters out short table-of-contents matches; this
   // floor just rejects the case where only a TOC line exists.
   if (best.length < 80) return null;
-  return best.slice(0, SECTION_MAX_CHARS);
+  return best.slice(0, maxChars);
 }
 
 export type DiffSegment = { value: string; added?: boolean; removed?: boolean };

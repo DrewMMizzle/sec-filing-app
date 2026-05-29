@@ -70,6 +70,16 @@ export const filings = pgTable("filings", {
   reviewOutputTokens: integer("review_output_tokens"),
   reviewCacheReadTokens: integer("review_cache_read_tokens"),
   reviewCacheCreationTokens: integer("review_cache_creation_tokens"),
+  // Analyst-oriented MD&A digest (10-K Item 7 / 10-Q Item 2). Generated on
+  // demand, separate from the editorial review above.
+  mdnaStatus: text("mdna_status"),               // null (not run) | analyzing | done | error
+  mdnaDigest: text("mdna_digest"),               // JSON object {overview, revenue_drivers, margins, segments, guidance, other}
+  mdnaError: text("mdna_error"),
+  mdnaAnalyzedAt: text("mdna_analyzed_at"),
+  mdnaInputTokens: integer("mdna_input_tokens"),
+  mdnaOutputTokens: integer("mdna_output_tokens"),
+  mdnaCacheReadTokens: integer("mdna_cache_read_tokens"),
+  mdnaCacheCreationTokens: integer("mdna_cache_creation_tokens"),
 }, (table) => [
   index("idx_filings_ticker").on(table.ticker),
   index("idx_filings_status").on(table.status),
