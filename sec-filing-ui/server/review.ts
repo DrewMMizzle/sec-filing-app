@@ -48,7 +48,14 @@ export function isReviewEnabled(): boolean {
 
 let _client: Anthropic | null = null;
 export function getAnthropicClient(): Anthropic {
-  if (!_client) _client = new Anthropic();
+  // Opt into the Opus 4.x 1M-token context window so a full filing (entire
+  // MD&A included) can be sent without truncation. Requires the account to
+  // have 1M-context access; harmless otherwise for requests under 200k tokens.
+  if (!_client) {
+    _client = new Anthropic({
+      defaultHeaders: { "anthropic-beta": "context-1m-2025-08-07" },
+    });
+  }
   return _client;
 }
 function client(): Anthropic {
