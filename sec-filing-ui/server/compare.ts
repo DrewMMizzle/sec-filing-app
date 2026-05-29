@@ -18,14 +18,17 @@ const SECTION_HEADINGS: Record<SectionKey, RegExp> = {
   legal: /legal\s+proceedings/i,
 };
 
-// A generic "Item N." header used to bound the end of a captured section.
-const NEXT_ITEM = /\bitem\s+\d+[a-z]?\b\.?/gi;
+// A section-ending "Item N" header. Anchored to the start of a line so an
+// inline cross-reference (e.g. "...the financial statements in Part I, Item 1
+// of this report...") — which a 10-Q's MD&A almost always opens with — is NOT
+// mistaken for the next section, which would truncate the capture to one line.
+const NEXT_ITEM = /\n[^\S\r\n]*item\s+\d+[a-z]?\b[.:)\s]/gi;
 
 const SECTION_MAX_CHARS = 80_000;
 
 // Extract a named section from filing text. Heuristic: find each occurrence of
-// the heading, capture to the next "Item N" header, and keep the longest
-// capture (the real section, not the short table-of-contents entry).
+// the heading, capture to the next line-leading "Item N" header, and keep the
+// longest capture (the real section, not the short table-of-contents entry).
 export function extractSection(
   text: string,
   key: SectionKey,
@@ -38,7 +41,7 @@ export function extractSection(
     const from = m.index;
     NEXT_ITEM.lastIndex = from + 40;
     const next = NEXT_ITEM.exec(text);
-    const end = next ? next.index : Math.min(text.length, from + 120_000);
+    const end = next ? next.index : Math.min(text.length, from + maxChars);
     const body = text.slice(from, end).trim();
     if (body.length > best.length) best = body;
   }
