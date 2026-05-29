@@ -61,6 +61,7 @@ const MDNA_SCHEMA = {
           detail: { type: "string", description: "Management's explanation, quoting concrete language/numbers." },
         },
         required: ["factor", "impact", "detail"],
+        additionalProperties: false,
       },
     },
     margins: {
@@ -71,6 +72,7 @@ const MDNA_SCHEMA = {
         commentary: { type: "string", description: "Other cost/margin notes (input costs, opex leverage, pricing). Empty if none." },
       },
       required: ["gross", "operating", "commentary"],
+      additionalProperties: false,
     },
     segments: {
       type: "array",
@@ -84,6 +86,7 @@ const MDNA_SCHEMA = {
           commentary: { type: "string", description: "What drove the segment." },
         },
         required: ["name", "revenue", "profit", "commentary"],
+        additionalProperties: false,
       },
     },
     guidance: {
@@ -97,6 +100,7 @@ const MDNA_SCHEMA = {
     },
   },
   required: ["available", "period", "overview", "revenue_drivers", "margins", "segments", "guidance", "other"],
+  additionalProperties: false,
 } as const;
 
 const MDNA_SYSTEM_PROMPT = `You are an equity research analyst extracting the operating story from the Management's Discussion & Analysis (MD&A) of an SEC filing (10-K Item 7 or 10-Q Item 2). Your audience is buy-side and sell-side analysts who want to know what actually drove the numbers this period.
