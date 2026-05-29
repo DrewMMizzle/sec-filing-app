@@ -9,8 +9,13 @@ import { fileURLToPath } from "url";
 import { hashPassword, verifyPassword, createSession, clearSession, requireAuth } from "./auth";
 import { ensureSP500Seeded } from "./seed-sp500";
 import { getSecTickerIndex } from "./sec-index";
-import { isReviewEnabled, kickReviewProcessor, reviewCostUsd } from "./review";
+import { isReviewEnabled, kickReviewProcessor, reviewCostUsd, requestCancelReview, isReviewProcessing } from "./review";
 import { analyzeMdna, isMdnaEligible } from "./mdna";
+import type { ChildProcess } from "child_process";
+
+// Tracks the in-flight fetch/render pipeline child so a user cancel can kill
+// it. Only one fetch runs at a time per process today (the route awaits it).
+let currentFetchChild: ChildProcess | null = null;
 import { chatAboutFindings, chatAboutFiling } from "./chat";
 import { findPageForQuote } from "./pdf-locate";
 import { compareFilings, SECTION_LABELS, type SectionKey } from "./compare";
@@ -102,6 +107,7 @@ function runFetchPipeline(
       cwd: PIPELINE_ROOT,
       env: { ...process.env, PYTHONUNBUFFERED: "1" },
     });
+    currentFetchChild = child;
     child.stdin.write(input);
     child.stdin.end();
 
@@ -206,6 +212,7 @@ function runFetchPipeline(
     });
 
     child.on("close", (code) => {
+      if (currentFetchChild === child) currentFetchChild = null;
       if (settled) return;
       settled = true;
       clearInterval(watchdog);
@@ -225,6 +232,7 @@ function runFetchPipeline(
     });
 
     child.on("error", (err) => {
+      if (currentFetchChild === child) currentFetchChild = null;
       if (settled) return;
       settled = true;
       clearInterval(watchdog);
@@ -915,7 +923,35 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     const budgetUsd = await storage.getReviewBudgetUsd();
     const pendingCount = await storage.getPendingReviewCount();
     const paused = budgetUsd !== null && rawCost >= budgetUsd && pendingCount > 0;
-    res.json({ ...u, costUsd, budgetUsd, pendingCount, paused });
+    const processing = isReviewProcessing();
+    const fetching = currentFetchChild !== null;
+    res.json({ ...u, costUsd, budgetUsd, pendingCount, paused, processing, fetching });
+  });
+
+  // Cancel an in-flight fetch+render+review run. Kills the Python pipeline
+  // child if one is running, aborts the in-flight Claude review API call, and
+  // drops any still-queued filings back to "not requested" so the next kick
+  // doesn't pick them up automatically.
+  app.post("/api/run/cancel", requireAuth, async (_req, res) => {
+    let fetchKilled = false;
+    if (currentFetchChild) {
+      const child = currentFetchChild;
+      try {
+        child.kill("SIGTERM");
+        // Escalate if the child doesn't exit promptly on its own.
+        setTimeout(() => {
+          if (!child.killed) {
+            try { child.kill("SIGKILL"); } catch { /* already gone */ }
+          }
+        }, 3000);
+        fetchKilled = true;
+      } catch (err: any) {
+        console.error("[cancel] Failed to signal fetch child:", err?.message || err);
+      }
+    }
+    const { abortedInFlight } = requestCancelReview();
+    const pendingCleared = await storage.clearPendingReviews();
+    res.json({ ok: true, fetchKilled, abortedInFlight, pendingCleared });
   });
 
   // Set or clear the team-wide review spend cap (USD). Pass null/empty to clear.
