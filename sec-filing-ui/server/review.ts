@@ -167,9 +167,12 @@ async function callClaude(filing: Filing, text: string): Promise<ReviewResult> {
     (body.trim() ? `Filing text:\n${body}` : `Filing text: [no extractable text]`);
 
   // Bound each review so a single stalled Claude call can't wedge the whole
-  // queue (the processor awaits this serially).
+  // queue (the processor awaits this serially). The same controller is also
+  // tracked module-level so a user-initiated cancel can abort the in-flight
+  // Claude API call immediately.
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), REVIEW_TIMEOUT_MS);
+  currentReviewAbort = controller;
   let message;
   try {
     const stream = client().messages.stream(
@@ -189,11 +192,13 @@ async function callClaude(filing: Filing, text: string): Promise<ReviewResult> {
     message = await stream.finalMessage();
   } catch (err: any) {
     if (controller.signal.aborted) {
+      if (cancelRequested) throw new Error("Review canceled");
       throw new Error(`Review timed out after ${Math.round(REVIEW_TIMEOUT_MS / 1000)}s`);
     }
     throw err;
   } finally {
     clearTimeout(timer);
+    if (currentReviewAbort === controller) currentReviewAbort = null;
   }
 
   const textBlock = message.content.find((b) => b.type === "text");
@@ -229,6 +234,13 @@ async function reviewOne(filing: Filing): Promise<void> {
     const result = await callClaude(filing, text);
     await storage.setFilingReviewResult(filing.accessionNumber, result, result.usage);
   } catch (err: any) {
+    if (cancelRequested) {
+      // User-initiated cancel — drop the filing back to "not requested" so it
+      // doesn't show up as an error and isn't auto-reprocessed next kick.
+      await storage.setFilingReviewStatus(filing.accessionNumber, null);
+      console.log(`[review] Canceled mid-review: ${filing.accessionNumber}`);
+      return;
+    }
     console.error(`[review] Failed for ${filing.accessionNumber}:`, err?.message || err);
     await storage.setFilingReviewError(filing.accessionNumber, String(err?.message || err));
   }
@@ -246,6 +258,24 @@ export async function resumeReviews(): Promise<void> {
 }
 
 let processing = false;
+// User-initiated cancel signal — checked between filings and used to abort the
+// in-flight Claude API call. Reset at the start of each fresh drain so a prior
+// cancel doesn't poison a future run.
+let cancelRequested = false;
+let currentReviewAbort: AbortController | null = null;
+
+export function isReviewProcessing(): boolean {
+  return processing;
+}
+
+// Stop the in-flight Claude review call and halt the drain. The route also
+// clears the pending queue so cancel truly abandons the run.
+export function requestCancelReview(): { canceled: boolean; abortedInFlight: boolean } {
+  const abortedInFlight = currentReviewAbort !== null;
+  cancelRequested = true;
+  currentReviewAbort?.abort();
+  return { canceled: true, abortedInFlight };
+}
 
 // Drain pending filings sequentially. Safe to call repeatedly; only one drain
 // runs at a time per process. No-op when no API key is configured. If a team
@@ -255,8 +285,13 @@ let processing = false;
 export async function kickReviewProcessor(): Promise<void> {
   if (!isReviewEnabled() || processing) return;
   processing = true;
+  cancelRequested = false;
   try {
     while (true) {
+      if (cancelRequested) {
+        console.log("[review] Cancel requested — halting drain.");
+        break;
+      }
       const budget = await storage.getReviewBudgetUsd();
       if (budget !== null && reviewCostUsd(await storage.getReviewUsage()) >= budget) {
         console.log(`[review] Spend cap of $${budget} reached — pausing review queue.`);

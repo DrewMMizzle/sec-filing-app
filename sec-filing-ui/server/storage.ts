@@ -442,8 +442,18 @@ export class DatabaseStorage {
       .limit(limit);
   }
 
-  async setFilingReviewStatus(accession: string, status: string): Promise<void> {
+  async setFilingReviewStatus(accession: string, status: string | null): Promise<void> {
     await db.update(filings).set({ reviewStatus: status }).where(eq(filings.accessionNumber, accession));
+  }
+
+  // Drop every still-queued filing back to "not requested" — used when the
+  // user cancels an in-flight fetch+review run so the remaining queued items
+  // don't keep churning the moment the next kick fires.
+  async clearPendingReviews(): Promise<number> {
+    const result = await pool.query(
+      `UPDATE filings SET review_status = NULL WHERE review_status = 'pending'`,
+    );
+    return result.rowCount ?? 0;
   }
 
   async setFilingReviewResult(

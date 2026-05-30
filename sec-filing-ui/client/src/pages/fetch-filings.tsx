@@ -156,6 +156,8 @@ export default function FetchFilings() {
     budgetUsd: number | null;
     pendingCount: number;
     paused: boolean;
+    processing: boolean;
+    fetching: boolean;
   }>({
     queryKey: ["/api/review/usage"],
     refetchInterval: (query) => {
@@ -378,6 +380,38 @@ export default function FetchFilings() {
       refetchFilings();
       queryClient.invalidateQueries({ queryKey: ["/api/review/usage"] });
     },
+  });
+
+  // Cancel an in-flight fetch+review run — kills the Python pipeline child,
+  // aborts the in-flight Claude review call, and drops queued filings back to
+  // "not requested" so the next kick doesn't auto-resume the abandoned batch.
+  const cancelMutation = useMutation<
+    { fetchKilled: boolean; abortedInFlight: boolean; pendingCleared: number },
+    Error,
+    void
+  >({
+    mutationFn: async () => {
+      const res = await apiRequest("POST", "/api/run/cancel", {});
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || "Cancel failed");
+      }
+      return res.json();
+    },
+    onSuccess: (data) => {
+      const bits: string[] = [];
+      if (data.fetchKilled) bits.push("fetch stopped");
+      if (data.abortedInFlight) bits.push("in-flight review aborted");
+      if (data.pendingCleared > 0)
+        bits.push(`${data.pendingCleared} queued review${data.pendingCleared !== 1 ? "s" : ""} dropped`);
+      toast({
+        title: "Run canceled",
+        description: bits.length ? bits.join(" · ") : "Nothing was running.",
+      });
+      queryClient.invalidateQueries({ queryKey: ["/api/review/usage"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/filings?slim=true"] });
+    },
+    onError: (err) => toast({ title: "Couldn't cancel", description: err.message, variant: "destructive" }),
   });
 
   // Re-run review for a single filing whose review errored
@@ -947,6 +981,33 @@ export default function FetchFilings() {
               </>
             )}
           </Button>
+
+          {/* Cancel: visible whenever something cancelable is in flight — the
+              Python fetch child, the Claude review drain, or queued reviews. */}
+          {(fetchMutation.isPending ||
+            usage?.fetching ||
+            usage?.processing ||
+            (usage?.pendingCount ?? 0) > 0) && (
+            <Button
+              variant="destructive"
+              onClick={() => cancelMutation.mutate()}
+              disabled={cancelMutation.isPending}
+              className="w-full"
+              data-testid="button-cancel-run"
+            >
+              {cancelMutation.isPending ? (
+                <>
+                  <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                  Canceling…
+                </>
+              ) : (
+                <>
+                  <X className="w-4 h-4 mr-2" />
+                  Cancel run
+                </>
+              )}
+            </Button>
+          )}
         </div>
       </Card>
 
