@@ -278,7 +278,6 @@ export async function chatAboutFindings(history: Turn[]): Promise<ChatResult> {
       {
         model: MODEL,
         max_tokens: 4000,
-        temperature: 0,
         system: [
           { type: "text", text: CORPUS_SYSTEM_PROMPT },
           // Cache the corpus block so follow-up questions are cheap.
@@ -358,7 +357,6 @@ export async function chatAboutFiling(
       {
         model: MODEL,
         max_tokens: 4000,
-        temperature: 0,
         system: [
           { type: "text", text: FILING_SYSTEM_PROMPT },
           { type: "text", text: filingBlock, cache_control: { type: "ephemeral" } },
