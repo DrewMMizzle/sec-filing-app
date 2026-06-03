@@ -757,8 +757,9 @@ export default function FetchFilings() {
               Quick fetch
             </label>
             <p className="text-xs text-muted-foreground">
-              Type or paste ticker symbols (separated by spaces, commas, or new lines) to fetch
-              recent 10-K, 10-Q, 8-K, and DEF 14A filings — no watchlist needed.
+              Type or paste ticker symbols — or CIKs for pre-IPO companies — separated by spaces,
+              commas, or new lines, to fetch recent 10-K, 10-Q, 8-K, and DEF 14A filings (no
+              watchlist needed).
             </p>
           </div>
           <div className="flex items-center gap-2">

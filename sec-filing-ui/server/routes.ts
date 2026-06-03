@@ -11,6 +11,7 @@ import { ensureSP500Seeded } from "./seed-sp500";
 import { getSecTickerIndex } from "./sec-index";
 import { isReviewEnabled, kickReviewProcessor, reviewCostUsd, requestCancelReview, isReviewProcessing } from "./review";
 import { analyzeMdna, isMdnaEligible } from "./mdna";
+import { lookupCikSubmissions, searchEdgarByName, nameToLabel } from "./sec-edgar";
 import type { ChildProcess } from "child_process";
 
 // Tracks the in-flight fetch/render pipeline child so a user cancel can kill
@@ -528,9 +529,34 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     if (!access) return res.status(403).json({ error: "Access denied" });
     if (access === "view") return res.status(403).json({ error: "View-only access cannot add tickers" });
 
-    const { ticker, filingTypes } = req.body;
+    const { ticker, cik: bodyCik, label, filingTypes } = req.body as {
+      ticker?: unknown;
+      cik?: unknown;
+      label?: unknown;
+      filingTypes?: unknown;
+    };
+
+    // Pre-IPO path: client supplies a CIK directly (with an optional display
+    // label) because the company has no ticker yet.
+    if (typeof bodyCik === "string" && bodyCik.trim()) {
+      const sub = await lookupCikSubmissions(bodyCik);
+      if (!sub) return res.status(404).json({ error: `CIK "${bodyCik}" not found at SEC` });
+      const labelStr = typeof label === "string" ? label.trim().toUpperCase() : "";
+      const tickerLabel = (labelStr || sub.tickers[0] || nameToLabel(sub.name)).slice(0, 32);
+      const types = Array.isArray(filingTypes) && filingTypes.length > 0
+        ? filingTypes
+        : ["S-1", "S-1/A", "10-K", "10-Q", "8-K", "DEF 14A"];
+      const newTicker = await storage.addTicker({
+        watchlistId,
+        ticker: tickerLabel,
+        cik: sub.cik,
+        filingTypes: JSON.stringify(types),
+      });
+      return res.status(201).json({ ...newTicker, filingTypes: types, companyName: sub.name });
+    }
+
     if (!ticker || typeof ticker !== "string") {
-      return res.status(400).json({ error: "ticker is required" });
+      return res.status(400).json({ error: "ticker or cik is required" });
     }
 
     try {
@@ -660,6 +686,30 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     res.json({ ...updated, filingTypes });
   });
 
+  // Rename a ticker's display label — used when a pre-IPO company's "ticker"
+  // is initially a name-derived placeholder and the user wants to update it
+  // to the real symbol post-IPO (or just clean it up).
+  app.patch("/api/tickers/:id/symbol", requireAuth, async (req, res) => {
+    const id = Number(req.params.id);
+    const rows = await db.select().from(tickersTable).where(eq(tickersTable.id, id));
+    const existing = rows[0];
+    if (!existing) return res.status(404).json({ error: "Ticker not found" });
+
+    const userId = req.user!.id;
+    const { access } = await checkWatchlistAccess(existing.watchlistId, userId);
+    if (!access) return res.status(403).json({ error: "Access denied" });
+    if (access === "view") return res.status(403).json({ error: "View-only access" });
+
+    const symbol =
+      typeof req.body?.symbol === "string" ? req.body.symbol.trim().toUpperCase() : "";
+    if (!symbol) return res.status(400).json({ error: "symbol is required" });
+    if (symbol.length > 32) return res.status(400).json({ error: "symbol is too long" });
+
+    const updated = await storage.updateTickerSymbol(id, symbol);
+    if (!updated) return res.status(404).json({ error: "Ticker not found" });
+    res.json(updated);
+  });
+
   // ─── Export watchlist.json ───────────────────────────────
 
   app.get("/api/export-watchlist", requireAuth, async (req, res) => {
@@ -694,6 +744,23 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
         if (typeof raw !== "string") continue;
         const symbol = raw.trim().toUpperCase();
         if (!symbol) continue;
+        // Numeric input → CIK (pre-IPO companies have a CIK but no ticker).
+        // Look it up via SEC's submissions JSON to get the company name and
+        // any tickers, then build a resolved entry with either the SEC ticker
+        // or a name-derived display label.
+        if (/^\d+$/.test(symbol)) {
+          const sub = await lookupCikSubmissions(symbol);
+          if (sub) {
+            const label = (sub.tickers[0] ?? nameToLabel(sub.name)).toUpperCase();
+            if (!seen.has(label)) {
+              seen.add(label);
+              resolved.push({ ticker: label, cik: sub.cik, name: sub.name });
+            }
+            continue;
+          }
+          unresolved.push(symbol);
+          continue;
+        }
         // SEC uses "-" where index lists use "." (e.g. BRK.B -> BRK-B).
         const variants = symbol.includes(".") ? [symbol.replace(/\./g, "-"), symbol] : [symbol];
         let hit: { ticker: string; cik: string; name: string } | null = null;
@@ -717,6 +784,21 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     } catch (e: any) {
       console.error("Error resolving tickers:", e);
       res.status(500).json({ error: "Failed to resolve tickers with SEC" });
+    }
+  });
+
+  // Search SEC EDGAR by company name so users can find pre-IPO companies
+  // (which have a CIK but no ticker and are NOT in company_tickers.json).
+  // Returns at most 10 deduped {cik, name, ticker?} matches.
+  app.get("/api/edgar/search", requireAuth, async (req, res) => {
+    const q = typeof req.query.q === "string" ? req.query.q : "";
+    if (!q.trim()) return res.json([]);
+    try {
+      const results = await searchEdgarByName(q);
+      res.json(results);
+    } catch (e: any) {
+      console.error("EDGAR search failed:", e?.message || e);
+      res.status(502).json({ error: "EDGAR search failed" });
     }
   });
 
