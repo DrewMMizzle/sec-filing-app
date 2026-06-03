@@ -32,8 +32,12 @@ PDF_OPTIONS = {
     "print_background": True,
 }
 
-# Maximum time to wait for the page to load and reach networkidle.
-PAGE_TIMEOUT_MS = 120_000  # 2 minutes — some filings are very large.
+# Maximum time to wait for the page to load. Some S-1s are huge.
+PAGE_TIMEOUT_MS = 120_000  # 2 minutes for the load step.
+# Generous cap on the PDF rasterization step itself. A 500-page S-1 with
+# dense tables can legitimately take several minutes to paginate; default
+# Playwright timeouts are too aggressive for that.
+PDF_TIMEOUT_MS = 5 * 60 * 1000  # 5 minutes.
 
 # JavaScript to strip ix: XBRL tags in the live DOM while preserving
 # their child content.  This runs after the page has fully loaded so
@@ -135,11 +139,17 @@ async def render_html_to_pdf(
         # Emulate print media for proper styling.
         await page.emulate_media(media="print")
 
-        # Load the HTML content.
-        await page.set_content(html, wait_until="networkidle", timeout=timeout_ms)
+        # set_content with wait_until="networkidle" hangs on huge SEC filings
+        # because residual font/stylesheet/keep-alive requests can prevent the
+        # network from ever going quiet for the required 500ms. "load" fires
+        # after the document and its initial subresources are loaded, which
+        # is what we actually want — networkidle was overkill given the HTML
+        # has already had its images base64-inlined by preprocess_filing.
+        await page.set_content(html, wait_until="load", timeout=timeout_ms)
 
-        # Generate the PDF.
-        pdf_bytes: bytes = await page.pdf(**PDF_OPTIONS)
+        # Generate the PDF. Explicit timeout because rasterizing a 500-page
+        # S-1 can legitimately take several minutes.
+        pdf_bytes: bytes = await page.pdf(**PDF_OPTIONS, timeout=PDF_TIMEOUT_MS)
         logger.info("PDF rendered successfully (%d bytes)", len(pdf_bytes))
         return pdf_bytes
 
@@ -177,13 +187,16 @@ async def render_url_to_pdf(
         await page.emulate_media(media="print")
 
         logger.info("Navigating to %s", url)
-        await page.goto(url, wait_until="networkidle", timeout=timeout_ms)
+        # Use "load" instead of "networkidle" — see render_html_to_pdf for
+        # the rationale. networkidle stalls on huge SEC filings.
+        await page.goto(url, wait_until="load", timeout=timeout_ms)
 
         if strip_xbrl:
             logger.debug("Stripping XBRL tags via JavaScript")
             await page.evaluate(STRIP_XBRL_JS)
 
-        pdf_bytes: bytes = await page.pdf(**PDF_OPTIONS)
+        # Explicit timeout for the rasterization step (big S-1s take minutes).
+        pdf_bytes: bytes = await page.pdf(**PDF_OPTIONS, timeout=PDF_TIMEOUT_MS)
         logger.info("PDF rendered from URL %s (%d bytes)", url, len(pdf_bytes))
         return pdf_bytes
 
