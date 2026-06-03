@@ -739,11 +739,17 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
       const idx = await getSecTickerIndex();
       const resolved: Array<{ ticker: string; cik: string; name: string }> = [];
       const unresolved: string[] = [];
+      // Inputs that look like company names (or misspellings) — anything alpha
+      // that didn't match a ticker — get a fallback EDGAR name search at the
+      // end so pre-IPO filers like SpaceX are reachable from Quick Fetch.
+      const alphaMisses: Array<{ query: string; original: string }> = [];
       const seen = new Set<string>();
-      for (const raw of tickers) {
-        if (typeof raw !== "string") continue;
-        const symbol = raw.trim().toUpperCase();
-        if (!symbol) continue;
+      const inputs = (tickers as unknown[])
+        .filter((t): t is string => typeof t === "string")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      for (const original of inputs) {
+        const symbol = original.toUpperCase();
         // Numeric input → CIK (pre-IPO companies have a CIK but no ticker).
         // Look it up via SEC's submissions JSON to get the company name and
         // any tickers, then build a resolved entry with either the SEC ticker
@@ -777,10 +783,46 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
             resolved.push(hit);
           }
         } else {
-          unresolved.push(symbol);
+          alphaMisses.push({ query: symbol, original });
         }
       }
-      res.json({ resolved, unresolved });
+
+      // EDGAR name-search fallback for alpha misses. Run in parallel so a
+      // multi-name Quick Fetch isn't bottlenecked by sequential HTTP calls.
+      const ambiguous: Array<{
+        query: string;
+        candidates: Array<{ cik: string; name: string; ticker?: string }>;
+      }> = [];
+      if (alphaMisses.length > 0) {
+        const searches = await Promise.all(
+          alphaMisses.map(async (miss) => {
+            try {
+              const candidates = await searchEdgarByName(miss.original);
+              return { miss, candidates };
+            } catch {
+              return { miss, candidates: [] as Array<{ cik: string; name: string; ticker?: string }> };
+            }
+          }),
+        );
+        for (const { miss, candidates } of searches) {
+          if (candidates.length === 0) {
+            unresolved.push(miss.query);
+            continue;
+          }
+          if (candidates.length === 1) {
+            const c = candidates[0];
+            const label = (c.ticker ?? nameToLabel(c.name)).toUpperCase();
+            if (!seen.has(label)) {
+              seen.add(label);
+              resolved.push({ ticker: label, cik: c.cik, name: c.name });
+            }
+            continue;
+          }
+          ambiguous.push({ query: miss.original, candidates });
+        }
+      }
+
+      res.json({ resolved, unresolved, ambiguous });
     } catch (e: any) {
       console.error("Error resolving tickers:", e);
       res.status(500).json({ error: "Failed to resolve tickers with SEC" });
