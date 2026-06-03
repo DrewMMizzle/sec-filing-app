@@ -59,7 +59,7 @@ type ShareEntry = {
   permission: string;
 };
 
-const ALL_FILING_TYPES = ["10-K", "10-Q", "8-K", "DEF 14A", "S-1", "20-F"];
+const ALL_FILING_TYPES = ["10-K", "10-Q", "8-K", "DEF 14A", "S-1", "S-1/A", "20-F"];
 
 export default function WatchlistPage() {
   const [, params] = useRoute("/watchlist/:id");
@@ -76,6 +76,21 @@ export default function WatchlistPage() {
   const [renameName, setRenameName] = useState("");
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleteTickerId, setDeleteTickerId] = useState<number | null>(null);
+  // Edit-filing-types dialog: when set, the dialog is open for that ticker.
+  const [editingTicker, setEditingTicker] = useState<TickerWithTypes | null>(null);
+  const [editTypes, setEditTypes] = useState<string[]>([]);
+  const [editSymbol, setEditSymbol] = useState<string>("");
+
+  // Add-ticker dialog: pre-IPO companies have a CIK but no ticker yet, so the
+  // dialog offers two modes — the default ticker-symbol path (existing) and a
+  // CIK path (with optional EDGAR name search to find the CIK).
+  const [addMode, setAddMode] = useState<"ticker" | "cik">("ticker");
+  const [cikInput, setCikInput] = useState("");
+  const [labelInput, setLabelInput] = useState("");
+  const [edgarQuery, setEdgarQuery] = useState("");
+  const [edgarResults, setEdgarResults] = useState<
+    Array<{ cik: string; name: string; ticker?: string }>
+  >([]);
   const [shareOpen, setShareOpen] = useState(false);
   const [shareEmail, setShareEmail] = useState("");
   const [sharePermission, setSharePermission] = useState("view");
@@ -112,8 +127,11 @@ export default function WatchlistPage() {
   const canEdit = watchlist?.access === "owner" || watchlist?.access === "edit";
 
   // Mutations
+  type AddTickerArgs =
+    | { ticker: string; filingTypes: string[] }
+    | { cik: string; label?: string; filingTypes: string[] };
   const addTickerMutation = useMutation({
-    mutationFn: async (data: { ticker: string; filingTypes: string[] }) => {
+    mutationFn: async (data: AddTickerArgs) => {
       const res = await apiRequest("POST", `/api/watchlists/${watchlistId}/tickers`, data);
       if (!res.ok) {
         const body = await res.json();
@@ -126,8 +144,73 @@ export default function WatchlistPage() {
       queryClient.invalidateQueries({ queryKey: ["/api/watchlists"] });
       setAddOpen(false);
       setTickerInput("");
+      setCikInput("");
+      setLabelInput("");
+      setEdgarQuery("");
+      setEdgarResults([]);
+      setAddMode("ticker");
       setSelectedTypes(["10-K", "10-Q", "8-K", "DEF 14A"]);
       toast({ title: "Ticker added" });
+    },
+    onError: (err: Error) => {
+      toast({ title: "Error", description: err.message, variant: "destructive" });
+    },
+  });
+
+  // EDGAR company-name search — surfaces pre-IPO filers that aren't in the
+  // tickered-companies index. Results populate a small picker in the dialog.
+  const edgarSearchMutation = useMutation<
+    Array<{ cik: string; name: string; ticker?: string }>,
+    Error,
+    string
+  >({
+    mutationFn: async (q) => {
+      const res = await apiRequest("GET", `/api/edgar/search?q=${encodeURIComponent(q)}`);
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || "EDGAR search failed");
+      }
+      return res.json();
+    },
+    onSuccess: (data) => setEdgarResults(data),
+    onError: (err) =>
+      toast({ title: "Couldn't search EDGAR", description: err.message, variant: "destructive" }),
+  });
+
+  // Rename a ticker's display label (PATCH /symbol). Used both for cleaning
+  // up a pre-IPO placeholder once the company IPOs, and for any manual
+  // relabeling. Kept distinct from filing-types update so the two saves
+  // can fire independently from the same dialog.
+  const renameTickerMutation = useMutation({
+    mutationFn: async (data: { id: number; symbol: string }) => {
+      const res = await apiRequest("PATCH", `/api/tickers/${data.id}/symbol`, { symbol: data.symbol });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || "Failed to rename ticker");
+      }
+      return res.json();
+    },
+    onError: (err: Error) => {
+      toast({ title: "Couldn't rename ticker", description: err.message, variant: "destructive" });
+    },
+  });
+
+  // Update the filing types for an existing ticker so a user can e.g. enable
+  // S-1 / S-1/A on a name without having to delete and re-add it. Plain
+  // mutation — closing the edit dialog is coordinated by handleSaveEdit
+  // below, which may also fire renameTickerMutation in the same save.
+  const updateFilingTypesMutation = useMutation({
+    mutationFn: async (data: { id: number; filingTypes: string[] }) => {
+      const res = await apiRequest(
+        "PATCH",
+        `/api/tickers/${data.id}/filing-types`,
+        { filingTypes: data.filingTypes },
+      );
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || "Failed to update filing types");
+      }
+      return res.json();
     },
     onError: (err: Error) => {
       toast({ title: "Error", description: err.message, variant: "destructive" });
@@ -202,9 +285,55 @@ export default function WatchlistPage() {
   });
 
   const handleAddTicker = () => {
+    if (selectedTypes.length === 0) return;
+    if (addMode === "cik") {
+      const cik = cikInput.trim().replace(/\D/g, "");
+      if (!cik) return;
+      const label = labelInput.trim().toUpperCase();
+      addTickerMutation.mutate({ cik, label: label || undefined, filingTypes: selectedTypes });
+      return;
+    }
     const trimmed = tickerInput.trim().toUpperCase();
-    if (!trimmed || selectedTypes.length === 0) return;
+    if (!trimmed) return;
     addTickerMutation.mutate({ ticker: trimmed, filingTypes: selectedTypes });
+  };
+
+  // Commit the edit-filing-types dialog. May fire a rename and/or a
+  // filing-types update; closes once all of them settle.
+  const handleSaveEdit = async () => {
+    if (!editingTicker || editTypes.length === 0) return;
+    const newSymbol = editSymbol.trim().toUpperCase();
+    const symbolChanged = !!newSymbol && newSymbol !== editingTicker.ticker;
+    const sameTypes =
+      editTypes.length === editingTicker.filingTypes.length &&
+      editTypes.every((t) => editingTicker.filingTypes.includes(t));
+    const typesChanged = !sameTypes;
+    if (!symbolChanged && !typesChanged) {
+      setEditingTicker(null);
+      return;
+    }
+    try {
+      if (symbolChanged) {
+        await renameTickerMutation.mutateAsync({ id: editingTicker.id, symbol: newSymbol });
+      }
+      if (typesChanged) {
+        await updateFilingTypesMutation.mutateAsync({ id: editingTicker.id, filingTypes: editTypes });
+      }
+      queryClient.invalidateQueries({ queryKey: ["/api/watchlists", watchlistId, "tickers"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/watchlists"] });
+      setEditingTicker(null);
+      toast({
+        title:
+          symbolChanged && typesChanged
+            ? "Ticker updated"
+            : symbolChanged
+              ? "Ticker renamed"
+              : "Filing types updated",
+      });
+    } catch {
+      // The individual mutations already toast on error; leave the dialog
+      // open so the user can correct and retry.
+    }
   };
 
   const toggleType = (type: string) => {
@@ -353,15 +482,31 @@ export default function WatchlistPage() {
                 </div>
               </div>
               {canEdit && (
-                <Button
-                  size="icon"
-                  variant="ghost"
-                  className="text-muted-foreground shrink-0"
-                  onClick={() => setDeleteTickerId(t.id)}
-                  data-testid={`button-remove-${t.ticker}`}
-                >
-                  <Trash2 className="w-4 h-4" />
-                </Button>
+                <>
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    className="text-muted-foreground shrink-0"
+                    onClick={() => {
+                      setEditingTicker(t);
+                      setEditTypes(t.filingTypes);
+                      setEditSymbol(t.ticker);
+                    }}
+                    data-testid={`button-edit-types-${t.ticker}`}
+                    title="Edit ticker"
+                  >
+                    <Pencil className="w-4 h-4" />
+                  </Button>
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    className="text-muted-foreground shrink-0"
+                    onClick={() => setDeleteTickerId(t.id)}
+                    data-testid={`button-remove-${t.ticker}`}
+                  >
+                    <Trash2 className="w-4 h-4" />
+                  </Button>
+                </>
               )}
             </Card>
           ))}
@@ -374,9 +519,30 @@ export default function WatchlistPage() {
           <DialogHeader>
             <DialogTitle>Add Ticker</DialogTitle>
             <DialogDescription>
-              Enter a ticker symbol. It will be resolved against the SEC EDGAR database.
+              Enter a ticker symbol — or, for pre-IPO companies that don&apos;t have one yet,
+              switch to CIK mode and look the company up by name.
             </DialogDescription>
           </DialogHeader>
+          <div className="flex gap-1 mb-3" role="tablist">
+            <Button
+              type="button"
+              size="sm"
+              variant={addMode === "ticker" ? "default" : "outline"}
+              onClick={() => setAddMode("ticker")}
+              data-testid="button-add-mode-ticker"
+            >
+              By ticker
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant={addMode === "cik" ? "default" : "outline"}
+              onClick={() => setAddMode("cik")}
+              data-testid="button-add-mode-cik"
+            >
+              By CIK (pre-IPO)
+            </Button>
+          </div>
           <form
             onSubmit={(e) => {
               e.preventDefault();
@@ -384,17 +550,102 @@ export default function WatchlistPage() {
             }}
           >
             <div className="space-y-4">
-              <div>
-                <label className="text-sm font-medium mb-1.5 block">Ticker Symbol</label>
-                <Input
-                  placeholder="e.g. NVDA, TSLA, AMZN"
-                  value={tickerInput}
-                  onChange={(e) => setTickerInput(e.target.value)}
-                  autoFocus
-                  className="font-mono uppercase"
-                  data-testid="input-ticker-symbol"
-                />
-              </div>
+              {addMode === "ticker" ? (
+                <div>
+                  <label className="text-sm font-medium mb-1.5 block">Ticker Symbol</label>
+                  <Input
+                    placeholder="e.g. NVDA, TSLA, AMZN"
+                    value={tickerInput}
+                    onChange={(e) => setTickerInput(e.target.value)}
+                    autoFocus
+                    className="font-mono uppercase"
+                    data-testid="input-ticker-symbol"
+                  />
+                </div>
+              ) : (
+                <>
+                  <div>
+                    <label className="text-sm font-medium mb-1.5 block">CIK</label>
+                    <Input
+                      placeholder="e.g. 1234567 — leading zeros optional"
+                      value={cikInput}
+                      onChange={(e) => setCikInput(e.target.value)}
+                      autoFocus
+                      className="font-mono"
+                      data-testid="input-cik"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-sm font-medium mb-1.5 block">
+                      Display label{" "}
+                      <span className="text-xs text-muted-foreground font-normal">
+                        (optional — defaults to a name-derived label)
+                      </span>
+                    </label>
+                    <Input
+                      placeholder="e.g. ACME, STRIPE"
+                      value={labelInput}
+                      onChange={(e) => setLabelInput(e.target.value)}
+                      className="font-mono uppercase"
+                      data-testid="input-label"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-sm font-medium mb-1.5 block">
+                      Don&apos;t know the CIK? Search SEC by name
+                    </label>
+                    <div className="flex gap-2">
+                      <Input
+                        placeholder="e.g. Acme Technologies"
+                        value={edgarQuery}
+                        onChange={(e) => setEdgarQuery(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") {
+                            e.preventDefault();
+                            if (edgarQuery.trim()) edgarSearchMutation.mutate(edgarQuery.trim());
+                          }
+                        }}
+                        data-testid="input-edgar-query"
+                      />
+                      <Button
+                        type="button"
+                        variant="outline"
+                        disabled={!edgarQuery.trim() || edgarSearchMutation.isPending}
+                        onClick={() => edgarSearchMutation.mutate(edgarQuery.trim())}
+                        data-testid="button-edgar-search"
+                      >
+                        {edgarSearchMutation.isPending ? "Searching…" : "Search"}
+                      </Button>
+                    </div>
+                    {edgarResults.length > 0 && (
+                      <div className="mt-2 border rounded-md max-h-56 overflow-y-auto divide-y">
+                        {edgarResults.map((r) => (
+                          <button
+                            key={r.cik}
+                            type="button"
+                            className="w-full text-left px-3 py-2 text-sm hover:bg-muted/40 transition-colors"
+                            onClick={() => {
+                              setCikInput(r.cik);
+                              setLabelInput(r.ticker ?? "");
+                              setEdgarResults([]);
+                            }}
+                            data-testid={`button-edgar-pick-${r.cik}`}
+                          >
+                            <div className="font-medium truncate">{r.name}</div>
+                            <div className="text-xs text-muted-foreground font-mono">
+                              CIK {r.cik}
+                              {r.ticker ? ` · ${r.ticker}` : ""}
+                            </div>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                    {edgarResults.length === 0 && edgarSearchMutation.isSuccess && (
+                      <p className="text-xs text-muted-foreground mt-1.5">No matches.</p>
+                    )}
+                  </div>
+                </>
+              )}
               <div>
                 <label className="text-sm font-medium mb-2 block">Filing Types</label>
                 <div className="flex flex-wrap gap-3">
@@ -424,13 +675,94 @@ export default function WatchlistPage() {
               </Button>
               <Button
                 type="submit"
-                disabled={!tickerInput.trim() || selectedTypes.length === 0 || addTickerMutation.isPending}
+                disabled={
+                  (addMode === "ticker" ? !tickerInput.trim() : !cikInput.trim()) ||
+                  selectedTypes.length === 0 ||
+                  addTickerMutation.isPending
+                }
                 data-testid="button-confirm-add-ticker"
               >
                 {addTickerMutation.isPending ? "Resolving..." : "Add"}
               </Button>
             </DialogFooter>
           </form>
+        </DialogContent>
+      </Dialog>
+
+      {/* Edit Ticker Dialog (rename + filing types) */}
+      <Dialog
+        open={editingTicker !== null}
+        onOpenChange={(open) => { if (!open) setEditingTicker(null); }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>
+              Edit ticker{" "}
+              {editingTicker && (
+                <span className="font-mono text-base text-muted-foreground">· {editingTicker.ticker}</span>
+              )}
+            </DialogTitle>
+            <DialogDescription>
+              Rename the display label and/or change which SEC forms are pulled. Use the rename
+              field to swap a pre-IPO placeholder for the real ticker after the company IPOs.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div>
+              <label className="text-sm font-medium mb-1.5 block">Display label</label>
+              <Input
+                value={editSymbol}
+                onChange={(e) => setEditSymbol(e.target.value)}
+                className="font-mono uppercase"
+                data-testid="input-edit-symbol"
+              />
+              {editingTicker && (
+                <p className="text-xs text-muted-foreground mt-1">
+                  CIK <span className="font-mono">{editingTicker.cik}</span> stays the same.
+                </p>
+              )}
+            </div>
+            <div>
+              <label className="text-sm font-medium mb-2 block">Filing types</label>
+              <div className="flex flex-wrap gap-3">
+                {ALL_FILING_TYPES.map((type) => (
+                  <label key={type} className="flex items-center gap-1.5 text-sm cursor-pointer">
+                    <Checkbox
+                      checked={editTypes.includes(type)}
+                      onCheckedChange={() =>
+                        setEditTypes((prev) =>
+                          prev.includes(type) ? prev.filter((t) => t !== type) : [...prev, type],
+                        )
+                      }
+                      data-testid={`checkbox-edit-type-${type}`}
+                    />
+                    {type}
+                  </label>
+                ))}
+              </div>
+            </div>
+          </div>
+          <DialogFooter className="mt-4">
+            <Button type="button" variant="secondary" onClick={() => setEditingTicker(null)}>
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              disabled={
+                !editingTicker ||
+                editTypes.length === 0 ||
+                !editSymbol.trim() ||
+                renameTickerMutation.isPending ||
+                updateFilingTypesMutation.isPending
+              }
+              onClick={handleSaveEdit}
+              data-testid="button-confirm-edit-types"
+            >
+              {renameTickerMutation.isPending || updateFilingTypesMutation.isPending
+                ? "Saving…"
+                : "Save"}
+            </Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
 
