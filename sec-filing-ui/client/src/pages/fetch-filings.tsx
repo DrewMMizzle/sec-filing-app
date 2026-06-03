@@ -502,7 +502,9 @@ export default function FetchFilings() {
   };
 
   // ── Quick fetch: type/paste tickers, resolve via SEC, kick the pipeline ──
-  const QUICK_FETCH_FILING_TYPES = ["10-K", "10-Q", "8-K", "DEF 14A"];
+  // S-1 / S-1/A are included so pre-IPO filers (which don't have periodic
+  // 10-K/10-Q/8-K filings yet) return something instead of an empty result.
+  const QUICK_FETCH_FILING_TYPES = ["10-K", "10-Q", "8-K", "DEF 14A", "S-1", "S-1/A"];
   const [quickInput, setQuickInput] = useState("");
 
   type ResolvedTicker = { ticker: string; cik: string; name: string };
@@ -613,10 +615,17 @@ export default function FetchFilings() {
   const bulkAddMutation = useMutation<
     { added: number; skipped: number },
     Error,
-    { watchlistId: string; tickers: Array<{ ticker: string; cik: string }> }
+    {
+      watchlistId: string;
+      tickers: Array<{ ticker: string; cik: string }>;
+      filingTypes?: string[];
+    }
   >({
-    mutationFn: async ({ watchlistId, tickers }) => {
-      const res = await apiRequest("POST", `/api/watchlists/${watchlistId}/tickers/bulk`, { tickers });
+    mutationFn: async ({ watchlistId, tickers, filingTypes }) => {
+      const res = await apiRequest("POST", `/api/watchlists/${watchlistId}/tickers/bulk`, {
+        tickers,
+        filingTypes,
+      });
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
         throw new Error(body.error || "Failed to add tickers to watchlist");
@@ -818,9 +827,9 @@ export default function FetchFilings() {
               Quick fetch
             </label>
             <p className="text-xs text-muted-foreground">
-              Type or paste ticker symbols — or CIKs for pre-IPO companies — separated by spaces,
-              commas, or new lines, to fetch recent 10-K, 10-Q, 8-K, and DEF 14A filings (no
-              watchlist needed).
+              Type or paste ticker symbols — or CIKs / company names for pre-IPO filers — separated
+              by spaces, commas, or new lines, to fetch recent 10-K, 10-Q, 8-K, DEF 14A, and S-1 /
+              S-1/A filings (no watchlist needed).
             </p>
           </div>
           <div className="flex items-center gap-2">
@@ -1567,6 +1576,7 @@ export default function FetchFilings() {
                   bulkAddMutation.mutate({
                     watchlistId: quickAddTarget,
                     tickers: quickAdd.map((r) => ({ ticker: r.ticker, cik: r.cik })),
+                    filingTypes: QUICK_FETCH_FILING_TYPES,
                   });
                 }
                 runQuickFetch(quickAdd);

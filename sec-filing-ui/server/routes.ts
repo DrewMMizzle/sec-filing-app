@@ -617,12 +617,20 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     if (!access) return res.status(403).json({ error: "Access denied" });
     if (access === "view") return res.status(403).json({ error: "View-only access cannot add tickers" });
 
-    const { tickers: incoming } = req.body as {
+    const { tickers: incoming, filingTypes: incomingTypes } = req.body as {
       tickers?: Array<{ ticker?: unknown; cik?: unknown }>;
+      filingTypes?: unknown;
     };
     if (!Array.isArray(incoming) || incoming.length === 0) {
       return res.status(400).json({ error: "tickers array is required" });
     }
+    // Persist the same forms the caller is fetching, defaulting to a broader
+    // list that includes S-1 / S-1/A so a pre-IPO entry doesn't immediately
+    // come back empty on the next fetch.
+    const filingTypes =
+      Array.isArray(incomingTypes) && incomingTypes.length > 0
+        ? (incomingTypes as unknown[]).filter((t): t is string => typeof t === "string")
+        : ["10-K", "10-Q", "8-K", "DEF 14A", "S-1", "S-1/A"];
 
     const existing = await storage.getTickersByWatchlist(watchlistId);
     const have = new Set(existing.map((t) => t.ticker.toUpperCase()));
@@ -641,7 +649,7 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
         watchlistId,
         ticker,
         cik,
-        filingTypes: JSON.stringify(["10-K", "10-Q", "8-K", "DEF 14A"]),
+        filingTypes: JSON.stringify(filingTypes),
       });
       have.add(ticker);
       added += 1;
