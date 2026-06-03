@@ -1054,11 +1054,14 @@ export default function FetchFilings() {
           </Button>
 
           {/* Cancel: visible whenever something cancelable is in flight — the
-              Python fetch child, the Claude review drain, or queued reviews. */}
+              Python fetch child, the Claude review drain, queued reviews, or
+              any filing the DB says is still rendering/reviewing (the last
+              two survive a server restart that drops the in-memory handles). */}
           {(fetchMutation.isPending ||
             usage?.fetching ||
             usage?.processing ||
-            (usage?.pendingCount ?? 0) > 0) && (
+            (usage?.pendingCount ?? 0) > 0 ||
+            runActive) && (
             <Button
               variant="destructive"
               onClick={() => cancelMutation.mutate()}
@@ -1170,6 +1173,21 @@ export default function FetchFilings() {
                   data-testid="button-raise-cap-inline"
                 >
                   Raise cap
+                </Button>
+              )}
+              {/* Inline cancel — visible right where the user is looking
+                  while a run is active, so they don't have to scroll back
+                  up to the Fetch button to find the destructive one. */}
+              {(runActive || fetchMutation.isPending) && (
+                <Button
+                  size="sm"
+                  variant="destructive"
+                  className="h-6"
+                  onClick={() => cancelMutation.mutate()}
+                  disabled={cancelMutation.isPending}
+                  data-testid="button-cancel-run-inline"
+                >
+                  {cancelMutation.isPending ? "Canceling…" : "Cancel run"}
                 </Button>
               )}
             </div>
