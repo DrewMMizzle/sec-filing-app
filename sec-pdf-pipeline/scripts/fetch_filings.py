@@ -37,8 +37,7 @@ os.chdir(PROJECT_ROOT)
 
 from src.config import configure_logging
 from src.edgar.rate_limiter import sec_get, close_client
-from src.renderer.preprocess import preprocess_filing
-from src.renderer.playwright_render import render_html_to_pdf, close_browser
+from src.renderer.playwright_render import render_url_to_pdf, close_browser
 
 logger = logging.getLogger(__name__)
 
@@ -119,14 +118,26 @@ async def poll_ticker_with_dates(
 
 
 async def render_filing(filing_info: dict) -> dict:
-    """Preprocess and render one filing to PDF. Returns result dict."""
+    """Render one filing to PDF directly from the SEC URL.
+
+    Uses the URL-based renderer (playwright_render.render_url_to_pdf): Chromium
+    navigates to the SEC primary document with the required User-Agent header
+    and loads images/CSS in parallel from the origin domain. XBRL tags get
+    stripped in the live DOM via STRIP_XBRL_JS before page.pdf() runs.
+
+    This is the path playwright_render.py itself calls "preferred". The
+    previous path (preprocess_filing -> render_html_to_pdf) downloaded every
+    inline image sequentially and base64-inlined it into the HTML — that
+    inflated huge S-1s by tens of MB before Chromium even saw the document
+    and was the actual wedge on SpaceX-sized filings, even after PR #67
+    parallelized image fetches.
+    """
     ticker = filing_info["ticker"]
     filing_type = filing_info["filing_type"]
     accession = filing_info["accession_number"]
     url = filing_info["primary_doc_url"]
 
-    html = await preprocess_filing(url)
-    pdf_bytes = await render_html_to_pdf(html)
+    pdf_bytes = await render_url_to_pdf(url)
 
     safe_type = filing_type.replace(" ", "_")
     out_dir = OUTPUT_DIR / "filings" / ticker / safe_type
