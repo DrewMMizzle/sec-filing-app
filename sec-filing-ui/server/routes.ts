@@ -1283,6 +1283,44 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     res.json({ ok: true });
   });
 
+  // Re-attempt a render that previously errored (or got interrupted). The
+  // main Fetch button skips anything already in the DB, so without this an
+  // errored filing is stuck — the user has no way to retry it from the UI.
+  // We delete the row, then run the pipeline scoped to just that filing so
+  // the pipeline re-fetches from SEC and creates a fresh row.
+  app.post("/api/filings/:accession/retry-render", requireAuth, async (req, res) => {
+    const accession = req.params.accession as string;
+    const filing = await storage.getFilingByAccession(accession);
+    if (!filing) return res.status(404).json({ error: "Filing not found" });
+    const userId = req.user!.id;
+
+    await storage.deleteFiling(filing.id);
+
+    const input = JSON.stringify({
+      tickers: [
+        {
+          ticker: filing.ticker,
+          cik: filing.cik,
+          filing_types: [filing.filingType],
+        },
+      ],
+      date_from: filing.filingDate,
+      date_to: filing.filingDate,
+      limit_per_ticker: 5,
+    });
+    const cikByTicker = new Map<string, string>([[filing.ticker, filing.cik]]);
+    const result = await runFetchPipeline(input, { userId, cikByTicker });
+    if (!result.success) {
+      return res.status(500).json({ error: result.error || "Retry render failed" });
+    }
+    kickReviewProcessor().catch((err) => console.error("Review processor failed:", err));
+    res.json({
+      ok: true,
+      rerendered: result.completedAccessions.length,
+      events: result.events,
+    });
+  });
+
   // ─── MD&A digest (analyst view) ──────────────────────────
 
   function mdnaCost(f: {
