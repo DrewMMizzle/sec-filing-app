@@ -431,6 +431,31 @@ export default function FetchFilings() {
     onError: (err: Error) => toast({ title: "Error", description: err.message, variant: "destructive" }),
   });
 
+  // Retry a single filing whose render previously errored or was interrupted.
+  // The main Fetch button dedups against the DB and won't re-attempt these.
+  const retryRenderMutation = useMutation<{ rerendered: number }, Error, string>({
+    mutationFn: async (accession) => {
+      const res = await apiRequest("POST", `/api/filings/${encodeURIComponent(accession)}/retry-render`, {});
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || "Retry failed");
+      }
+      return res.json();
+    },
+    onSuccess: (data) => {
+      refetchFilings();
+      queryClient.invalidateQueries({ queryKey: ["/api/review/usage"] });
+      toast({
+        title: data.rerendered > 0 ? "Re-rendered" : "Retry queued",
+        description:
+          data.rerendered > 0
+            ? "Filing re-rendered; review will run shortly."
+            : "SEC returned nothing this time — check the date or filing-type list.",
+      });
+    },
+    onError: (err) => toast({ title: "Retry failed", description: err.message, variant: "destructive" }),
+  });
+
   // Re-render filings whose PDF is missing from disk (zombie "complete" rows)
   const renderMissingMutation = useMutation<{ rerendered: number; missingTotal: number; tickersRemaining: number }>({
     mutationFn: async () => {
@@ -1357,9 +1382,34 @@ export default function FetchFilings() {
                     </Badge>
                   )}
                   {f.status === "error" && (
-                    <Badge variant="destructive" className="text-xs">
-                      <X className="w-3 h-3 mr-0.5" /> Error
-                    </Badge>
+                    <>
+                      <Badge variant="destructive" className="text-xs">
+                        <X className="w-3 h-3 mr-0.5" /> Error
+                      </Badge>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-5 px-1.5 text-[10px]"
+                        disabled={
+                          retryRenderMutation.isPending &&
+                          retryRenderMutation.variables === f.accessionNumber
+                        }
+                        onClick={() => retryRenderMutation.mutate(f.accessionNumber)}
+                        data-testid={`button-retry-render-${f.accessionNumber}`}
+                        title="Re-attempt rendering this filing"
+                      >
+                        {retryRenderMutation.isPending &&
+                        retryRenderMutation.variables === f.accessionNumber ? (
+                          <>
+                            <Loader2 className="w-3 h-3 mr-0.5 animate-spin" /> Retrying
+                          </>
+                        ) : (
+                          <>
+                            <RefreshCw className="w-3 h-3 mr-0.5" /> Retry
+                          </>
+                        )}
+                      </Button>
+                    </>
                   )}
                   {(f.reviewStatus === "pending" || f.reviewStatus === "reviewing") && (
                     <Badge variant="default" className="text-xs bg-amber-600/20 text-amber-400 border-amber-600/30">
