@@ -120,8 +120,12 @@ function runFetchPipeline(
     // Watchdog: if the pipeline produces no output for this long, treat it as
     // stalled (e.g. a wedged Chromium) and kill it so the run can't hang
     // forever. Anything rendered/reviewed before the stall is already saved, and
-    // a re-fetch resumes (dedup skips completed filings).
-    const IDLE_TIMEOUT_MS = 6 * 60 * 1000;
+    // a re-fetch resumes (dedup skips completed filings). The budget covers
+    // one legal attempt's silent window: preprocess (4 min cap) +
+    // page.pdf() (5 min cap), with margin — Python's logger also writes to
+    // stderr, which we now treat as activity, so a healthy run never gets
+    // close to this.
+    const IDLE_TIMEOUT_MS = 15 * 60 * 1000;
     let lastActivity = Date.now();
     let stalled = false;
     const watchdog = setInterval(() => {
@@ -209,6 +213,12 @@ function runFetchPipeline(
     });
 
     child.stderr.on("data", (data: Buffer) => {
+      // Python's `logger.info`/`logger.debug` writes here by default. Counting
+      // stderr as activity prevents the watchdog from killing a render that's
+      // chattily making progress on the Python side but happens not to have
+      // emitted a stdout JSON event yet (preprocess + page.pdf can be silent
+      // on stdout for several minutes per filing).
+      lastActivity = Date.now();
       stderrOutput += data.toString();
     });
 
@@ -945,6 +955,13 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
 
     const cikByTicker = new Map(tickerList.map((t) => [t.ticker, t.cik]));
     const result = await runFetchPipeline(input, { userId, cikByTicker });
+    // Always sweep stale 'rendering' rows for the tickers we touched —
+    // regardless of pipeline success. A failed/killed pipeline would
+    // otherwise leave rows spinning forever, which is exactly what made
+    // the SpaceX S-1/A look stuck on "Rendering" after a watchdog kill.
+    storage
+      .recoverStaleRenders(tickerNames)
+      .catch((err) => console.error("Stale-render recovery failed:", err));
     if (!result.success) {
       return res
         .status(500)
@@ -957,11 +974,6 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
       totalErrors: result.doneEvent?.total_errors ?? 0,
       events: result.events,
     });
-    // Clear any rows the pipeline left at 'rendering' (e.g. it was stalled and
-    // killed) for these tickers so they don't spin forever.
-    storage
-      .recoverStaleRenders(tickerNames)
-      .catch((err) => console.error("Stale-render recovery failed:", err));
 
     // Newly-rendered filings were queued incrementally as each PDF landed. Also
     // queue any already-rendered filings (skipped by dedup) that were never
@@ -1310,6 +1322,11 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     });
     const cikByTicker = new Map<string, string>([[filing.ticker, filing.cik]]);
     const result = await runFetchPipeline(input, { userId, cikByTicker });
+    // Sweep any row this retry left at 'rendering' (e.g. the watchdog killed
+    // mid-attempt) so the retry doesn't replace one stuck row with another.
+    storage
+      .recoverStaleRenders([filing.ticker])
+      .catch((err) => console.error("Stale-render recovery failed:", err));
     if (!result.success) {
       return res.status(500).json({ error: result.error || "Retry render failed" });
     }
