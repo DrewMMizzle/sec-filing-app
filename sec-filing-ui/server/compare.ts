@@ -1,6 +1,6 @@
 import { diffWords } from "diff";
 import type { Filing } from "@shared/schema";
-import { MODEL, getAnthropicClient, resolvePdfPath, extractPdfText } from "./review";
+import { MODEL, getAnthropicClient, resolvePdfPath, extractPdfText, reviewCostUsd } from "./review";
 import type { RegistrationFiling } from "./sec-edgar";
 
 export type SectionKey = "risk_factors" | "mdna" | "legal";
@@ -54,19 +54,31 @@ const SECTION_MAX_CHARS = 80_000;
 const REGISTRATION_SECTION_MAX_CHARS = 120_000;
 const REGISTRATION_FULL_MAX_CHARS = 180_000;
 
+// Word boundaries on every heading so /business/ doesn't match
+// "businesses", /dilution/ doesn't match "dilutionary", etc. The
+// extractRegistrationSection caller still picks the LONGEST match across
+// occurrences, so the regex doesn't need to nail the heading exactly —
+// it just needs to not snap to a random inline mention.
 const REGISTRATION_SECTION_HEADINGS: Record<Exclude<RegistrationSectionKey, "all">, RegExp> = {
-  risk_factors: /risk\s+factors/i,
-  prospectus_summary: /prospectus\s+summary/i,
-  business: /business/i,
-  mdna: /management[’'`]s\s+discussion\s+and\s+analysis/i,
-  use_of_proceeds: /use\s+of\s+proceeds/i,
-  dilution: /dilution/i,
-  capitalization: /capitalization/i,
-  executive_compensation: /executive\s+compensation/i,
-  underwriting: /underwriting/i,
+  risk_factors: /\brisk\s+factors\b/i,
+  prospectus_summary: /\bprospectus\s+summary\b/i,
+  business: /\bbusiness\b/i,
+  mdna: /\bmanagement[’'`]s\s+discussion\s+and\s+analysis\b/i,
+  use_of_proceeds: /\buse\s+of\s+proceeds\b/i,
+  dilution: /\bdilution\b/i,
+  capitalization: /\bcapitalization\b/i,
+  executive_compensation: /\bexecutive\s+compensation\b/i,
+  underwriting: /\bunderwriting\b/i,
 };
 
-const REGISTRATION_NEXT_HEADING = /\n[^\S\r\n]*(?:prospectus\s+summary|risk\s+factors|use\s+of\s+proceeds|dividend\s+policy|capitalization|dilution|management[’'`]s\s+discussion\s+and\s+analysis|business|management|executive\s+compensation|principal\s+stockholders|certain\s+relationships|related\s+party\s+transactions|description\s+of\s+capital\s+stock|shares\s+eligible\s+for\s+future\s+sale|material\s+u\.?s\.?\s+federal\s+income\s+tax|underwriting|legal\s+matters|experts|where\s+you\s+can\s+find\s+more\s+information|index\s+to\s+financial\s+statements|item\s+\d+[a-z]?)\b/gi;
+// Section-ending heading for S-1 / S-1/A documents. Required to be at a
+// line start. Critically does NOT include single-word "business" or
+// "management" alone — htmlToText creates a newline at every paragraph
+// break, so an inline "Our business..." or "Management has..." paragraph
+// would otherwise truncate the captured section to a tiny fragment.
+// Only multi-word S-1 section names are included as boundaries — those
+// are specific enough to be real headings.
+const REGISTRATION_NEXT_HEADING = /\n[^\S\r\n]*(?:prospectus\s+summary|risk\s+factors|use\s+of\s+proceeds|dividend\s+policy|capitalization|dilution|management[’'`]s\s+discussion\s+and\s+analysis|executive\s+compensation|principal\s+stockholders|certain\s+relationships|related\s+party\s+transactions|description\s+of\s+capital\s+stock|shares\s+eligible\s+for\s+future\s+sale|material\s+u\.?s\.?\s+federal\s+income\s+tax|underwriting|legal\s+matters|experts\b|where\s+you\s+can\s+find\s+more\s+information|index\s+to\s+financial\s+statements|item\s+\d+[a-z]?)\b/gi;
 
 // Extract a named section from filing text. Heuristic: find each occurrence of
 // the heading, capture to the next line-leading "Item N" header, and keep the
@@ -93,14 +105,35 @@ export function extractSection(
   return best.slice(0, maxChars);
 }
 
+// Common named entities seen in SEC HTML prose. Numeric entities are
+// covered by the &#NNN;/&#xHH; replacements below the named ones.
+const NAMED_ENTITIES: Record<string, string> = {
+  nbsp: " ",
+  amp: "&",
+  lt: "<",
+  gt: ">",
+  quot: '"',
+  apos: "'",
+  mdash: "—",
+  ndash: "–",
+  ldquo: "“",
+  rdquo: "”",
+  lsquo: "‘",
+  rsquo: "’",
+  hellip: "…",
+  bull: "•",
+  middot: "·",
+  copy: "©",
+  reg: "®",
+  trade: "™",
+};
+
 function decodeHtmlEntities(value: string): string {
   return value
-    .replace(/&nbsp;|&#160;/gi, " ")
-    .replace(/&amp;/gi, "&")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">")
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&([a-z]+);/gi, (m, name: string) => {
+      const k = name.toLowerCase();
+      return NAMED_ENTITIES[k] ?? m;
+    })
     .replace(/&#(\d+);/g, (_m, n) => String.fromCharCode(Number(n)))
     .replace(/&#x([0-9a-f]+);/gi, (_m, n) => String.fromCharCode(parseInt(n, 16)));
 }
@@ -122,20 +155,55 @@ function htmlToText(html: string): string {
     .trim();
 }
 
+const SEC_FETCH_TIMEOUT_MS = 30_000;
+
 async function fetchSecPrimaryDocumentText(url: string): Promise<string> {
-  const res = await fetch(url, {
-    headers: {
-      "User-Agent": process.env.SEC_USER_AGENT || "DotAdda ameister@dotadda.com",
-      Accept: "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8",
-    },
-  });
-  if (!res.ok) throw new Error(`SEC primary document returned ${res.status}`);
-  return htmlToText(await res.text());
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), SEC_FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      headers: {
+        "User-Agent": process.env.SEC_USER_AGENT || "DotAdda ameister@dotadda.com",
+        Accept: "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8",
+      },
+      signal: controller.signal,
+    });
+    if (!res.ok) throw new Error(`SEC primary document returned ${res.status}`);
+    return htmlToText(await res.text());
+  } catch (err: any) {
+    if (controller.signal.aborted) {
+      throw new Error(
+        `SEC primary document fetch timed out after ${SEC_FETCH_TIMEOUT_MS / 1000}s`,
+      );
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
-function capped(text: string, maxChars: number): string {
+// Three-way sample for the "all material changes" path. The previous
+// version just kept the first maxChars, which on a 500k-char S-1 silently
+// dropped MD&A, executive comp, and underwriting — exactly the sections
+// most likely to change between an S-1 and S-1/A. Splitting the budget
+// across front / middle / back keeps representative coverage from every
+// part of the document.
+function sampledForAll(text: string, maxChars: number): string {
   if (text.length <= maxChars) return text;
-  return `${text.slice(0, maxChars)}\n\n[Truncated at ${maxChars.toLocaleString()} characters for comparison.]`;
+  const perSlice = Math.floor(maxChars / 3);
+  const mid = Math.max(0, Math.floor(text.length / 2) - Math.floor(perSlice / 2));
+  const front = text.slice(0, perSlice).trim();
+  const middle = text.slice(mid, mid + perSlice).trim();
+  const back = text.slice(text.length - perSlice).trim();
+  return [
+    "[Front of the filing:]",
+    front,
+    "\n[Middle of the filing:]",
+    middle,
+    "\n[Back of the filing:]",
+    back,
+    `\n[Sampled at ~${maxChars.toLocaleString()} characters total — front, middle, and back slices of the SEC primary document.]`,
+  ].join("\n\n");
 }
 
 export function extractRegistrationSection(
@@ -334,7 +402,18 @@ export async function compareFilings(a: Filing, b: Filing, key: SectionKey): Pro
     { form: laterF.filingType, date: laterF.filingDate || "unknown", text: secL },
   );
   result.changelog = changelog;
-  result.costUsd = Math.round(((usage.inputTokens * 5 + usage.outputTokens * 25) / 1_000_000) * 100) / 100;
+  // Reuse the shared pricing helper so a future model price change updates
+  // both review and compare cost lines from one place. The helper expects
+  // cache-token fields; Claude compare doesn't use prompt caching here, so
+  // those are zero.
+  result.costUsd = Math.round(
+    reviewCostUsd({
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+    }) * 100,
+  ) / 100;
   return result;
 }
 
@@ -380,9 +459,13 @@ export async function compareRegistrationFilings(
     fetchSecPrimaryDocumentText(laterF.primaryDocUrl),
   ]);
   const secE =
-    key === "all" ? capped(textE, REGISTRATION_FULL_MAX_CHARS) : extractRegistrationSection(textE, key);
+    key === "all"
+      ? sampledForAll(textE, REGISTRATION_FULL_MAX_CHARS)
+      : extractRegistrationSection(textE, key);
   const secL =
-    key === "all" ? capped(textL, REGISTRATION_FULL_MAX_CHARS) : extractRegistrationSection(textL, key);
+    key === "all"
+      ? sampledForAll(textL, REGISTRATION_FULL_MAX_CHARS)
+      : extractRegistrationSection(textL, key);
 
   result.earlier.found = !!secE;
   result.later.found = !!secL;
@@ -402,10 +485,21 @@ export async function compareRegistrationFilings(
     { form: laterF.form, date: laterF.filingDate || "unknown", text: secL },
   );
   result.changelog = changelog;
-  result.costUsd = Math.round(((usage.inputTokens * 5 + usage.outputTokens * 25) / 1_000_000) * 100) / 100;
+  // Reuse the shared pricing helper so a future model price change updates
+  // both review and compare cost lines from one place. The helper expects
+  // cache-token fields; Claude compare doesn't use prompt caching here, so
+  // those are zero.
+  result.costUsd = Math.round(
+    reviewCostUsd({
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+    }) * 100,
+  ) / 100;
   if (key === "all") {
     result.note =
-      "Compared SEC primary document HTML directly. Long filings are capped before Claude analysis to keep the request bounded.";
+      "Compared SEC primary document HTML directly. Long filings are sampled across front, middle, and back slices before Claude analysis so coverage isn't biased to the early sections.";
   }
   return result;
 }
