@@ -1,4 +1,5 @@
 import { useState } from "react";
+import type { ReactNode } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { Card } from "@/components/ui/card";
@@ -6,6 +7,13 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { Checkbox } from "@/components/ui/checkbox";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { useToast } from "@/hooks/use-toast";
 import {
   AlertDialog,
@@ -17,7 +25,17 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
-import { Rocket, Search, Loader2, AlertCircle, Sparkles } from "lucide-react";
+import {
+  Rocket,
+  Search,
+  Loader2,
+  AlertCircle,
+  Sparkles,
+  GitCompareArrows,
+  Plus,
+  Minus,
+  Pencil,
+} from "lucide-react";
 
 // ─── Types mirroring the /api/registration/* endpoints ───────────────
 type EdgarCompany = { cik: string; name: string; ticker?: string };
@@ -38,6 +56,49 @@ type RenderResponse = {
   companyName: string;
   rendered: number;
 };
+type RegistrationSectionKey =
+  | "all"
+  | "risk_factors"
+  | "prospectus_summary"
+  | "business"
+  | "mdna"
+  | "use_of_proceeds"
+  | "dilution"
+  | "capitalization"
+  | "executive_compensation"
+  | "underwriting";
+type DiffSegment = { value: string; added?: boolean; removed?: boolean };
+type ChangeItem = { headline: string; detail: string };
+type Changelog = {
+  unchanged: boolean;
+  summary: string;
+  added: ChangeItem[];
+  removed: ChangeItem[];
+  changed: ChangeItem[];
+};
+type CompareResult = {
+  section: RegistrationSectionKey;
+  sectionLabel: string;
+  earlier: { accession: string; form: string; date: string; found: boolean; sourceUrl: string };
+  later: { accession: string; form: string; date: string; found: boolean; sourceUrl: string };
+  diff: DiffSegment[] | null;
+  changelog: Changelog | null;
+  costUsd: number;
+  note?: string;
+};
+
+const REGISTRATION_COMPARE_SECTIONS: Array<{ key: RegistrationSectionKey; label: string }> = [
+  { key: "risk_factors", label: "Risk Factors" },
+  { key: "prospectus_summary", label: "Prospectus Summary" },
+  { key: "business", label: "Business" },
+  { key: "mdna", label: "MD&A" },
+  { key: "use_of_proceeds", label: "Use of Proceeds" },
+  { key: "dilution", label: "Dilution" },
+  { key: "capitalization", label: "Capitalization" },
+  { key: "executive_compensation", label: "Executive Compensation" },
+  { key: "underwriting", label: "Underwriting" },
+  { key: "all", label: "All material changes" },
+];
 
 // Reviewing one S-1 / S-1/A is genuinely expensive (large input, $5/1M
 // input tokens for Opus 4.7) — show this estimate before the user opts
@@ -50,6 +111,8 @@ export default function Registration() {
   const [picked, setPicked] = useState<EdgarCompany | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [reviewConfirm, setReviewConfirm] = useState<string | null>(null);
+  const [compareSection, setCompareSection] = useState<RegistrationSectionKey>("risk_factors");
+  const [compareResult, setCompareResult] = useState<CompareResult | null>(null);
 
   // ─── Search ────────────────────────────────────────────────────────
   const search = useMutation<EdgarCompany[], Error, string>({
@@ -109,6 +172,40 @@ export default function Registration() {
       toast({ title: "Render failed", description: err.message, variant: "destructive" }),
   });
 
+  // ─── Compare ───────────────────────────────────────────────────────
+  // Compare selected S-1 / S-1/A versions directly from SEC primary HTML.
+  // This does not require the filings to render to PDF first.
+  const compare = useMutation<
+    CompareResult,
+    Error,
+    { accessions: string[]; section: RegistrationSectionKey }
+  >({
+    mutationFn: async ({ accessions, section }) => {
+      if (!picked) throw new Error("No company picked");
+      if (accessions.length !== 2) throw new Error("Pick exactly two filings to compare");
+      const res = await apiRequest("POST", "/api/registration/compare", {
+        cik: picked.cik,
+        accessionA: accessions[0],
+        accessionB: accessions[1],
+        section,
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || "Comparison failed");
+      }
+      return res.json();
+    },
+    onSuccess: (data) => {
+      setCompareResult(data);
+      toast({
+        title: "Comparison complete",
+        description: `${data.earlier.form} ${data.earlier.date} to ${data.later.form} ${data.later.date}`,
+      });
+    },
+    onError: (err) =>
+      toast({ title: "Comparison failed", description: err.message, variant: "destructive" }),
+  });
+
   // ─── Review (opt-in, per filing) ───────────────────────────────────
   const review = useMutation<{ ok: boolean }, Error, string>({
     mutationFn: async (accession) => {
@@ -128,6 +225,7 @@ export default function Registration() {
     if (!trimmed) return;
     setPicked(null);
     setSelected(new Set());
+    setCompareResult(null);
     search.mutate(trimmed);
   };
 
@@ -147,6 +245,19 @@ export default function Registration() {
   const renderSelected = () => {
     if (selected.size === 0) return;
     render.mutate({ accessions: Array.from(selected) });
+  };
+
+  const compareSelected = () => {
+    if (selected.size !== 2) {
+      toast({
+        title: "Pick exactly two filings",
+        description: "Select the original S-1 and one S-1/A amendment to compare.",
+        variant: "destructive",
+      });
+      return;
+    }
+    setCompareResult(null);
+    compare.mutate({ accessions: Array.from(selected), section: compareSection });
   };
 
   const filings = filingsQuery.data ?? [];
@@ -219,6 +330,7 @@ export default function Registration() {
               onClick={() => {
                 setPicked(c);
                 setSelected(new Set());
+                setCompareResult(null);
               }}
               data-testid={`button-registration-pick-${c.cik}`}
             >
@@ -243,7 +355,16 @@ export default function Registration() {
                 {picked.ticker ? ` · ${picked.ticker}` : " · pre-IPO"}
               </p>
             </div>
-            <Button variant="ghost" size="sm" onClick={() => setPicked(null)} data-testid="button-registration-back">
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => {
+                setPicked(null);
+                setSelected(new Set());
+                setCompareResult(null);
+              }}
+              data-testid="button-registration-back"
+            >
               Pick another
             </Button>
           </Card>
@@ -264,7 +385,43 @@ export default function Registration() {
 
           {filings.length > 0 && (
             <>
-              <div className="flex items-center justify-end gap-2 mb-3">
+              <div className="flex flex-col gap-2 mb-3 sm:flex-row sm:items-center sm:justify-between">
+                <div className="flex flex-wrap items-center gap-2">
+                  <Select
+                    value={compareSection}
+                    onValueChange={(value) => setCompareSection(value as RegistrationSectionKey)}
+                  >
+                    <SelectTrigger className="h-9 w-[210px]" data-testid="select-registration-compare-section">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {REGISTRATION_COMPARE_SECTIONS.map((section) => (
+                        <SelectItem key={section.key} value={section.key}>
+                          {section.label}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <Button
+                    variant="outline"
+                    onClick={compareSelected}
+                    disabled={selected.size !== 2 || compare.isPending}
+                    data-testid="button-registration-compare"
+                  >
+                    {compare.isPending ? (
+                      <>
+                        <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                        Comparing...
+                      </>
+                    ) : (
+                      <>
+                        <GitCompareArrows className="w-4 h-4 mr-2" />
+                        Compare selected
+                      </>
+                    )}
+                  </Button>
+                </div>
+                <div className="flex items-center justify-end gap-2">
                 <Button
                   variant="outline"
                   onClick={renderLatest}
@@ -294,6 +451,7 @@ export default function Registration() {
                     `Render selected (${selected.size})`
                   )}
                 </Button>
+              </div>
               </div>
 
               <Card className="divide-y">
@@ -362,6 +520,70 @@ export default function Registration() {
                   );
                 })}
               </Card>
+
+              {compareResult && (
+                <Card className="mt-4 p-4 space-y-3">
+                  <div className="flex items-center gap-2 text-sm flex-wrap border-b pb-2">
+                    <GitCompareArrows className="w-4 h-4 text-primary" />
+                    <span className="font-semibold">{compareResult.sectionLabel}</span>
+                    <Badge variant="outline">
+                      {compareResult.earlier.form} {compareResult.earlier.date}
+                    </Badge>
+                    <span className="text-muted-foreground">to</span>
+                    <Badge variant="outline">
+                      {compareResult.later.form} {compareResult.later.date}
+                    </Badge>
+                  </div>
+
+                  {compareResult.note && (
+                    <p className="rounded-md border border-amber-600/30 bg-amber-600/10 p-3 text-xs text-muted-foreground">
+                      {compareResult.note}
+                    </p>
+                  )}
+
+                  {compareResult.changelog ? (
+                    <>
+                      <p className="text-sm">{compareResult.changelog.summary}</p>
+                      {compareResult.changelog.added.length > 0 && (
+                        <ChangeGroup
+                          title="Added"
+                          icon={<Plus className="w-3.5 h-3.5 text-green-400" />}
+                          items={compareResult.changelog.added}
+                        />
+                      )}
+                      {compareResult.changelog.removed.length > 0 && (
+                        <ChangeGroup
+                          title="Removed"
+                          icon={<Minus className="w-3.5 h-3.5 text-red-400" />}
+                          items={compareResult.changelog.removed}
+                        />
+                      )}
+                      {compareResult.changelog.changed.length > 0 && (
+                        <ChangeGroup
+                          title="Changed"
+                          icon={<Pencil className="w-3.5 h-3.5 text-amber-400" />}
+                          items={compareResult.changelog.changed}
+                        />
+                      )}
+                      {compareResult.changelog.unchanged && (
+                        <p className="text-xs text-muted-foreground">
+                          Claude did not identify material changes in this section.
+                        </p>
+                      )}
+                    </>
+                  ) : (
+                    <p className="text-sm text-muted-foreground">
+                      No changelog was returned for this comparison.
+                    </p>
+                  )}
+
+                  {compareResult.costUsd > 0 && (
+                    <p className="text-[11px] text-muted-foreground">
+                      Claude comparison cost: ${compareResult.costUsd.toFixed(2)}
+                    </p>
+                  )}
+                </Card>
+              )}
             </>
           )}
         </div>
@@ -395,6 +617,27 @@ export default function Registration() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+    </div>
+  );
+}
+
+function ChangeGroup({ title, icon, items }: { title: string; icon: ReactNode; items: ChangeItem[] }) {
+  return (
+    <div className="rounded-md border border-border/60 bg-muted/30 p-3">
+      <div className="flex items-center gap-1.5 mb-2">
+        {icon}
+        <span className="text-sm font-semibold">
+          {title} ({items.length})
+        </span>
+      </div>
+      <div className="space-y-2">
+        {items.map((item, i) => (
+          <div key={i} className="rounded-md border border-border/60 bg-background/50 p-2.5">
+            <p className="text-sm font-medium">{item.headline}</p>
+            <p className="text-xs text-muted-foreground mt-0.5">{item.detail}</p>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }

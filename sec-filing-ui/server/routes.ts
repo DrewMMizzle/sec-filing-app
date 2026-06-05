@@ -25,7 +25,14 @@ import type { ChildProcess } from "child_process";
 let currentFetchChild: ChildProcess | null = null;
 import { chatAboutFindings, chatAboutFiling } from "./chat";
 import { findPageForQuote } from "./pdf-locate";
-import { compareFilings, SECTION_LABELS, type SectionKey } from "./compare";
+import {
+  compareFilings,
+  compareRegistrationFilings,
+  REGISTRATION_SECTION_LABELS,
+  SECTION_LABELS,
+  type RegistrationSectionKey,
+  type SectionKey,
+} from "./compare";
 import { db } from "./storage";
 import { tickers as tickersTable, filings as filingsTable } from "@shared/schema";
 import { eq } from "drizzle-orm";
@@ -235,7 +242,23 @@ function runFetchPipeline(
           error: `Pipeline stalled (no output for ${IDLE_TIMEOUT_MS / 60000} min) and was stopped after rendering ${completedAccessions.length} filing(s). Run it again to resume.`,
         });
       } else if (code === 0 && doneEvent) {
-        resolve({ success: true, events, completedAccessions, doneEvent });
+        const totalErrors = Number(doneEvent.total_errors ?? 0);
+        if (totalErrors > 0 && completedAccessions.length === 0) {
+          const lastError = [...events]
+            .reverse()
+            .find((e) => e?.event === "error" && typeof e?.message === "string");
+          resolve({
+            success: false,
+            events,
+            completedAccessions,
+            doneEvent,
+            error:
+              lastError?.message ||
+              `Pipeline finished with ${totalErrors} render error(s) and no completed PDFs.`,
+          });
+        } else {
+          resolve({ success: true, events, completedAccessions, doneEvent });
+        }
       } else {
         resolve({ success: false, events, completedAccessions, error: stderrOutput || "Pipeline process failed" });
       }
@@ -1564,6 +1587,51 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
       });
     } catch (e: any) {
       res.status(500).json({ error: e?.message || "Registration render failed" });
+    }
+  });
+
+  app.post("/api/registration/compare", requireAuth, async (req, res) => {
+    if (!isReviewEnabled()) {
+      return res
+        .status(409)
+        .json({ error: "Claude comparison is not configured (ANTHROPIC_API_KEY is not set)." });
+    }
+
+    const body = req.body as {
+      cik?: unknown;
+      accessionA?: unknown;
+      accessionB?: unknown;
+      section?: unknown;
+    };
+    const cikDigits = typeof body.cik === "string" ? body.cik.replace(/\D/g, "") : "";
+    const accessionA = typeof body.accessionA === "string" ? body.accessionA.trim() : "";
+    const accessionB = typeof body.accessionB === "string" ? body.accessionB.trim() : "";
+    if (!cikDigits) return res.status(400).json({ error: "cik is required" });
+    if (!accessionA || !accessionB) {
+      return res.status(400).json({ error: "accessionA and accessionB are required" });
+    }
+    if (accessionA === accessionB) {
+      return res.status(400).json({ error: "Pick two different filings" });
+    }
+    const section =
+      typeof body.section === "string" && body.section in REGISTRATION_SECTION_LABELS
+        ? (body.section as RegistrationSectionKey)
+        : "risk_factors";
+
+    try {
+      const filings = await listRegistrationFilings(cikDigits);
+      const fa = filings.find((f) => f.accessionNumber === accessionA);
+      const fb = filings.find((f) => f.accessionNumber === accessionB);
+      if (!fa || !fb) {
+        return res
+          .status(404)
+          .json({ error: "Registration filing not found for this CIK" });
+      }
+      const result = await compareRegistrationFilings(fa, fb, section);
+      res.json(result);
+    } catch (e: any) {
+      console.error("Registration comparison failed:", e?.message || e);
+      res.status(500).json({ error: e?.message || "Registration comparison failed" });
     }
   });
 }

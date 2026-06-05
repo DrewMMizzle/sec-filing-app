@@ -1,6 +1,7 @@
 import { diffWords } from "diff";
 import type { Filing } from "@shared/schema";
 import { MODEL, getAnthropicClient, resolvePdfPath, extractPdfText } from "./review";
+import type { RegistrationFiling } from "./sec-edgar";
 
 export type SectionKey = "risk_factors" | "mdna" | "legal";
 
@@ -8,6 +9,31 @@ export const SECTION_LABELS: Record<SectionKey, string> = {
   risk_factors: "Risk Factors",
   mdna: "Management's Discussion & Analysis",
   legal: "Legal Proceedings",
+};
+
+export type RegistrationSectionKey =
+  | "all"
+  | "risk_factors"
+  | "prospectus_summary"
+  | "business"
+  | "mdna"
+  | "use_of_proceeds"
+  | "dilution"
+  | "capitalization"
+  | "executive_compensation"
+  | "underwriting";
+
+export const REGISTRATION_SECTION_LABELS: Record<RegistrationSectionKey, string> = {
+  all: "All Material Changes",
+  risk_factors: "Risk Factors",
+  prospectus_summary: "Prospectus Summary",
+  business: "Business",
+  mdna: "Management's Discussion & Analysis",
+  use_of_proceeds: "Use of Proceeds",
+  dilution: "Dilution",
+  capitalization: "Capitalization",
+  executive_compensation: "Executive Compensation",
+  underwriting: "Underwriting",
 };
 
 // Heading text used to locate each section. Matched by name (not item number),
@@ -25,6 +51,22 @@ const SECTION_HEADINGS: Record<SectionKey, RegExp> = {
 const NEXT_ITEM = /\n[^\S\r\n]*item\s+\d+[a-z]?\b[.:)\s]/gi;
 
 const SECTION_MAX_CHARS = 80_000;
+const REGISTRATION_SECTION_MAX_CHARS = 120_000;
+const REGISTRATION_FULL_MAX_CHARS = 180_000;
+
+const REGISTRATION_SECTION_HEADINGS: Record<Exclude<RegistrationSectionKey, "all">, RegExp> = {
+  risk_factors: /risk\s+factors/i,
+  prospectus_summary: /prospectus\s+summary/i,
+  business: /business/i,
+  mdna: /management[’'`]s\s+discussion\s+and\s+analysis/i,
+  use_of_proceeds: /use\s+of\s+proceeds/i,
+  dilution: /dilution/i,
+  capitalization: /capitalization/i,
+  executive_compensation: /executive\s+compensation/i,
+  underwriting: /underwriting/i,
+};
+
+const REGISTRATION_NEXT_HEADING = /\n[^\S\r\n]*(?:prospectus\s+summary|risk\s+factors|use\s+of\s+proceeds|dividend\s+policy|capitalization|dilution|management[’'`]s\s+discussion\s+and\s+analysis|business|management|executive\s+compensation|principal\s+stockholders|certain\s+relationships|related\s+party\s+transactions|description\s+of\s+capital\s+stock|shares\s+eligible\s+for\s+future\s+sale|material\s+u\.?s\.?\s+federal\s+income\s+tax|underwriting|legal\s+matters|experts|where\s+you\s+can\s+find\s+more\s+information|index\s+to\s+financial\s+statements|item\s+\d+[a-z]?)\b/gi;
 
 // Extract a named section from filing text. Heuristic: find each occurrence of
 // the heading, capture to the next line-leading "Item N" header, and keep the
@@ -47,6 +89,71 @@ export function extractSection(
   }
   // The longest candidate filters out short table-of-contents matches; this
   // floor just rejects the case where only a TOC line exists.
+  if (best.length < 80) return null;
+  return best.slice(0, maxChars);
+}
+
+function decodeHtmlEntities(value: string): string {
+  return value
+    .replace(/&nbsp;|&#160;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&#(\d+);/g, (_m, n) => String.fromCharCode(Number(n)))
+    .replace(/&#x([0-9a-f]+);/gi, (_m, n) => String.fromCharCode(parseInt(n, 16)));
+}
+
+function htmlToText(html: string): string {
+  return decodeHtmlEntities(
+    html
+      .replace(/<script[\s\S]*?<\/script>/gi, " ")
+      .replace(/<style[\s\S]*?<\/style>/gi, " ")
+      .replace(/<\s*br\s*\/?>/gi, "\n")
+      .replace(/<\/\s*(p|div|tr|table|h[1-6]|li|section|article)\s*>/gi, "\n")
+      .replace(/<\s*(p|div|tr|table|h[1-6]|li|section|article)\b[^>]*>/gi, "\n")
+      .replace(/<[^>]+>/g, " "),
+  )
+    .replace(/\r/g, "")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n[ \t]+/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+async function fetchSecPrimaryDocumentText(url: string): Promise<string> {
+  const res = await fetch(url, {
+    headers: {
+      "User-Agent": process.env.SEC_USER_AGENT || "DotAdda ameister@dotadda.com",
+      Accept: "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8",
+    },
+  });
+  if (!res.ok) throw new Error(`SEC primary document returned ${res.status}`);
+  return htmlToText(await res.text());
+}
+
+function capped(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, maxChars)}\n\n[Truncated at ${maxChars.toLocaleString()} characters for comparison.]`;
+}
+
+export function extractRegistrationSection(
+  text: string,
+  key: Exclude<RegistrationSectionKey, "all">,
+  maxChars: number = REGISTRATION_SECTION_MAX_CHARS,
+): string | null {
+  const heading = new RegExp(REGISTRATION_SECTION_HEADINGS[key].source, "gi");
+  let best = "";
+  let m: RegExpExecArray | null;
+  while ((m = heading.exec(text)) !== null) {
+    const from = m.index;
+    REGISTRATION_NEXT_HEADING.lastIndex = from + Math.max(m[0].length, 20);
+    const next = REGISTRATION_NEXT_HEADING.exec(text);
+    const end = next ? next.index : Math.min(text.length, from + maxChars);
+    const body = text.slice(from, end).trim();
+    if (body.length > best.length) best = body;
+  }
   if (best.length < 80) return null;
   return best.slice(0, maxChars);
 }
@@ -228,5 +335,77 @@ export async function compareFilings(a: Filing, b: Filing, key: SectionKey): Pro
   );
   result.changelog = changelog;
   result.costUsd = Math.round(((usage.inputTokens * 5 + usage.outputTokens * 25) / 1_000_000) * 100) / 100;
+  return result;
+}
+
+export type RegistrationCompareResult = {
+  section: RegistrationSectionKey;
+  sectionLabel: string;
+  earlier: { accession: string; form: string; date: string; found: boolean; sourceUrl: string };
+  later: { accession: string; form: string; date: string; found: boolean; sourceUrl: string };
+  diff: DiffSegment[] | null;
+  changelog: Changelog | null;
+  costUsd: number;
+  note?: string;
+};
+
+export async function compareRegistrationFilings(
+  a: RegistrationFiling,
+  b: RegistrationFiling,
+  key: RegistrationSectionKey,
+): Promise<RegistrationCompareResult> {
+  const [earlierF, laterF] =
+    (a.filingDate || "") <= (b.filingDate || "") ? [a, b] : [b, a];
+  const label = REGISTRATION_SECTION_LABELS[key];
+  const meta = (f: RegistrationFiling) => ({
+    accession: f.accessionNumber,
+    form: f.form,
+    date: f.filingDate || "unknown",
+    found: false,
+    sourceUrl: f.primaryDocUrl,
+  });
+
+  const result: RegistrationCompareResult = {
+    section: key,
+    sectionLabel: label,
+    earlier: meta(earlierF),
+    later: meta(laterF),
+    diff: null,
+    changelog: null,
+    costUsd: 0,
+  };
+
+  const [textE, textL] = await Promise.all([
+    fetchSecPrimaryDocumentText(earlierF.primaryDocUrl),
+    fetchSecPrimaryDocumentText(laterF.primaryDocUrl),
+  ]);
+  const secE =
+    key === "all" ? capped(textE, REGISTRATION_FULL_MAX_CHARS) : extractRegistrationSection(textE, key);
+  const secL =
+    key === "all" ? capped(textL, REGISTRATION_FULL_MAX_CHARS) : extractRegistrationSection(textL, key);
+
+  result.earlier.found = !!secE;
+  result.later.found = !!secL;
+
+  if (!secE || !secL) {
+    const missing = [!secE ? `the ${earlierF.form}` : null, !secL ? `the ${laterF.form}` : null]
+      .filter(Boolean)
+      .join(" and ");
+    result.note = `Couldn't locate the "${label}" section in ${missing}. Try "All Material Changes" for a broader SEC HTML comparison.`;
+    return result;
+  }
+
+  result.diff = key === "all" ? null : computeDiff(secE, secL);
+  const { changelog, usage } = await claudeCompare(
+    key === "all" ? `${label} (SEC primary document HTML text)` : label,
+    { form: earlierF.form, date: earlierF.filingDate || "unknown", text: secE },
+    { form: laterF.form, date: laterF.filingDate || "unknown", text: secL },
+  );
+  result.changelog = changelog;
+  result.costUsd = Math.round(((usage.inputTokens * 5 + usage.outputTokens * 25) / 1_000_000) * 100) / 100;
+  if (key === "all") {
+    result.note =
+      "Compared SEC primary document HTML directly. Long filings are capped before Claude analysis to keep the request bounded.";
+  }
   return result;
 }
