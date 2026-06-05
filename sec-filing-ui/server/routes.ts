@@ -1082,9 +1082,13 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
       const child = currentFetchChild;
       try {
         child.kill("SIGTERM");
-        // Escalate if the child doesn't exit promptly on its own.
+        // Escalate if the child doesn't exit promptly on its own. Node sets
+        // child.killed=true the instant a signal is *sent*, not when the
+        // process actually exits — so checking child.killed here would
+        // basically never escalate. exitCode stays null until the process
+        // truly exits, which is the right gate.
         setTimeout(() => {
-          if (!child.killed) {
+          if (child.exitCode === null) {
             try { child.kill("SIGKILL"); } catch { /* already gone */ }
           }
         }, 3000);
@@ -1299,13 +1303,18 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
   // main Fetch button skips anything already in the DB, so without this an
   // errored filing is stuck — the user has no way to retry it from the UI.
   // We delete the row, then run the pipeline scoped to just that filing so
-  // the pipeline re-fetches from SEC and creates a fresh row.
+  // the pipeline re-fetches from SEC and creates a fresh row. The original
+  // row is restored as `error` if the retry pipeline fails or returns
+  // nothing, so the user never loses the row (and therefore the Retry
+  // button on it) by clicking Retry.
   app.post("/api/filings/:accession/retry-render", requireAuth, async (req, res) => {
     const accession = req.params.accession as string;
     const filing = await storage.getFilingByAccession(accession);
     if (!filing) return res.status(404).json({ error: "Filing not found" });
     const userId = req.user!.id;
 
+    // Snapshot before delete so we can restore on failure / zero-result.
+    const snapshot = filing;
     await storage.deleteFiling(filing.id);
 
     const input = JSON.stringify({
@@ -1327,6 +1336,30 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     storage
       .recoverStaleRenders([filing.ticker])
       .catch((err) => console.error("Stale-render recovery failed:", err));
+
+    // If the pipeline didn't actually produce a replacement (failure, or
+    // returned but rendered 0), restore the original errored row so the
+    // user still has a target to retry.
+    const replacement = await storage.getFilingByAccession(accession);
+    const renderedAny = result.success && result.completedAccessions.length > 0;
+    if (!replacement && !renderedAny) {
+      await storage.upsertFiling({
+        ticker: snapshot.ticker,
+        cik: snapshot.cik,
+        accessionNumber: snapshot.accessionNumber,
+        filingType: snapshot.filingType,
+        filingDate: snapshot.filingDate,
+        pdfPath: snapshot.pdfPath,
+        pdfSize: snapshot.pdfSize,
+        status: "error",
+        errorMessage:
+          (result.error && `Retry failed: ${result.error}`) ||
+          snapshot.errorMessage ||
+          "Retry produced no replacement filing.",
+        createdAt: snapshot.createdAt,
+        userId: snapshot.userId,
+      });
+    }
     if (!result.success) {
       return res.status(500).json({ error: result.error || "Retry render failed" });
     }

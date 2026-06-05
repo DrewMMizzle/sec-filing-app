@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import logging
 from typing import Optional
+from urllib.parse import urlparse
 
-from playwright.async_api import async_playwright, Browser, BrowserContext
+from playwright.async_api import async_playwright, Browser, BrowserContext, Route, Request
 
 from src.config import get_settings
+from src.edgar.rate_limiter import acquire_sec_token
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +80,34 @@ STRIP_XBRL_JS = """
     }
 }
 """
+
+# Hosts whose subresource loads count against SEC's 10 req/s budget.
+# Anything else (e.g. fonts.googleapis.com) is passed through untouched.
+_SEC_HOST_SUFFIXES = ("sec.gov",)
+
+
+def _is_sec_host(url: str) -> bool:
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        return False
+    return any(host == suf or host.endswith("." + suf) for suf in _SEC_HOST_SUFFIXES)
+
+
+async def _throttle_sec_requests(route: Route, request: Request) -> None:
+    """Playwright route handler that gates SEC-origin requests through the
+    shared token-bucket limiter, so browser-issued subresource loads obey
+    the same 10 req/s rule that Python sec_get() does. Non-SEC requests
+    (Google fonts, etc.) continue immediately."""
+    if _is_sec_host(request.url):
+        await acquire_sec_token()
+    try:
+        await route.continue_()
+    except Exception:
+        # Page may have closed (e.g. abort during shutdown) — swallow so we
+        # don't propagate a routing error out of an unrelated request.
+        pass
+
 
 # Singleton browser management.
 _browser: Browser | None = None
@@ -184,6 +214,12 @@ async def render_url_to_pdf(
     context = await _get_context()
     page = await context.new_page()
     try:
+        # Gate browser-issued SEC requests through the global token bucket so
+        # Chromium can't blast hundreds of parallel asset loads at SEC and
+        # earn the IP a 429/403 — Playwright reissues each routed request via
+        # _throttle_sec_requests, which acquires from the shared limiter
+        # before letting SEC-host requests proceed.
+        await page.route("**/*", _throttle_sec_requests)
         await page.emulate_media(media="print")
 
         logger.info("Navigating to %s", url)
