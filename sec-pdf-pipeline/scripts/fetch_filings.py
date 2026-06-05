@@ -38,7 +38,11 @@ os.chdir(PROJECT_ROOT)
 from src.config import configure_logging
 from src.edgar.rate_limiter import sec_get, close_client
 from src.renderer.preprocess import preprocess_filing
-from src.renderer.playwright_render import render_html_to_pdf, close_browser
+from src.renderer.playwright_render import (
+    render_html_to_pdf,
+    render_s1_url_to_pdf,
+    close_browser,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -119,14 +123,49 @@ async def poll_ticker_with_dates(
 
 
 async def render_filing(filing_info: dict) -> dict:
-    """Preprocess and render one filing to PDF. Returns result dict."""
+    """Preprocess and render one filing to PDF. Returns result dict.
+
+    S-1 / S-1/A take the URL-render path (Chromium fetches assets directly
+    from SEC with rate-limited subresources) — preprocess+base64-inline
+    inflates these documents to tens of MB and is the documented wedge.
+    Other forms keep the existing preprocess+render_html_to_pdf path,
+    unchanged, so this code path can't regress normal renders.
+
+    For S-1 / S-1/A, also emits periodic heartbeat events so the Node-side
+    pipeline watchdog (which idle-times on stdout activity) doesn't
+    mistake a healthy multi-minute render for a hung pipeline.
+    """
     ticker = filing_info["ticker"]
     filing_type = filing_info["filing_type"]
     accession = filing_info["accession_number"]
     url = filing_info["primary_doc_url"]
 
-    html = await preprocess_filing(url)
-    pdf_bytes = await render_html_to_pdf(html)
+    if filing_type.upper().startswith("S-1"):
+        async def heartbeat():
+            try:
+                while True:
+                    await asyncio.sleep(60)
+                    emit({
+                        "event": "heartbeat",
+                        "ticker": ticker,
+                        "accession": accession,
+                        "filing_type": filing_type,
+                    })
+            except asyncio.CancelledError:
+                return
+
+        task = asyncio.create_task(heartbeat())
+        try:
+            pdf_bytes = await render_s1_url_to_pdf(url)
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+    else:
+        html = await preprocess_filing(url)
+        pdf_bytes = await render_html_to_pdf(html)
 
     safe_type = filing_type.replace(" ", "_")
     out_dir = OUTPUT_DIR / "filings" / ticker / safe_type
@@ -154,6 +193,10 @@ async def main() -> None:
     date_to = date.fromisoformat(date_to_str) if date_to_str else None
 
     skip_accessions = set(input_data.get("skip_accessions", []))
+    # When set, only these accessions are rendered (Registration / IPO mode
+    # uses this so a user-selected S-1 doesn't drag in other recent S-1s the
+    # date-range query happens to also match). Empty means "no whitelist".
+    target_accessions = set(input_data.get("target_accessions", []))
 
     total_rendered = 0
     total_skipped = 0
@@ -174,6 +217,9 @@ async def main() -> None:
                 limit=limit,
             )
 
+            # target_accessions, when present, narrows to just those rows.
+            if target_accessions:
+                found_filings = [f for f in found_filings if f["accession_number"] in target_accessions]
             new_filings = [f for f in found_filings if f["accession_number"] not in skip_accessions]
             skipped_filings = [f for f in found_filings if f["accession_number"] in skip_accessions]
 

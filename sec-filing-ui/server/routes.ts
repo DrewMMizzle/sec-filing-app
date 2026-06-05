@@ -10,6 +10,13 @@ import { hashPassword, verifyPassword, createSession, clearSession, requireAuth 
 import { ensureSP500Seeded } from "./seed-sp500";
 import { getSecTickerIndex } from "./sec-index";
 import { isReviewEnabled, kickReviewProcessor, reviewCostUsd, requestCancelReview, isReviewProcessing } from "./review";
+import {
+  lookupCikSubmissions,
+  searchEdgarByName,
+  listRegistrationFilings,
+  nameToLabel,
+  type EdgarCompany,
+} from "./sec-edgar";
 import { analyzeMdna, isMdnaEligible } from "./mdna";
 import type { ChildProcess } from "child_process";
 
@@ -95,7 +102,7 @@ type PipelineResult = {
 // fetch and re-render-missing endpoints.
 function runFetchPipeline(
   input: string,
-  ctx: { userId: number; cikByTicker: Map<string, string> },
+  ctx: { userId: number; cikByTicker: Map<string, string>; skipAutoReview?: boolean },
 ): Promise<PipelineResult> {
   return new Promise((resolve) => {
     const pythonScript = path.join(PIPELINE_ROOT, "scripts", "fetch_filings.py");
@@ -183,10 +190,13 @@ function runFetchPipeline(
                   appRelPath,
                   event.size,
                 );
-                if (isReviewEnabled()) {
+                if (isReviewEnabled() && !ctx.skipAutoReview) {
                   // Queue the review as soon as the PDF is rendered (and nudge
                   // the processor) so spend and review progress move during
                   // the run, instead of only after the entire batch finishes.
+                  // Registration / IPO mode passes skipAutoReview=true so
+                  // heavy S-1/S-1/A renders never auto-burn review budget —
+                  // the user can opt in per-filing afterward.
                   await storage.markFilingForReview(event.accession);
                   kickReviewProcessor().catch((err) =>
                     console.error("Review processor failed:", err),
@@ -1390,6 +1400,146 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
       res.json(matches);
     } catch (e: any) {
       res.status(500).json({ error: "Failed to search SEC tickers" });
+    }
+  });
+
+  // ───────────────────────────────────────────────────────────
+  // Registration / IPO mode — explicit, opt-in S-1 / S-1/A lane.
+  //
+  // Kept separate from the normal Fetch flow so heavy registration
+  // statements (often 500+ pages, image-dense) can't pollute regular
+  // public-company fetches:
+  //   - Render is single-filing, on demand, with skipAutoReview=true.
+  //   - Review is opt-in per filing via the existing
+  //     /api/filings/:accession/review endpoint.
+  //   - Filing types are locked to S-1 / S-1/A — no schema or default
+  //     changes leak into the normal fetch defaults.
+  // ───────────────────────────────────────────────────────────
+
+  app.get("/api/registration/search", requireAuth, async (req, res) => {
+    const q = typeof req.query.q === "string" ? req.query.q.trim() : "";
+    if (!q) return res.json([]);
+    try {
+      const matches: EdgarCompany[] = [];
+      const seen = new Set<string>();
+      const push = (m: EdgarCompany) => {
+        if (seen.has(m.cik)) return;
+        seen.add(m.cik);
+        matches.push(m);
+      };
+
+      // 1. Numeric → CIK confirmation via submissions JSON.
+      if (/^\d+$/.test(q)) {
+        const sub = await lookupCikSubmissions(q);
+        if (sub) push({ cik: sub.cik, name: sub.name, ticker: sub.tickers[0] });
+      } else {
+        // 2. Alpha → try the tickered-companies index first.
+        const idx = await getSecTickerIndex();
+        const tickerHit = idx.get(q.toUpperCase());
+        if (tickerHit) {
+          push({ cik: tickerHit.cik, name: tickerHit.name, ticker: q.toUpperCase() });
+        }
+      }
+
+      // 3. Always also run EDGAR full-text search so pre-IPO filers appear.
+      try {
+        const edgar = await searchEdgarByName(q);
+        for (const m of edgar) push(m);
+      } catch (err) {
+        console.warn("EDGAR search failed:", err);
+      }
+
+      res.json(matches.slice(0, 15));
+    } catch (e: any) {
+      console.error("Registration search failed:", e?.message || e);
+      res.status(502).json({ error: "Registration search failed" });
+    }
+  });
+
+  app.get("/api/registration/filings", requireAuth, async (req, res) => {
+    const cik = typeof req.query.cik === "string" ? req.query.cik : "";
+    if (!cik) return res.status(400).json({ error: "cik is required" });
+    try {
+      const filings = await listRegistrationFilings(cik);
+      res.json(filings);
+    } catch (e: any) {
+      console.error("Registration listing failed:", e?.message || e);
+      res.status(502).json({ error: "Failed to list registration filings" });
+    }
+  });
+
+  // Render specific S-1 / S-1/A filings on demand. Single-filing scope,
+  // skipAutoReview=true — review is opt-in afterwards via the regular
+  // per-filing review endpoint. The ticker label stored on the filings row
+  // is the SEC ticker if available, otherwise a name-derived placeholder —
+  // documented as the schema compromise (avoids a wider migration).
+  app.post("/api/registration/render", requireAuth, async (req, res) => {
+    const body = req.body as {
+      cik?: unknown;
+      companyName?: unknown;
+      ticker?: unknown;
+      accessions?: unknown;
+    };
+    const cikDigits = typeof body.cik === "string" ? body.cik.replace(/\D/g, "") : "";
+    if (!cikDigits) return res.status(400).json({ error: "cik is required" });
+    const accessions = Array.isArray(body.accessions)
+      ? (body.accessions as unknown[]).filter((a): a is string => typeof a === "string" && !!a)
+      : [];
+    if (accessions.length === 0) {
+      return res.status(400).json({ error: "accessions array is required" });
+    }
+    const companyName = typeof body.companyName === "string" ? body.companyName : "";
+    const explicitTicker = typeof body.ticker === "string" ? body.ticker.trim().toUpperCase() : "";
+
+    const sub = await lookupCikSubmissions(cikDigits);
+    if (!sub) return res.status(404).json({ error: "CIK not found at SEC" });
+    const label = explicitTicker || sub.tickers[0] || nameToLabel(companyName || sub.name);
+
+    const allFilings = await listRegistrationFilings(cikDigits);
+    const wanted = new Set(accessions);
+    const selected = allFilings.filter((f) => wanted.has(f.accessionNumber));
+    if (selected.length === 0) {
+      return res
+        .status(404)
+        .json({ error: "No matching S-1 / S-1/A filings found for the supplied accessions" });
+    }
+
+    const tickers = [
+      {
+        ticker: label,
+        cik: sub.cik,
+        filing_types: Array.from(new Set(selected.map((f) => f.form))),
+      },
+    ];
+    const dates = selected.map((f) => f.filingDate).filter(Boolean).sort();
+    const input = JSON.stringify({
+      tickers,
+      date_from: dates[0] || null,
+      date_to: dates[dates.length - 1] || null,
+      limit_per_ticker: Math.max(selected.length, 1),
+      target_accessions: selected.map((f) => f.accessionNumber),
+    });
+    const cikByTicker = new Map<string, string>([[label, sub.cik]]);
+    const userId = req.user!.id;
+    try {
+      const result = await runFetchPipeline(input, {
+        userId,
+        cikByTicker,
+        skipAutoReview: true,
+      });
+      if (!result.success) {
+        return res.status(500).json({ error: result.error || "Render failed", events: result.events });
+      }
+      res.json({
+        ok: true,
+        label,
+        cik: sub.cik,
+        companyName: sub.name,
+        rendered: result.completedAccessions.length,
+        events: result.events,
+      });
+    } catch (e: any) {
+      res.status(500).json({ error: e?.message || "Registration render failed" });
     }
   });
 }

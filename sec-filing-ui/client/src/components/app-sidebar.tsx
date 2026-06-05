@@ -27,7 +27,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { useToast } from "@/hooks/use-toast";
-import { List, Plus, FileText, Search, Database, LogOut, Share2, User, Sparkles, GitCompareArrows, MessageSquare, LineChart } from "lucide-react";
+import { List, Plus, FileText, Search, Database, LogOut, Share2, User, Sparkles, GitCompareArrows, MessageSquare, LineChart, Rocket } from "lucide-react";
 
 type WatchlistSummary = {
   id: number;
@@ -155,6 +155,18 @@ export function AppSidebar() {
                     <Link href="/mdna">
                       <LineChart className="w-4 h-4" />
                       <span>MD&amp;A</span>
+                    </Link>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+                <SidebarMenuItem>
+                  <SidebarMenuButton
+                    asChild
+                    isActive={location === "/registration"}
+                    data-testid="nav-registration"
+                  >
+                    <Link href="/registration">
+                      <Rocket className="w-4 h-4" />
+                      <span>Registration / IPO</span>
                     </Link>
                   </SidebarMenuButton>
                 </SidebarMenuItem>
