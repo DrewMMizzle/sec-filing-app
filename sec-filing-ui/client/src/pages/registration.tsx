@@ -26,6 +26,10 @@ type RegistrationFiling = {
   form: "S-1" | "S-1/A" | string;
   filingDate: string;
   primaryDocUrl: string;
+  // null when the filing has no DB row yet — i.e. it hasn't been rendered.
+  // "complete" means the PDF is on disk and the row is reviewable.
+  dbStatus: "pending" | "rendering" | "complete" | "error" | null;
+  reviewStatus: "pending" | "reviewing" | "done" | "error" | null;
 };
 type RenderResponse = {
   ok: boolean;
@@ -90,6 +94,11 @@ export default function Registration() {
     },
     onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ["/api/filings?slim=true"] });
+      // Refresh the registration listing so the just-rendered filing's
+      // dbStatus flips to "complete" and the Review button appears.
+      if (picked) {
+        queryClient.invalidateQueries({ queryKey: ["/api/registration/filings", picked.cik] });
+      }
       toast({
         title: data.rendered > 0 ? "Render complete" : "Pipeline ran but nothing rendered",
         description: `${data.companyName} → ${data.rendered} S-1 / S-1/A PDF(s)`,
@@ -288,38 +297,70 @@ export default function Registration() {
               </div>
 
               <Card className="divide-y">
-                {filings.map((f, i) => (
-                  <div
-                    key={f.accessionNumber}
-                    className="flex items-center gap-3 px-3 py-2 text-sm"
-                    data-testid={`registration-filing-${f.accessionNumber}`}
-                  >
-                    <Checkbox
-                      checked={selected.has(f.accessionNumber)}
-                      onCheckedChange={() => toggleAccession(f.accessionNumber)}
-                      data-testid={`checkbox-registration-${f.accessionNumber}`}
-                    />
-                    <Badge variant="secondary" className="text-[10px]">{f.form}</Badge>
-                    <span className="font-mono text-xs text-muted-foreground">{f.filingDate}</span>
-                    <span className="font-mono text-xs text-muted-foreground truncate flex-1">
-                      {f.accessionNumber}
-                    </span>
-                    {i === 0 && (
-                      <Badge variant="outline" className="text-[10px]">Latest</Badge>
-                    )}
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      className="h-7 text-xs"
-                      onClick={() => setReviewConfirm(f.accessionNumber)}
-                      data-testid={`button-review-${f.accessionNumber}`}
-                      title="Run Claude review on this filing (cost warning will appear)"
+                {filings.map((f, i) => {
+                  const rendered = f.dbStatus === "complete";
+                  const reviewing = f.reviewStatus === "pending" || f.reviewStatus === "reviewing";
+                  const reviewed = f.reviewStatus === "done";
+                  return (
+                    <div
+                      key={f.accessionNumber}
+                      className="flex items-center gap-3 px-3 py-2 text-sm"
+                      data-testid={`registration-filing-${f.accessionNumber}`}
                     >
-                      <Sparkles className="w-3 h-3 mr-1" />
-                      Review
-                    </Button>
-                  </div>
-                ))}
+                      <Checkbox
+                        checked={selected.has(f.accessionNumber)}
+                        onCheckedChange={() => toggleAccession(f.accessionNumber)}
+                        data-testid={`checkbox-registration-${f.accessionNumber}`}
+                      />
+                      <Badge variant="secondary" className="text-[10px]">{f.form}</Badge>
+                      <span className="font-mono text-xs text-muted-foreground">{f.filingDate}</span>
+                      <span className="font-mono text-xs text-muted-foreground truncate flex-1">
+                        {f.accessionNumber}
+                      </span>
+                      {i === 0 && (
+                        <Badge variant="outline" className="text-[10px]">Latest</Badge>
+                      )}
+                      {/* Status badges reflect the DB row, so the user can see
+                          which filings are rendered and reviewable. */}
+                      {f.dbStatus === "rendering" && (
+                        <Badge variant="default" className="text-[10px] bg-amber-600/20 text-amber-400 border-amber-600/30">
+                          Rendering
+                        </Badge>
+                      )}
+                      {f.dbStatus === "error" && (
+                        <Badge variant="destructive" className="text-[10px]">Error</Badge>
+                      )}
+                      {rendered && !reviewing && !reviewed && (
+                        <Badge variant="outline" className="text-[10px]">Rendered</Badge>
+                      )}
+                      {reviewing && (
+                        <Badge variant="default" className="text-[10px] bg-amber-600/20 text-amber-400 border-amber-600/30">
+                          Reviewing
+                        </Badge>
+                      )}
+                      {reviewed && (
+                        <Badge variant="default" className="text-[10px]">Reviewed</Badge>
+                      )}
+                      {/* Review button only appears once the filing is
+                          actually rendered (has a complete DB row) — calling
+                          /api/filings/:accession/review on an unrendered
+                          accession would just return 400. */}
+                      {rendered && !reviewing && !reviewed && (
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          className="h-7 text-xs"
+                          onClick={() => setReviewConfirm(f.accessionNumber)}
+                          data-testid={`button-review-${f.accessionNumber}`}
+                          title="Run Claude review on this filing (cost warning will appear)"
+                        >
+                          <Sparkles className="w-3 h-3 mr-1" />
+                          Review
+                        </Button>
+                      )}
+                    </div>
+                  );
+                })}
               </Card>
             </>
           )}

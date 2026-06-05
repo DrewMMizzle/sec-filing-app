@@ -349,6 +349,25 @@ export class DatabaseStorage {
     return rows[0];
   }
 
+  // Batch status lookup — the registration UI needs to know which EDGAR-listed
+  // S-1 / S-1/A filings already have a DB row (and at what status / review
+  // state) so it only shows the Review button for filings that are actually
+  // rendered. Returns just the small status fields, not the heavy review JSON.
+  async getFilingStatusesByAccessions(accessions: string[]): Promise<
+    Array<{ accessionNumber: string; status: string; reviewStatus: string | null }>
+  > {
+    if (accessions.length === 0) return [];
+    const rows = await db
+      .select({
+        accessionNumber: filings.accessionNumber,
+        status: filings.status,
+        reviewStatus: filings.reviewStatus,
+      })
+      .from(filings)
+      .where(inArray(filings.accessionNumber, accessions));
+    return rows;
+  }
+
   async upsertFiling(data: InsertFiling): Promise<Filing> {
     const existing = await this.getFilingByAccession(data.accessionNumber);
     if (existing) {

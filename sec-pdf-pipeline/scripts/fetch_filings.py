@@ -62,8 +62,15 @@ async def poll_ticker_with_dates(
     date_from: date | None,
     date_to: date | None,
     limit: int,
+    target_accessions: set[str] | None = None,
 ) -> list[dict]:
-    """Poll EDGAR and filter by date range."""
+    """Poll EDGAR and filter by date range.
+
+    When ``target_accessions`` is non-empty, only those accessions are
+    returned and the per-ticker ``limit`` cap is ignored — otherwise a
+    user-selected older S-1 could be silently dropped because the newer
+    S-1 in the same date range filled the limit first.
+    """
     url = SUBMISSIONS_URL.format(cik=cik)
     response = await sec_get(url)
     data = response.json()
@@ -78,11 +85,21 @@ async def poll_ticker_with_dates(
     primary_docs = recent.get("primaryDocument", [])
 
     watched = set(filing_types)
+    has_targets = bool(target_accessions)
     results = []
 
     for i in range(len(accessions)):
-        if len(results) >= limit:
+        # Only honor the limit when we're NOT filtering to specific
+        # accessions — otherwise the caller's whitelist could be cut off.
+        if not has_targets and len(results) >= limit:
             break
+
+        accession_dashed = accessions[i]
+
+        # Whitelist filter — applied BEFORE the limit so the registration
+        # flow's user-picked filing is never crowded out.
+        if has_targets and accession_dashed not in target_accessions:
+            continue
 
         form = forms[i] if i < len(forms) else ""
         if form not in watched:
@@ -102,7 +119,6 @@ async def poll_ticker_with_dates(
             if date_to and fd > date_to:
                 continue
 
-        accession_dashed = accessions[i]
         accession_nodash = accession_dashed.replace("-", "")
         cik_stripped = cik.lstrip("0") or "0"
         primary_doc_url = (
@@ -118,6 +134,11 @@ async def poll_ticker_with_dates(
             "ticker": ticker,
             "cik": cik,
         })
+
+        # Stop early once we've covered every target — saves work on
+        # companies with hundreds of historical filings.
+        if has_targets and len(results) >= len(target_accessions):
+            break
 
     return results
 
@@ -215,11 +236,12 @@ async def main() -> None:
                 date_from=date_from,
                 date_to=date_to,
                 limit=limit,
+                # Whitelist is applied INSIDE the poll loop, before the
+                # limit cap, so a user-selected older S-1 isn't crowded
+                # out by a newer one in the same date range.
+                target_accessions=target_accessions if target_accessions else None,
             )
 
-            # target_accessions, when present, narrows to just those rows.
-            if target_accessions:
-                found_filings = [f for f in found_filings if f["accession_number"] in target_accessions]
             new_filings = [f for f in found_filings if f["accession_number"] not in skip_accessions]
             skipped_filings = [f for f in found_filings if f["accession_number"] in skip_accessions]
 

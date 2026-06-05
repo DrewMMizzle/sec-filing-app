@@ -1460,8 +1460,22 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     const cik = typeof req.query.cik === "string" ? req.query.cik : "";
     if (!cik) return res.status(400).json({ error: "cik is required" });
     try {
-      const filings = await listRegistrationFilings(cik);
-      res.json(filings);
+      const edgarFilings = await listRegistrationFilings(cik);
+      // Enrich with each accession's DB render status so the UI can gate
+      // the Review button (it requires the filing to be rendered).
+      const statuses = await storage.getFilingStatusesByAccessions(
+        edgarFilings.map((f) => f.accessionNumber),
+      );
+      const byAcc = new Map(statuses.map((s) => [s.accessionNumber, s]));
+      const enriched = edgarFilings.map((f) => {
+        const s = byAcc.get(f.accessionNumber);
+        return {
+          ...f,
+          dbStatus: s?.status ?? null, // null | pending | rendering | complete | error
+          reviewStatus: s?.reviewStatus ?? null,
+        };
+      });
+      res.json(enriched);
     } catch (e: any) {
       console.error("Registration listing failed:", e?.message || e);
       res.status(502).json({ error: "Failed to list registration filings" });
@@ -1489,11 +1503,21 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
       return res.status(400).json({ error: "accessions array is required" });
     }
     const companyName = typeof body.companyName === "string" ? body.companyName : "";
-    const explicitTicker = typeof body.ticker === "string" ? body.ticker.trim().toUpperCase() : "";
+    const requestedTicker =
+      typeof body.ticker === "string" ? body.ticker.trim().toUpperCase() : "";
 
     const sub = await lookupCikSubmissions(cikDigits);
     if (!sub) return res.status(404).json({ error: "CIK not found at SEC" });
-    const label = explicitTicker || sub.tickers[0] || nameToLabel(companyName || sub.name);
+
+    // Trust SEC over the request body for the displayed label so a client
+    // can't render SpaceX's S-1 into the corpus labelled "AAPL". The
+    // client-supplied ticker is only honored if SEC confirms it for this
+    // CIK; otherwise the SEC ticker (if any) or a name-derived placeholder
+    // is used.
+    const secTickers = sub.tickers.map((t) => t.toUpperCase());
+    const trustedRequested =
+      requestedTicker && secTickers.includes(requestedTicker) ? requestedTicker : "";
+    const label = trustedRequested || sub.tickers[0] || nameToLabel(companyName || sub.name);
 
     const allFilings = await listRegistrationFilings(cikDigits);
     const wanted = new Set(accessions);
