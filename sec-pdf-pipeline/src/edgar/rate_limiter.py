@@ -67,6 +67,16 @@ def _get_limiter() -> TokenBucketLimiter:
     return _limiter
 
 
+async def acquire_sec_token() -> None:
+    """Acquire one SEC token from the shared bucket without issuing a request.
+
+    Used by callers that don't go through :func:`sec_get` but still need to
+    respect SEC's 10 req/s rule — specifically the Playwright route handler
+    that gates browser-issued subresource loads during S-1 renders.
+    """
+    await _get_limiter().acquire()
+
+
 async def get_sec_client() -> httpx.AsyncClient:
     """Return a shared :class:`httpx.AsyncClient` configured for SEC EDGAR.
 

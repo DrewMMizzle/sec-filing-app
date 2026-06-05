@@ -38,7 +38,11 @@ os.chdir(PROJECT_ROOT)
 from src.config import configure_logging
 from src.edgar.rate_limiter import sec_get, close_client
 from src.renderer.preprocess import preprocess_filing
-from src.renderer.playwright_render import render_html_to_pdf, close_browser
+from src.renderer.playwright_render import (
+    render_html_to_pdf,
+    render_s1_url_to_pdf,
+    close_browser,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -58,8 +62,15 @@ async def poll_ticker_with_dates(
     date_from: date | None,
     date_to: date | None,
     limit: int,
+    target_accessions: set[str] | None = None,
 ) -> list[dict]:
-    """Poll EDGAR and filter by date range."""
+    """Poll EDGAR and filter by date range.
+
+    When ``target_accessions`` is non-empty, only those accessions are
+    returned and the per-ticker ``limit`` cap is ignored — otherwise a
+    user-selected older S-1 could be silently dropped because the newer
+    S-1 in the same date range filled the limit first.
+    """
     url = SUBMISSIONS_URL.format(cik=cik)
     response = await sec_get(url)
     data = response.json()
@@ -74,11 +85,21 @@ async def poll_ticker_with_dates(
     primary_docs = recent.get("primaryDocument", [])
 
     watched = set(filing_types)
+    has_targets = bool(target_accessions)
     results = []
 
     for i in range(len(accessions)):
-        if len(results) >= limit:
+        # Only honor the limit when we're NOT filtering to specific
+        # accessions — otherwise the caller's whitelist could be cut off.
+        if not has_targets and len(results) >= limit:
             break
+
+        accession_dashed = accessions[i]
+
+        # Whitelist filter — applied BEFORE the limit so the registration
+        # flow's user-picked filing is never crowded out.
+        if has_targets and accession_dashed not in target_accessions:
+            continue
 
         form = forms[i] if i < len(forms) else ""
         if form not in watched:
@@ -98,7 +119,6 @@ async def poll_ticker_with_dates(
             if date_to and fd > date_to:
                 continue
 
-        accession_dashed = accessions[i]
         accession_nodash = accession_dashed.replace("-", "")
         cik_stripped = cik.lstrip("0") or "0"
         primary_doc_url = (
@@ -115,18 +135,58 @@ async def poll_ticker_with_dates(
             "cik": cik,
         })
 
+        # Stop early once we've covered every target — saves work on
+        # companies with hundreds of historical filings.
+        if has_targets and len(results) >= len(target_accessions):
+            break
+
     return results
 
 
 async def render_filing(filing_info: dict) -> dict:
-    """Preprocess and render one filing to PDF. Returns result dict."""
+    """Preprocess and render one filing to PDF. Returns result dict.
+
+    S-1 / S-1/A take the URL-render path (Chromium fetches assets directly
+    from SEC with rate-limited subresources) — preprocess+base64-inline
+    inflates these documents to tens of MB and is the documented wedge.
+    Other forms keep the existing preprocess+render_html_to_pdf path,
+    unchanged, so this code path can't regress normal renders.
+
+    For S-1 / S-1/A, also emits periodic heartbeat events so the Node-side
+    pipeline watchdog (which idle-times on stdout activity) doesn't
+    mistake a healthy multi-minute render for a hung pipeline.
+    """
     ticker = filing_info["ticker"]
     filing_type = filing_info["filing_type"]
     accession = filing_info["accession_number"]
     url = filing_info["primary_doc_url"]
 
-    html = await preprocess_filing(url)
-    pdf_bytes = await render_html_to_pdf(html)
+    if filing_type.upper().startswith("S-1"):
+        async def heartbeat():
+            try:
+                while True:
+                    await asyncio.sleep(60)
+                    emit({
+                        "event": "heartbeat",
+                        "ticker": ticker,
+                        "accession": accession,
+                        "filing_type": filing_type,
+                    })
+            except asyncio.CancelledError:
+                return
+
+        task = asyncio.create_task(heartbeat())
+        try:
+            pdf_bytes = await render_s1_url_to_pdf(url)
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+    else:
+        html = await preprocess_filing(url)
+        pdf_bytes = await render_html_to_pdf(html)
 
     safe_type = filing_type.replace(" ", "_")
     out_dir = OUTPUT_DIR / "filings" / ticker / safe_type
@@ -154,6 +214,10 @@ async def main() -> None:
     date_to = date.fromisoformat(date_to_str) if date_to_str else None
 
     skip_accessions = set(input_data.get("skip_accessions", []))
+    # When set, only these accessions are rendered (Registration / IPO mode
+    # uses this so a user-selected S-1 doesn't drag in other recent S-1s the
+    # date-range query happens to also match). Empty means "no whitelist".
+    target_accessions = set(input_data.get("target_accessions", []))
 
     total_rendered = 0
     total_skipped = 0
@@ -172,6 +236,10 @@ async def main() -> None:
                 date_from=date_from,
                 date_to=date_to,
                 limit=limit,
+                # Whitelist is applied INSIDE the poll loop, before the
+                # limit cap, so a user-selected older S-1 isn't crowded
+                # out by a newer one in the same date range.
+                target_accessions=target_accessions if target_accessions else None,
             )
 
             new_filings = [f for f in found_filings if f["accession_number"] not in skip_accessions]

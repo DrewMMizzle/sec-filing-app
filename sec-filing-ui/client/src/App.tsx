@@ -14,6 +14,7 @@ import FetchFilings from "@/pages/fetch-filings";
 import Findings from "@/pages/findings";
 import Compare from "@/pages/compare";
 import Mdna from "@/pages/mdna";
+import Registration from "@/pages/registration";
 import PdfLibrary from "@/pages/pdf-library";
 import Ask from "@/pages/ask";
 import LoginPage from "@/pages/login";
@@ -46,6 +47,7 @@ function AuthenticatedApp() {
               <Route path="/fetch" component={FetchFilings} />
               <Route path="/compare" component={Compare} />
               <Route path="/mdna" component={Mdna} />
+              <Route path="/registration" component={Registration} />
               <Route path="/ask" component={Ask} />
               <Route path="/library" component={PdfLibrary} />
               {/* If we land on an auth route while already signed in (e.g. the

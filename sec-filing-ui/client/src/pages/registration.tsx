@@ -1,0 +1,400 @@
+import { useState } from "react";
+import { useQuery, useMutation } from "@tanstack/react-query";
+import { apiRequest, queryClient } from "@/lib/queryClient";
+import { Card } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Badge } from "@/components/ui/badge";
+import { Checkbox } from "@/components/ui/checkbox";
+import { useToast } from "@/hooks/use-toast";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import { Rocket, Search, Loader2, AlertCircle, Sparkles } from "lucide-react";
+
+// ─── Types mirroring the /api/registration/* endpoints ───────────────
+type EdgarCompany = { cik: string; name: string; ticker?: string };
+type RegistrationFiling = {
+  accessionNumber: string;
+  form: "S-1" | "S-1/A" | string;
+  filingDate: string;
+  primaryDocUrl: string;
+  // null when the filing has no DB row yet — i.e. it hasn't been rendered.
+  // "complete" means the PDF is on disk and the row is reviewable.
+  dbStatus: "pending" | "rendering" | "complete" | "error" | null;
+  reviewStatus: "pending" | "reviewing" | "done" | "error" | null;
+};
+type RenderResponse = {
+  ok: boolean;
+  label: string;
+  cik: string;
+  companyName: string;
+  rendered: number;
+};
+
+// Reviewing one S-1 / S-1/A is genuinely expensive (large input, $5/1M
+// input tokens for Opus 4.7) — show this estimate before the user opts
+// in per filing.
+const REVIEW_COST_ESTIMATE = "$1.50 – $4.00 (Opus 4.7; rough)";
+
+export default function Registration() {
+  const { toast } = useToast();
+  const [query, setQuery] = useState("");
+  const [picked, setPicked] = useState<EdgarCompany | null>(null);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [reviewConfirm, setReviewConfirm] = useState<string | null>(null);
+
+  // ─── Search ────────────────────────────────────────────────────────
+  const search = useMutation<EdgarCompany[], Error, string>({
+    mutationFn: async (q) => {
+      const res = await apiRequest("GET", `/api/registration/search?q=${encodeURIComponent(q)}`);
+      if (!res.ok) throw new Error((await res.json()).error || "Search failed");
+      return res.json();
+    },
+    onSuccess: (data) => {
+      if (data.length === 0) toast({ title: "No matches at SEC for that query." });
+    },
+    onError: (err) => toast({ title: "Search failed", description: err.message, variant: "destructive" }),
+  });
+
+  // ─── List the picked company's S-1 / S-1/A history ────────────────
+  const filingsQuery = useQuery<RegistrationFiling[]>({
+    queryKey: ["/api/registration/filings", picked?.cik],
+    queryFn: async () => {
+      if (!picked) return [];
+      const res = await apiRequest("GET", `/api/registration/filings?cik=${encodeURIComponent(picked.cik)}`);
+      if (!res.ok) throw new Error((await res.json()).error || "Failed to load filings");
+      return res.json();
+    },
+    enabled: !!picked,
+  });
+
+  // ─── Render ────────────────────────────────────────────────────────
+  const render = useMutation<RenderResponse, Error, { accessions: string[] }>({
+    mutationFn: async ({ accessions }) => {
+      if (!picked) throw new Error("No company picked");
+      const res = await apiRequest("POST", "/api/registration/render", {
+        cik: picked.cik,
+        companyName: picked.name,
+        ticker: picked.ticker,
+        accessions,
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || "Render failed");
+      }
+      return res.json();
+    },
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ["/api/filings?slim=true"] });
+      // Refresh the registration listing so the just-rendered filing's
+      // dbStatus flips to "complete" and the Review button appears.
+      if (picked) {
+        queryClient.invalidateQueries({ queryKey: ["/api/registration/filings", picked.cik] });
+      }
+      toast({
+        title: data.rendered > 0 ? "Render complete" : "Pipeline ran but nothing rendered",
+        description: `${data.companyName} → ${data.rendered} S-1 / S-1/A PDF(s)`,
+      });
+      setSelected(new Set());
+    },
+    onError: (err) =>
+      toast({ title: "Render failed", description: err.message, variant: "destructive" }),
+  });
+
+  // ─── Review (opt-in, per filing) ───────────────────────────────────
+  const review = useMutation<{ ok: boolean }, Error, string>({
+    mutationFn: async (accession) => {
+      const res = await apiRequest("POST", `/api/filings/${encodeURIComponent(accession)}/review`, {});
+      if (!res.ok) throw new Error((await res.json()).error || "Review failed");
+      return res.json();
+    },
+    onSuccess: () => {
+      toast({ title: "Review queued", description: "Findings will appear in the Findings tab when done." });
+    },
+    onError: (err) => toast({ title: "Review failed", description: err.message, variant: "destructive" }),
+  });
+
+  // ─── Handlers ──────────────────────────────────────────────────────
+  const submitSearch = () => {
+    const trimmed = query.trim();
+    if (!trimmed) return;
+    setPicked(null);
+    setSelected(new Set());
+    search.mutate(trimmed);
+  };
+
+  const toggleAccession = (acc: string) =>
+    setSelected((s) => {
+      const next = new Set(s);
+      next.has(acc) ? next.delete(acc) : next.add(acc);
+      return next;
+    });
+
+  const renderLatest = () => {
+    const f = filingsQuery.data?.[0];
+    if (!f) return;
+    render.mutate({ accessions: [f.accessionNumber] });
+  };
+
+  const renderSelected = () => {
+    if (selected.size === 0) return;
+    render.mutate({ accessions: Array.from(selected) });
+  };
+
+  const filings = filingsQuery.data ?? [];
+
+  return (
+    <div className="p-6 max-w-4xl mx-auto">
+      <div className="mb-4 flex items-start gap-3">
+        <div className="flex items-center justify-center w-10 h-10 rounded-md bg-primary/10 shrink-0">
+          <Rocket className="w-5 h-5 text-primary" />
+        </div>
+        <div>
+          <h1 className="text-xl font-semibold mb-1" data-testid="text-page-title">
+            Registration / IPO filings
+          </h1>
+          <p className="text-sm text-muted-foreground">
+            Pull S-1 and S-1/A filings from SEC EDGAR for any company — including
+            pre-IPO filers that aren&apos;t in the tickered universe yet. Kept separate
+            from the normal Fetch flow because these documents are very large
+            and slow to render.
+          </p>
+        </div>
+      </div>
+
+      <Card className="p-3 mb-4 flex items-start gap-2 border-amber-600/30">
+        <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+        <p className="text-xs text-muted-foreground">
+          <span className="text-foreground font-medium">Heads up:</span> S-1 / S-1/A filings can
+          be 500+ pages. Render runs single-filing, on-demand, and does not auto-review. Use the
+          per-row <span className="text-foreground">Review</span> button after render if you want
+          Claude findings (~{REVIEW_COST_ESTIMATE} per filing).
+        </p>
+      </Card>
+
+      {/* ─── Lookup ───────────────────────────────────────────────── */}
+      <div className="mb-4">
+        <label className="text-sm font-medium mb-1.5 block">
+          Company name, ticker, or CIK
+        </label>
+        <div className="flex gap-2">
+          <Input
+            placeholder="e.g. SpaceX, AAPL, 1318605"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                submitSearch();
+              }
+            }}
+            data-testid="input-registration-query"
+          />
+          <Button
+            onClick={submitSearch}
+            disabled={!query.trim() || search.isPending}
+            data-testid="button-registration-search"
+          >
+            {search.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />}
+          </Button>
+        </div>
+      </div>
+
+      {/* ─── Search results ───────────────────────────────────────── */}
+      {search.data && search.data.length > 0 && !picked && (
+        <Card className="mb-4 divide-y">
+          {search.data.map((c) => (
+            <button
+              key={c.cik}
+              type="button"
+              className="w-full text-left px-3 py-2 hover:bg-muted/40 transition-colors"
+              onClick={() => {
+                setPicked(c);
+                setSelected(new Set());
+              }}
+              data-testid={`button-registration-pick-${c.cik}`}
+            >
+              <div className="text-sm font-medium truncate">{c.name}</div>
+              <div className="text-xs text-muted-foreground font-mono">
+                CIK {c.cik}
+                {c.ticker ? ` · ${c.ticker}` : " · (no ticker)"}
+              </div>
+            </button>
+          ))}
+        </Card>
+      )}
+
+      {/* ─── Picked company + filings list ────────────────────────── */}
+      {picked && (
+        <div>
+          <Card className="p-3 mb-3 flex items-center gap-3">
+            <div className="flex-1 min-w-0">
+              <p className="text-sm font-medium truncate">{picked.name}</p>
+              <p className="text-xs text-muted-foreground font-mono">
+                CIK {picked.cik}
+                {picked.ticker ? ` · ${picked.ticker}` : " · pre-IPO"}
+              </p>
+            </div>
+            <Button variant="ghost" size="sm" onClick={() => setPicked(null)} data-testid="button-registration-back">
+              Pick another
+            </Button>
+          </Card>
+
+          {filingsQuery.isLoading && (
+            <p className="text-sm text-muted-foreground">Loading S-1 / S-1/A history from EDGAR…</p>
+          )}
+          {filingsQuery.error && (
+            <p className="text-sm text-destructive">
+              Couldn&apos;t load filings: {(filingsQuery.error as Error).message}
+            </p>
+          )}
+          {!filingsQuery.isLoading && !filingsQuery.error && filings.length === 0 && (
+            <Card className="p-6 text-center text-sm text-muted-foreground">
+              No S-1 or S-1/A filings in this company&apos;s recent submissions.
+            </Card>
+          )}
+
+          {filings.length > 0 && (
+            <>
+              <div className="flex items-center justify-end gap-2 mb-3">
+                <Button
+                  variant="outline"
+                  onClick={renderLatest}
+                  disabled={render.isPending}
+                  data-testid="button-render-latest"
+                >
+                  {render.isPending ? (
+                    <>
+                      <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                      Rendering…
+                    </>
+                  ) : (
+                    "Render latest"
+                  )}
+                </Button>
+                <Button
+                  onClick={renderSelected}
+                  disabled={selected.size === 0 || render.isPending}
+                  data-testid="button-render-selected"
+                >
+                  {render.isPending ? (
+                    <>
+                      <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                      Rendering…
+                    </>
+                  ) : (
+                    `Render selected (${selected.size})`
+                  )}
+                </Button>
+              </div>
+
+              <Card className="divide-y">
+                {filings.map((f, i) => {
+                  const rendered = f.dbStatus === "complete";
+                  const reviewing = f.reviewStatus === "pending" || f.reviewStatus === "reviewing";
+                  const reviewed = f.reviewStatus === "done";
+                  return (
+                    <div
+                      key={f.accessionNumber}
+                      className="flex items-center gap-3 px-3 py-2 text-sm"
+                      data-testid={`registration-filing-${f.accessionNumber}`}
+                    >
+                      <Checkbox
+                        checked={selected.has(f.accessionNumber)}
+                        onCheckedChange={() => toggleAccession(f.accessionNumber)}
+                        data-testid={`checkbox-registration-${f.accessionNumber}`}
+                      />
+                      <Badge variant="secondary" className="text-[10px]">{f.form}</Badge>
+                      <span className="font-mono text-xs text-muted-foreground">{f.filingDate}</span>
+                      <span className="font-mono text-xs text-muted-foreground truncate flex-1">
+                        {f.accessionNumber}
+                      </span>
+                      {i === 0 && (
+                        <Badge variant="outline" className="text-[10px]">Latest</Badge>
+                      )}
+                      {/* Status badges reflect the DB row, so the user can see
+                          which filings are rendered and reviewable. */}
+                      {f.dbStatus === "rendering" && (
+                        <Badge variant="default" className="text-[10px] bg-amber-600/20 text-amber-400 border-amber-600/30">
+                          Rendering
+                        </Badge>
+                      )}
+                      {f.dbStatus === "error" && (
+                        <Badge variant="destructive" className="text-[10px]">Error</Badge>
+                      )}
+                      {rendered && !reviewing && !reviewed && (
+                        <Badge variant="outline" className="text-[10px]">Rendered</Badge>
+                      )}
+                      {reviewing && (
+                        <Badge variant="default" className="text-[10px] bg-amber-600/20 text-amber-400 border-amber-600/30">
+                          Reviewing
+                        </Badge>
+                      )}
+                      {reviewed && (
+                        <Badge variant="default" className="text-[10px]">Reviewed</Badge>
+                      )}
+                      {/* Review button only appears once the filing is
+                          actually rendered (has a complete DB row) — calling
+                          /api/filings/:accession/review on an unrendered
+                          accession would just return 400. */}
+                      {rendered && !reviewing && !reviewed && (
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          className="h-7 text-xs"
+                          onClick={() => setReviewConfirm(f.accessionNumber)}
+                          data-testid={`button-review-${f.accessionNumber}`}
+                          title="Run Claude review on this filing (cost warning will appear)"
+                        >
+                          <Sparkles className="w-3 h-3 mr-1" />
+                          Review
+                        </Button>
+                      )}
+                    </div>
+                  );
+                })}
+              </Card>
+            </>
+          )}
+        </div>
+      )}
+
+      {/* ─── Review cost confirmation dialog ───────────────────────── */}
+      <AlertDialog
+        open={reviewConfirm !== null}
+        onOpenChange={(open) => { if (!open) setReviewConfirm(null); }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Run Claude review on this S-1?</AlertDialogTitle>
+            <AlertDialogDescription>
+              Reviewing a registration statement is expensive — input is much larger than a
+              typical 10-K. Estimated Claude cost: <span className="text-foreground font-medium">{REVIEW_COST_ESTIMATE}</span>.
+              The review will be charged against the team-wide review spend cap.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => {
+                if (reviewConfirm) review.mutate(reviewConfirm);
+                setReviewConfirm(null);
+              }}
+              data-testid="button-confirm-review"
+            >
+              Run review
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </div>
+  );
+}
