@@ -11,6 +11,7 @@ pre-processed HTML directly.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Optional
 
@@ -257,7 +258,21 @@ async def render_s1_url_to_pdf(url: str) -> bytes:
         await page.goto(url, wait_until="load", timeout=_S1_PAGE_TIMEOUT_MS)
         logger.debug("[S-1] Stripping XBRL tags via JavaScript")
         await page.evaluate(STRIP_XBRL_JS)
-        pdf_bytes: bytes = await page.pdf(**PDF_OPTIONS, timeout=_S1_PDF_TIMEOUT_MS)
+
+        # page.pdf() in this Playwright Python version doesn't accept a
+        # `timeout` keyword (the parameter exists in newer Playwright JS but
+        # not in the installed Python binding). Bound the rasterization step
+        # externally with asyncio.wait_for so a wedged Chromium can't hang
+        # the render indefinitely.
+        try:
+            pdf_bytes: bytes = await asyncio.wait_for(
+                page.pdf(**PDF_OPTIONS),
+                timeout=_S1_PDF_TIMEOUT_MS / 1000,
+            )
+        except asyncio.TimeoutError:
+            raise RuntimeError(
+                f"page.pdf() exceeded the {_S1_PDF_TIMEOUT_MS // 1000}s S-1 budget."
+            ) from None
         logger.info("[S-1] PDF rendered from %s (%d bytes)", url, len(pdf_bytes))
         return pdf_bytes
     finally:
