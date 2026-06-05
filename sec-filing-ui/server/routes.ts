@@ -11,7 +11,6 @@ import { ensureSP500Seeded } from "./seed-sp500";
 import { getSecTickerIndex } from "./sec-index";
 import { isReviewEnabled, kickReviewProcessor, reviewCostUsd, requestCancelReview, isReviewProcessing } from "./review";
 import { analyzeMdna, isMdnaEligible } from "./mdna";
-import { lookupCikSubmissions, searchEdgarByName, nameToLabel } from "./sec-edgar";
 import type { ChildProcess } from "child_process";
 
 // Tracks the in-flight fetch/render pipeline child so a user cancel can kill
@@ -120,12 +119,8 @@ function runFetchPipeline(
     // Watchdog: if the pipeline produces no output for this long, treat it as
     // stalled (e.g. a wedged Chromium) and kill it so the run can't hang
     // forever. Anything rendered/reviewed before the stall is already saved, and
-    // a re-fetch resumes (dedup skips completed filings). The budget covers
-    // one legal attempt's silent window: preprocess (4 min cap) +
-    // page.pdf() (5 min cap), with margin — Python's logger also writes to
-    // stderr, which we now treat as activity, so a healthy run never gets
-    // close to this.
-    const IDLE_TIMEOUT_MS = 15 * 60 * 1000;
+    // a re-fetch resumes (dedup skips completed filings).
+    const IDLE_TIMEOUT_MS = 6 * 60 * 1000;
     let lastActivity = Date.now();
     let stalled = false;
     const watchdog = setInterval(() => {
@@ -213,12 +208,6 @@ function runFetchPipeline(
     });
 
     child.stderr.on("data", (data: Buffer) => {
-      // Python's `logger.info`/`logger.debug` writes here by default. Counting
-      // stderr as activity prevents the watchdog from killing a render that's
-      // chattily making progress on the Python side but happens not to have
-      // emitted a stdout JSON event yet (preprocess + page.pdf can be silent
-      // on stdout for several minutes per filing).
-      lastActivity = Date.now();
       stderrOutput += data.toString();
     });
 
@@ -539,34 +528,9 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     if (!access) return res.status(403).json({ error: "Access denied" });
     if (access === "view") return res.status(403).json({ error: "View-only access cannot add tickers" });
 
-    const { ticker, cik: bodyCik, label, filingTypes } = req.body as {
-      ticker?: unknown;
-      cik?: unknown;
-      label?: unknown;
-      filingTypes?: unknown;
-    };
-
-    // Pre-IPO path: client supplies a CIK directly (with an optional display
-    // label) because the company has no ticker yet.
-    if (typeof bodyCik === "string" && bodyCik.trim()) {
-      const sub = await lookupCikSubmissions(bodyCik);
-      if (!sub) return res.status(404).json({ error: `CIK "${bodyCik}" not found at SEC` });
-      const labelStr = typeof label === "string" ? label.trim().toUpperCase() : "";
-      const tickerLabel = (labelStr || sub.tickers[0] || nameToLabel(sub.name)).slice(0, 32);
-      const types = Array.isArray(filingTypes) && filingTypes.length > 0
-        ? filingTypes
-        : ["S-1", "S-1/A", "10-K", "10-Q", "8-K", "DEF 14A"];
-      const newTicker = await storage.addTicker({
-        watchlistId,
-        ticker: tickerLabel,
-        cik: sub.cik,
-        filingTypes: JSON.stringify(types),
-      });
-      return res.status(201).json({ ...newTicker, filingTypes: types, companyName: sub.name });
-    }
-
+    const { ticker, filingTypes } = req.body;
     if (!ticker || typeof ticker !== "string") {
-      return res.status(400).json({ error: "ticker or cik is required" });
+      return res.status(400).json({ error: "ticker is required" });
     }
 
     try {
@@ -627,20 +591,12 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     if (!access) return res.status(403).json({ error: "Access denied" });
     if (access === "view") return res.status(403).json({ error: "View-only access cannot add tickers" });
 
-    const { tickers: incoming, filingTypes: incomingTypes } = req.body as {
+    const { tickers: incoming } = req.body as {
       tickers?: Array<{ ticker?: unknown; cik?: unknown }>;
-      filingTypes?: unknown;
     };
     if (!Array.isArray(incoming) || incoming.length === 0) {
       return res.status(400).json({ error: "tickers array is required" });
     }
-    // Persist the same forms the caller is fetching, defaulting to a broader
-    // list that includes S-1 / S-1/A so a pre-IPO entry doesn't immediately
-    // come back empty on the next fetch.
-    const filingTypes =
-      Array.isArray(incomingTypes) && incomingTypes.length > 0
-        ? (incomingTypes as unknown[]).filter((t): t is string => typeof t === "string")
-        : ["10-K", "10-Q", "8-K", "DEF 14A", "S-1", "S-1/A"];
 
     const existing = await storage.getTickersByWatchlist(watchlistId);
     const have = new Set(existing.map((t) => t.ticker.toUpperCase()));
@@ -659,7 +615,7 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
         watchlistId,
         ticker,
         cik,
-        filingTypes: JSON.stringify(filingTypes),
+        filingTypes: JSON.stringify(["10-K", "10-Q", "8-K", "DEF 14A"]),
       });
       have.add(ticker);
       added += 1;
@@ -704,30 +660,6 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     res.json({ ...updated, filingTypes });
   });
 
-  // Rename a ticker's display label — used when a pre-IPO company's "ticker"
-  // is initially a name-derived placeholder and the user wants to update it
-  // to the real symbol post-IPO (or just clean it up).
-  app.patch("/api/tickers/:id/symbol", requireAuth, async (req, res) => {
-    const id = Number(req.params.id);
-    const rows = await db.select().from(tickersTable).where(eq(tickersTable.id, id));
-    const existing = rows[0];
-    if (!existing) return res.status(404).json({ error: "Ticker not found" });
-
-    const userId = req.user!.id;
-    const { access } = await checkWatchlistAccess(existing.watchlistId, userId);
-    if (!access) return res.status(403).json({ error: "Access denied" });
-    if (access === "view") return res.status(403).json({ error: "View-only access" });
-
-    const symbol =
-      typeof req.body?.symbol === "string" ? req.body.symbol.trim().toUpperCase() : "";
-    if (!symbol) return res.status(400).json({ error: "symbol is required" });
-    if (symbol.length > 32) return res.status(400).json({ error: "symbol is too long" });
-
-    const updated = await storage.updateTickerSymbol(id, symbol);
-    if (!updated) return res.status(404).json({ error: "Ticker not found" });
-    res.json(updated);
-  });
-
   // ─── Export watchlist.json ───────────────────────────────
 
   app.get("/api/export-watchlist", requireAuth, async (req, res) => {
@@ -757,34 +689,11 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
       const idx = await getSecTickerIndex();
       const resolved: Array<{ ticker: string; cik: string; name: string }> = [];
       const unresolved: string[] = [];
-      // Inputs that look like company names (or misspellings) — anything alpha
-      // that didn't match a ticker — get a fallback EDGAR name search at the
-      // end so pre-IPO filers like SpaceX are reachable from Quick Fetch.
-      const alphaMisses: Array<{ query: string; original: string }> = [];
       const seen = new Set<string>();
-      const inputs = (tickers as unknown[])
-        .filter((t): t is string => typeof t === "string")
-        .map((s) => s.trim())
-        .filter(Boolean);
-      for (const original of inputs) {
-        const symbol = original.toUpperCase();
-        // Numeric input → CIK (pre-IPO companies have a CIK but no ticker).
-        // Look it up via SEC's submissions JSON to get the company name and
-        // any tickers, then build a resolved entry with either the SEC ticker
-        // or a name-derived display label.
-        if (/^\d+$/.test(symbol)) {
-          const sub = await lookupCikSubmissions(symbol);
-          if (sub) {
-            const label = (sub.tickers[0] ?? nameToLabel(sub.name)).toUpperCase();
-            if (!seen.has(label)) {
-              seen.add(label);
-              resolved.push({ ticker: label, cik: sub.cik, name: sub.name });
-            }
-            continue;
-          }
-          unresolved.push(symbol);
-          continue;
-        }
+      for (const raw of tickers) {
+        if (typeof raw !== "string") continue;
+        const symbol = raw.trim().toUpperCase();
+        if (!symbol) continue;
         // SEC uses "-" where index lists use "." (e.g. BRK.B -> BRK-B).
         const variants = symbol.includes(".") ? [symbol.replace(/\./g, "-"), symbol] : [symbol];
         let hit: { ticker: string; cik: string; name: string } | null = null;
@@ -801,64 +710,13 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
             resolved.push(hit);
           }
         } else {
-          alphaMisses.push({ query: symbol, original });
+          unresolved.push(symbol);
         }
       }
-
-      // EDGAR name-search fallback for alpha misses. Run in parallel so a
-      // multi-name Quick Fetch isn't bottlenecked by sequential HTTP calls.
-      const ambiguous: Array<{
-        query: string;
-        candidates: Array<{ cik: string; name: string; ticker?: string }>;
-      }> = [];
-      if (alphaMisses.length > 0) {
-        const searches = await Promise.all(
-          alphaMisses.map(async (miss) => {
-            try {
-              const candidates = await searchEdgarByName(miss.original);
-              return { miss, candidates };
-            } catch {
-              return { miss, candidates: [] as Array<{ cik: string; name: string; ticker?: string }> };
-            }
-          }),
-        );
-        for (const { miss, candidates } of searches) {
-          if (candidates.length === 0) {
-            unresolved.push(miss.query);
-            continue;
-          }
-          if (candidates.length === 1) {
-            const c = candidates[0];
-            const label = (c.ticker ?? nameToLabel(c.name)).toUpperCase();
-            if (!seen.has(label)) {
-              seen.add(label);
-              resolved.push({ ticker: label, cik: c.cik, name: c.name });
-            }
-            continue;
-          }
-          ambiguous.push({ query: miss.original, candidates });
-        }
-      }
-
-      res.json({ resolved, unresolved, ambiguous });
+      res.json({ resolved, unresolved });
     } catch (e: any) {
       console.error("Error resolving tickers:", e);
       res.status(500).json({ error: "Failed to resolve tickers with SEC" });
-    }
-  });
-
-  // Search SEC EDGAR by company name so users can find pre-IPO companies
-  // (which have a CIK but no ticker and are NOT in company_tickers.json).
-  // Returns at most 10 deduped {cik, name, ticker?} matches.
-  app.get("/api/edgar/search", requireAuth, async (req, res) => {
-    const q = typeof req.query.q === "string" ? req.query.q : "";
-    if (!q.trim()) return res.json([]);
-    try {
-      const results = await searchEdgarByName(q);
-      res.json(results);
-    } catch (e: any) {
-      console.error("EDGAR search failed:", e?.message || e);
-      res.status(502).json({ error: "EDGAR search failed" });
     }
   });
 
@@ -955,13 +813,6 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
 
     const cikByTicker = new Map(tickerList.map((t) => [t.ticker, t.cik]));
     const result = await runFetchPipeline(input, { userId, cikByTicker });
-    // Always sweep stale 'rendering' rows for the tickers we touched —
-    // regardless of pipeline success. A failed/killed pipeline would
-    // otherwise leave rows spinning forever, which is exactly what made
-    // the SpaceX S-1/A look stuck on "Rendering" after a watchdog kill.
-    storage
-      .recoverStaleRenders(tickerNames)
-      .catch((err) => console.error("Stale-render recovery failed:", err));
     if (!result.success) {
       return res
         .status(500)
@@ -974,6 +825,11 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
       totalErrors: result.doneEvent?.total_errors ?? 0,
       events: result.events,
     });
+    // Clear any rows the pipeline left at 'rendering' (e.g. it was stalled and
+    // killed) for these tickers so they don't spin forever.
+    storage
+      .recoverStaleRenders(tickerNames)
+      .catch((err) => console.error("Stale-render recovery failed:", err));
 
     // Newly-rendered filings were queued incrementally as each PDF landed. Also
     // queue any already-rendered filings (skipped by dedup) that were never
@@ -1082,13 +938,9 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
       const child = currentFetchChild;
       try {
         child.kill("SIGTERM");
-        // Escalate if the child doesn't exit promptly on its own. Node sets
-        // child.killed=true the instant a signal is *sent*, not when the
-        // process actually exits — so checking child.killed here would
-        // basically never escalate. exitCode stays null until the process
-        // truly exits, which is the right gate.
+        // Escalate if the child doesn't exit promptly on its own.
         setTimeout(() => {
-          if (child.exitCode === null) {
+          if (!child.killed) {
             try { child.kill("SIGKILL"); } catch { /* already gone */ }
           }
         }, 3000);
@@ -1297,78 +1149,6 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     await storage.markFilingForReview(accession);
     kickReviewProcessor().catch((err) => console.error("Review processor failed:", err));
     res.json({ ok: true });
-  });
-
-  // Re-attempt a render that previously errored (or got interrupted). The
-  // main Fetch button skips anything already in the DB, so without this an
-  // errored filing is stuck — the user has no way to retry it from the UI.
-  // We delete the row, then run the pipeline scoped to just that filing so
-  // the pipeline re-fetches from SEC and creates a fresh row. The original
-  // row is restored as `error` if the retry pipeline fails or returns
-  // nothing, so the user never loses the row (and therefore the Retry
-  // button on it) by clicking Retry.
-  app.post("/api/filings/:accession/retry-render", requireAuth, async (req, res) => {
-    const accession = req.params.accession as string;
-    const filing = await storage.getFilingByAccession(accession);
-    if (!filing) return res.status(404).json({ error: "Filing not found" });
-    const userId = req.user!.id;
-
-    // Snapshot before delete so we can restore on failure / zero-result.
-    const snapshot = filing;
-    await storage.deleteFiling(filing.id);
-
-    const input = JSON.stringify({
-      tickers: [
-        {
-          ticker: filing.ticker,
-          cik: filing.cik,
-          filing_types: [filing.filingType],
-        },
-      ],
-      date_from: filing.filingDate,
-      date_to: filing.filingDate,
-      limit_per_ticker: 5,
-    });
-    const cikByTicker = new Map<string, string>([[filing.ticker, filing.cik]]);
-    const result = await runFetchPipeline(input, { userId, cikByTicker });
-    // Sweep any row this retry left at 'rendering' (e.g. the watchdog killed
-    // mid-attempt) so the retry doesn't replace one stuck row with another.
-    storage
-      .recoverStaleRenders([filing.ticker])
-      .catch((err) => console.error("Stale-render recovery failed:", err));
-
-    // If the pipeline didn't actually produce a replacement (failure, or
-    // returned but rendered 0), restore the original errored row so the
-    // user still has a target to retry.
-    const replacement = await storage.getFilingByAccession(accession);
-    const renderedAny = result.success && result.completedAccessions.length > 0;
-    if (!replacement && !renderedAny) {
-      await storage.upsertFiling({
-        ticker: snapshot.ticker,
-        cik: snapshot.cik,
-        accessionNumber: snapshot.accessionNumber,
-        filingType: snapshot.filingType,
-        filingDate: snapshot.filingDate,
-        pdfPath: snapshot.pdfPath,
-        pdfSize: snapshot.pdfSize,
-        status: "error",
-        errorMessage:
-          (result.error && `Retry failed: ${result.error}`) ||
-          snapshot.errorMessage ||
-          "Retry produced no replacement filing.",
-        createdAt: snapshot.createdAt,
-        userId: snapshot.userId,
-      });
-    }
-    if (!result.success) {
-      return res.status(500).json({ error: result.error || "Retry render failed" });
-    }
-    kickReviewProcessor().catch((err) => console.error("Review processor failed:", err));
-    res.json({
-      ok: true,
-      rerendered: result.completedAccessions.length,
-      events: result.events,
-    });
   });
 
   // ─── MD&A digest (analyst view) ──────────────────────────

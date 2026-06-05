@@ -13,12 +13,10 @@ from __future__ import annotations
 
 import logging
 from typing import Optional
-from urllib.parse import urlparse
 
-from playwright.async_api import async_playwright, Browser, BrowserContext, Route, Request
+from playwright.async_api import async_playwright, Browser, BrowserContext
 
 from src.config import get_settings
-from src.edgar.rate_limiter import acquire_sec_token
 
 logger = logging.getLogger(__name__)
 
@@ -34,12 +32,8 @@ PDF_OPTIONS = {
     "print_background": True,
 }
 
-# Maximum time to wait for the page to load. Some S-1s are huge.
-PAGE_TIMEOUT_MS = 120_000  # 2 minutes for the load step.
-# Generous cap on the PDF rasterization step itself. A 500-page S-1 with
-# dense tables can legitimately take several minutes to paginate; default
-# Playwright timeouts are too aggressive for that.
-PDF_TIMEOUT_MS = 5 * 60 * 1000  # 5 minutes.
+# Maximum time to wait for the page to load and reach networkidle.
+PAGE_TIMEOUT_MS = 120_000  # 2 minutes — some filings are very large.
 
 # JavaScript to strip ix: XBRL tags in the live DOM while preserving
 # their child content.  This runs after the page has fully loaded so
@@ -80,34 +74,6 @@ STRIP_XBRL_JS = """
     }
 }
 """
-
-# Hosts whose subresource loads count against SEC's 10 req/s budget.
-# Anything else (e.g. fonts.googleapis.com) is passed through untouched.
-_SEC_HOST_SUFFIXES = ("sec.gov",)
-
-
-def _is_sec_host(url: str) -> bool:
-    try:
-        host = (urlparse(url).hostname or "").lower()
-    except Exception:
-        return False
-    return any(host == suf or host.endswith("." + suf) for suf in _SEC_HOST_SUFFIXES)
-
-
-async def _throttle_sec_requests(route: Route, request: Request) -> None:
-    """Playwright route handler that gates SEC-origin requests through the
-    shared token-bucket limiter, so browser-issued subresource loads obey
-    the same 10 req/s rule that Python sec_get() does. Non-SEC requests
-    (Google fonts, etc.) continue immediately."""
-    if _is_sec_host(request.url):
-        await acquire_sec_token()
-    try:
-        await route.continue_()
-    except Exception:
-        # Page may have closed (e.g. abort during shutdown) — swallow so we
-        # don't propagate a routing error out of an unrelated request.
-        pass
-
 
 # Singleton browser management.
 _browser: Browser | None = None
@@ -169,17 +135,11 @@ async def render_html_to_pdf(
         # Emulate print media for proper styling.
         await page.emulate_media(media="print")
 
-        # set_content with wait_until="networkidle" hangs on huge SEC filings
-        # because residual font/stylesheet/keep-alive requests can prevent the
-        # network from ever going quiet for the required 500ms. "load" fires
-        # after the document and its initial subresources are loaded, which
-        # is what we actually want — networkidle was overkill given the HTML
-        # has already had its images base64-inlined by preprocess_filing.
-        await page.set_content(html, wait_until="load", timeout=timeout_ms)
+        # Load the HTML content.
+        await page.set_content(html, wait_until="networkidle", timeout=timeout_ms)
 
-        # Generate the PDF. Explicit timeout because rasterizing a 500-page
-        # S-1 can legitimately take several minutes.
-        pdf_bytes: bytes = await page.pdf(**PDF_OPTIONS, timeout=PDF_TIMEOUT_MS)
+        # Generate the PDF.
+        pdf_bytes: bytes = await page.pdf(**PDF_OPTIONS)
         logger.info("PDF rendered successfully (%d bytes)", len(pdf_bytes))
         return pdf_bytes
 
@@ -214,25 +174,16 @@ async def render_url_to_pdf(
     context = await _get_context()
     page = await context.new_page()
     try:
-        # Gate browser-issued SEC requests through the global token bucket so
-        # Chromium can't blast hundreds of parallel asset loads at SEC and
-        # earn the IP a 429/403 — Playwright reissues each routed request via
-        # _throttle_sec_requests, which acquires from the shared limiter
-        # before letting SEC-host requests proceed.
-        await page.route("**/*", _throttle_sec_requests)
         await page.emulate_media(media="print")
 
         logger.info("Navigating to %s", url)
-        # Use "load" instead of "networkidle" — see render_html_to_pdf for
-        # the rationale. networkidle stalls on huge SEC filings.
-        await page.goto(url, wait_until="load", timeout=timeout_ms)
+        await page.goto(url, wait_until="networkidle", timeout=timeout_ms)
 
         if strip_xbrl:
             logger.debug("Stripping XBRL tags via JavaScript")
             await page.evaluate(STRIP_XBRL_JS)
 
-        # Explicit timeout for the rasterization step (big S-1s take minutes).
-        pdf_bytes: bytes = await page.pdf(**PDF_OPTIONS, timeout=PDF_TIMEOUT_MS)
+        pdf_bytes: bytes = await page.pdf(**PDF_OPTIONS)
         logger.info("PDF rendered from URL %s (%d bytes)", url, len(pdf_bytes))
         return pdf_bytes
 

@@ -246,15 +246,6 @@ export class DatabaseStorage {
     return rows[0];
   }
 
-  async updateTickerSymbol(id: number, ticker: string): Promise<Ticker | undefined> {
-    const rows = await db
-      .update(tickers)
-      .set({ ticker })
-      .where(eq(tickers.id, id))
-      .returning();
-    return rows[0];
-  }
-
   // ─── Filings (scoped by userId) ────────────────────────
 
   // Filings are a shared team corpus (no per-user filter).
