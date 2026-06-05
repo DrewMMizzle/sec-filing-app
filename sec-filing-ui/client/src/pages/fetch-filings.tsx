@@ -431,31 +431,6 @@ export default function FetchFilings() {
     onError: (err: Error) => toast({ title: "Error", description: err.message, variant: "destructive" }),
   });
 
-  // Retry a single filing whose render previously errored or was interrupted.
-  // The main Fetch button dedups against the DB and won't re-attempt these.
-  const retryRenderMutation = useMutation<{ rerendered: number }, Error, string>({
-    mutationFn: async (accession) => {
-      const res = await apiRequest("POST", `/api/filings/${encodeURIComponent(accession)}/retry-render`, {});
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        throw new Error(body.error || "Retry failed");
-      }
-      return res.json();
-    },
-    onSuccess: (data) => {
-      refetchFilings();
-      queryClient.invalidateQueries({ queryKey: ["/api/review/usage"] });
-      toast({
-        title: data.rerendered > 0 ? "Re-rendered" : "Retry queued",
-        description:
-          data.rerendered > 0
-            ? "Filing re-rendered; review will run shortly."
-            : "SEC returned nothing this time — check the date or filing-type list.",
-      });
-    },
-    onError: (err) => toast({ title: "Retry failed", description: err.message, variant: "destructive" }),
-  });
-
   // Re-render filings whose PDF is missing from disk (zombie "complete" rows)
   const renderMissingMutation = useMutation<{ rerendered: number; missingTotal: number; tickersRemaining: number }>({
     mutationFn: async () => {
@@ -527,31 +502,18 @@ export default function FetchFilings() {
   };
 
   // ── Quick fetch: type/paste tickers, resolve via SEC, kick the pipeline ──
-  // S-1 / S-1/A are included so pre-IPO filers (which don't have periodic
-  // 10-K/10-Q/8-K filings yet) return something instead of an empty result.
-  const QUICK_FETCH_FILING_TYPES = ["10-K", "10-Q", "8-K", "DEF 14A", "S-1", "S-1/A"];
+  const QUICK_FETCH_FILING_TYPES = ["10-K", "10-Q", "8-K", "DEF 14A"];
   const [quickInput, setQuickInput] = useState("");
 
   type ResolvedTicker = { ticker: string; cik: string; name: string };
-  type EdgarCandidate = { cik: string; name: string; ticker?: string };
-  type AmbiguousGroup = { query: string; candidates: EdgarCandidate[] };
   // Holds the resolved tickers from a quick fetch while we ask whether to add
   // them to a watchlist. Quick fetch only puts filings in the shared library;
   // adding the ticker to a watchlist is what makes it reappear in the picker.
   const [quickAdd, setQuickAdd] = useState<ResolvedTicker[] | null>(null);
   const [quickAddTarget, setQuickAddTarget] = useState<string>("");
-  // EDGAR name-search fallback: when Quick Fetch input matches multiple
-  // companies (e.g. "SpaceX" with multiple SEC filers using that name), the
-  // server returns the candidates here and we show a picker before
-  // advancing to the add-to-watchlist prompt.
-  const [ambiguous, setAmbiguous] = useState<{
-    initialResolved: ResolvedTicker[];
-    groups: AmbiguousGroup[];
-    picks: Record<string, EdgarCandidate | null>; // query -> pick (null = skip)
-  } | null>(null);
 
   const quickFetchMutation = useMutation<
-    { resolved: ResolvedTicker[]; unresolved: string[]; ambiguous?: AmbiguousGroup[] },
+    { resolved: ResolvedTicker[]; unresolved: string[] },
     Error,
     string[]
   >({
@@ -563,19 +525,13 @@ export default function FetchFilings() {
       }
       return res.json();
     },
-    onSuccess: ({ resolved, unresolved, ambiguous: amb }) => {
+    onSuccess: ({ resolved, unresolved }) => {
       if (unresolved.length > 0) {
         toast({
           title: `Skipped ${unresolved.length} ticker${unresolved.length !== 1 ? "s" : ""}`,
           description: `Not found in SEC: ${unresolved.join(", ")}`,
           variant: "destructive",
         });
-      }
-      // If any name has multiple matches, ask the user to pick before we
-      // continue into the add-to-watchlist prompt.
-      if (amb && amb.length > 0) {
-        setAmbiguous({ initialResolved: resolved, groups: amb, picks: {} });
-        return;
       }
       if (resolved.length === 0) return;
       // Don't fetch yet — ask which watchlist (if any) to persist these tickers
@@ -592,65 +548,14 @@ export default function FetchFilings() {
     onError: (err) => toast({ title: "Error", description: err.message, variant: "destructive" }),
   });
 
-  // Derive a short ALL-CAPS display label from a company name client-side,
-  // for picks where EDGAR didn't return a ticker. Mirrors server/sec-edgar.ts.
-  const nameToLabelClient = (name: string): string => {
-    const SUFFIXES = new Set([
-      "THE", "INC", "CORP", "CORPORATION", "CO", "COMPANY", "LLC", "LTD", "PLC",
-      "HOLDINGS", "GROUP", "TRUST", "FUND",
-    ]);
-    const tokens = (name || "")
-      .toUpperCase()
-      .replace(/[.,()/]/g, " ")
-      .split(/\s+/)
-      .filter(Boolean);
-    const first = tokens.find((t) => !SUFFIXES.has(t)) ?? tokens[0] ?? "";
-    return (first.replace(/[^A-Z0-9]/g, "") || "PREIPO").slice(0, 8);
-  };
-
-  // Finalize the ambiguous picker: merge user picks into the initial resolved
-  // set, then advance to the add-to-watchlist prompt (or stop if nothing
-  // resolved at all).
-  const finalizeAmbiguous = () => {
-    if (!ambiguous) return;
-    const additions: ResolvedTicker[] = [];
-    const seen = new Set(ambiguous.initialResolved.map((r) => r.ticker));
-    for (const g of ambiguous.groups) {
-      const pick = ambiguous.picks[g.query];
-      if (!pick) continue;
-      const label = (pick.ticker || nameToLabelClient(pick.name)).toUpperCase();
-      if (seen.has(label)) continue;
-      seen.add(label);
-      additions.push({ ticker: label, cik: pick.cik, name: pick.name });
-    }
-    const finalResolved = [...ambiguous.initialResolved, ...additions];
-    setAmbiguous(null);
-    if (finalResolved.length === 0) return;
-    setQuickAdd(finalResolved);
-    setQuickAddTarget(
-      selectedWatchlist !== "all"
-        ? selectedWatchlist
-        : watchlists[0]
-          ? String(watchlists[0].id)
-          : "",
-    );
-  };
-
   // Persist quick-fetched tickers into a watchlist (idempotent server-side).
   const bulkAddMutation = useMutation<
     { added: number; skipped: number },
     Error,
-    {
-      watchlistId: string;
-      tickers: Array<{ ticker: string; cik: string }>;
-      filingTypes?: string[];
-    }
+    { watchlistId: string; tickers: Array<{ ticker: string; cik: string }> }
   >({
-    mutationFn: async ({ watchlistId, tickers, filingTypes }) => {
-      const res = await apiRequest("POST", `/api/watchlists/${watchlistId}/tickers/bulk`, {
-        tickers,
-        filingTypes,
-      });
+    mutationFn: async ({ watchlistId, tickers }) => {
+      const res = await apiRequest("POST", `/api/watchlists/${watchlistId}/tickers/bulk`, { tickers });
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
         throw new Error(body.error || "Failed to add tickers to watchlist");
@@ -852,9 +757,8 @@ export default function FetchFilings() {
               Quick fetch
             </label>
             <p className="text-xs text-muted-foreground">
-              Type or paste ticker symbols — or CIKs / company names for pre-IPO filers — separated
-              by spaces, commas, or new lines, to fetch recent 10-K, 10-Q, 8-K, DEF 14A, and S-1 /
-              S-1/A filings (no watchlist needed).
+              Type or paste ticker symbols (separated by spaces, commas, or new lines) to fetch
+              recent 10-K, 10-Q, 8-K, and DEF 14A filings — no watchlist needed.
             </p>
           </div>
           <div className="flex items-center gap-2">
@@ -1079,14 +983,11 @@ export default function FetchFilings() {
           </Button>
 
           {/* Cancel: visible whenever something cancelable is in flight — the
-              Python fetch child, the Claude review drain, queued reviews, or
-              any filing the DB says is still rendering/reviewing (the last
-              two survive a server restart that drops the in-memory handles). */}
+              Python fetch child, the Claude review drain, or queued reviews. */}
           {(fetchMutation.isPending ||
             usage?.fetching ||
             usage?.processing ||
-            (usage?.pendingCount ?? 0) > 0 ||
-            runActive) && (
+            (usage?.pendingCount ?? 0) > 0) && (
             <Button
               variant="destructive"
               onClick={() => cancelMutation.mutate()}
@@ -1198,21 +1099,6 @@ export default function FetchFilings() {
                   data-testid="button-raise-cap-inline"
                 >
                   Raise cap
-                </Button>
-              )}
-              {/* Inline cancel — visible right where the user is looking
-                  while a run is active, so they don't have to scroll back
-                  up to the Fetch button to find the destructive one. */}
-              {(runActive || fetchMutation.isPending) && (
-                <Button
-                  size="sm"
-                  variant="destructive"
-                  className="h-6"
-                  onClick={() => cancelMutation.mutate()}
-                  disabled={cancelMutation.isPending}
-                  data-testid="button-cancel-run-inline"
-                >
-                  {cancelMutation.isPending ? "Canceling…" : "Cancel run"}
                 </Button>
               )}
             </div>
@@ -1382,34 +1268,9 @@ export default function FetchFilings() {
                     </Badge>
                   )}
                   {f.status === "error" && (
-                    <>
-                      <Badge variant="destructive" className="text-xs">
-                        <X className="w-3 h-3 mr-0.5" /> Error
-                      </Badge>
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        className="h-5 px-1.5 text-[10px]"
-                        disabled={
-                          retryRenderMutation.isPending &&
-                          retryRenderMutation.variables === f.accessionNumber
-                        }
-                        onClick={() => retryRenderMutation.mutate(f.accessionNumber)}
-                        data-testid={`button-retry-render-${f.accessionNumber}`}
-                        title="Re-attempt rendering this filing"
-                      >
-                        {retryRenderMutation.isPending &&
-                        retryRenderMutation.variables === f.accessionNumber ? (
-                          <>
-                            <Loader2 className="w-3 h-3 mr-0.5 animate-spin" /> Retrying
-                          </>
-                        ) : (
-                          <>
-                            <RefreshCw className="w-3 h-3 mr-0.5" /> Retry
-                          </>
-                        )}
-                      </Button>
-                    </>
+                    <Badge variant="destructive" className="text-xs">
+                      <X className="w-3 h-3 mr-0.5" /> Error
+                    </Badge>
                   )}
                   {(f.reviewStatus === "pending" || f.reviewStatus === "reviewing") && (
                     <Badge variant="default" className="text-xs bg-amber-600/20 text-amber-400 border-amber-600/30">
@@ -1531,71 +1392,6 @@ export default function FetchFilings() {
         </AlertDialogContent>
       </AlertDialog>
 
-      {/* Quick fetch: EDGAR name-search picker when an input matched multiple
-          companies (e.g. "SpaceX" with several similarly-named filers). */}
-      <Dialog
-        open={ambiguous !== null}
-        onOpenChange={(open) => { if (!open) setAmbiguous(null); }}
-      >
-        <DialogContent className="max-w-lg">
-          <DialogHeader>
-            <DialogTitle>Pick the company you meant</DialogTitle>
-            <DialogDescription>
-              SEC EDGAR returned multiple matches for the names below. Pick the right one for each
-              — or leave a group unpicked to skip it.
-            </DialogDescription>
-          </DialogHeader>
-          <div className="space-y-4 max-h-[60vh] overflow-y-auto pr-1">
-            {ambiguous?.groups.map((g) => {
-              const picked = ambiguous.picks[g.query];
-              return (
-                <div key={g.query}>
-                  <p className="text-sm font-medium mb-1.5">
-                    For <span className="font-mono">{g.query}</span>
-                  </p>
-                  <div className="border rounded-md divide-y">
-                    {g.candidates.map((c) => {
-                      const isPicked = picked?.cik === c.cik;
-                      return (
-                        <button
-                          key={c.cik}
-                          type="button"
-                          className={`w-full text-left px-3 py-2 text-sm transition-colors ${
-                            isPicked ? "bg-primary/10" : "hover:bg-muted/40"
-                          }`}
-                          onClick={() =>
-                            setAmbiguous((s) =>
-                              s
-                                ? { ...s, picks: { ...s.picks, [g.query]: isPicked ? null : c } }
-                                : s,
-                            )
-                          }
-                          data-testid={`ambiguous-pick-${g.query}-${c.cik}`}
-                        >
-                          <div className="font-medium truncate">{c.name}</div>
-                          <div className="text-xs text-muted-foreground font-mono">
-                            CIK {c.cik}
-                            {c.ticker ? ` · ${c.ticker}` : ""}
-                          </div>
-                        </button>
-                      );
-                    })}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-          <DialogFooter>
-            <Button variant="ghost" onClick={() => setAmbiguous(null)} data-testid="button-ambiguous-cancel">
-              Cancel
-            </Button>
-            <Button onClick={finalizeAmbiguous} data-testid="button-ambiguous-confirm">
-              Continue
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
       {/* Quick fetch: offer to save the resolved tickers to a watchlist */}
       <Dialog open={quickAdd !== null} onOpenChange={(open) => { if (!open) setQuickAdd(null); }}>
         <DialogContent>
@@ -1644,7 +1440,6 @@ export default function FetchFilings() {
                   bulkAddMutation.mutate({
                     watchlistId: quickAddTarget,
                     tickers: quickAdd.map((r) => ({ ticker: r.ticker, cik: r.cik })),
-                    filingTypes: QUICK_FETCH_FILING_TYPES,
                   });
                 }
                 runQuickFetch(quickAdd);
