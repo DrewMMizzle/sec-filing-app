@@ -69,10 +69,12 @@ type RegistrationCompareResult = {
 // input tokens for Opus 4.7) — show this estimate before the user opts
 // in per filing.
 const REVIEW_COST_ESTIMATE = "$1.50 – $4.00 (Opus 4.7; rough)";
-// Whole-filing compare is bounded at ~400k chars per filing (~100k tokens each)
-// — so the input is materially smaller than a full review, and the output is
-// only a structured changelog. Rule of thumb: roughly $1 – $2 per compare.
-const COMPARE_COST_ESTIMATE = "$1.00 – $2.00 (Opus 4.7; rough)";
+// Whole-filing compare runs against Claude's 1M-token context window. Each
+// filing can hit ~1.5M chars (~375k tokens) before sampling kicks in, so a
+// fully-sampled two-filing compare hits ~750k tokens of input. At $5/1M
+// input + $25/1M output, that lands around $1 – $4 per compare depending on
+// how much of each filing's text is actually sent.
+const COMPARE_COST_ESTIMATE = "$1.00 – $4.00 (Opus 4.7, 1M-context; rough)";
 
 export default function Registration() {
   const { toast } = useToast();
@@ -595,9 +597,10 @@ export default function Registration() {
           <AlertDialogHeader>
             <AlertDialogTitle>Compare these two filings with Claude?</AlertDialogTitle>
             <AlertDialogDescription>
-              Claude will read both rendered PDFs (front, middle, and back samples for long
-              filings) and produce a changelog of added / removed / changed material between
-              the earlier and later filing. Estimated cost:{" "}
+              Claude will read both rendered PDFs end-to-end (using the Opus 1M-token context
+              window) and produce a changelog of added / removed / changed material between
+              the earlier and later filing. Very long filings (&gt;1.5M chars each) still get
+              front / middle / back sampled. Estimated cost:{" "}
               <span className="text-foreground font-medium">{COMPARE_COST_ESTIMATE}</span>. The
               spend is charged against the team-wide review cap.
             </AlertDialogDescription>

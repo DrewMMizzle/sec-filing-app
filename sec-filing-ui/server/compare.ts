@@ -249,7 +249,13 @@ export async function compareFilings(a: Filing, b: Filing, key: SectionKey): Pro
 //      material changes.
 // ───────────────────────────────────────────────────────────
 
-const REGISTRATION_FULL_MAX_CHARS_PER_FILING = 400_000; // ~100k tokens
+// With the Opus 1M-token context beta enabled per-request (see the
+// "anthropic-beta" header on the messages.stream call below), each filing
+// can hit ~1.5M chars / ~375k tokens before we have to sample. Two filings
+// + system prompt + thinking + 8k max_output_tokens still comfortably fits
+// under 1M tokens. Sampling logic remains as a fallback for the truly
+// pathological cases (mega-bank-sized S-1s well over 1.5M chars).
+const REGISTRATION_FULL_MAX_CHARS_PER_FILING = 1_500_000;
 const REGISTRATION_COMPARE_SYSTEM = `You are comparing two related SEC registration statements from the SAME company (typically an S-1 and its S-1/A amendment, or two successive S-1/A amendments), filed at different times, for footnoted.com. Your job is to identify what MATERIALLY changed across the WHOLE filing from the earlier filing to the later one.
 
 Report:
@@ -326,14 +332,23 @@ export async function compareRegistrationFilingsFromPdfs(
     `=== EARLIER (${earlierF.filingType} ${earlierF.filingDate || "unknown"}) ===\n${sampledE}\n\n` +
     `=== LATER (${laterF.filingType} ${laterF.filingDate || "unknown"}) ===\n${sampledL}`;
 
-  const stream = getAnthropicClient().messages.stream({
-    model: MODEL,
-    max_tokens: 8000,
-    thinking: { type: "adaptive" },
-    output_config: { effort: "high", format: { type: "json_schema", schema: COMPARE_SCHEMA } },
-    system: [{ type: "text", text: REGISTRATION_COMPARE_SYSTEM, cache_control: { type: "ephemeral" } }],
-    messages: [{ role: "user", content: userContent }],
-  });
+  // 1M-context beta header — scoped to this one call so the rest of the
+  // codebase (review, MD&A, the various Ask paths) keeps its existing
+  // bounded inputs and stays in the standard 200k-token context. The
+  // header is per-request via the messages.stream() options arg.
+  const stream = getAnthropicClient().messages.stream(
+    {
+      model: MODEL,
+      max_tokens: 8000,
+      thinking: { type: "adaptive" },
+      output_config: { effort: "high", format: { type: "json_schema", schema: COMPARE_SCHEMA } },
+      system: [{ type: "text", text: REGISTRATION_COMPARE_SYSTEM, cache_control: { type: "ephemeral" } }],
+      messages: [{ role: "user", content: userContent }],
+    },
+    {
+      headers: { "anthropic-beta": "context-1m-2025-08-07" },
+    },
+  );
 
   const message = await stream.finalMessage();
   const textBlock = message.content.find((b) => b.type === "text");
@@ -360,7 +375,7 @@ export async function compareRegistrationFilingsFromPdfs(
       Math.round(((usage.inputTokens * 5 + usage.outputTokens * 25) / 1_000_000) * 100) / 100,
     sampled: wasSampled,
     note: wasSampled
-      ? `Long filing — sampled front / middle / back at ~${REGISTRATION_FULL_MAX_CHARS_PER_FILING.toLocaleString()} chars per filing so the comparison fits in Claude's context window.`
+      ? `Long filing — sampled front / middle / back at ~${REGISTRATION_FULL_MAX_CHARS_PER_FILING.toLocaleString()} chars per filing so the comparison fits in Claude's 1M-token context window.`
       : undefined,
   };
 }
