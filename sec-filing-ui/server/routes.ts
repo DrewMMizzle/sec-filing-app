@@ -25,7 +25,12 @@ import type { ChildProcess } from "child_process";
 let currentFetchChild: ChildProcess | null = null;
 import { chatAboutFindings, chatAboutFiling } from "./chat";
 import { findPageForQuote } from "./pdf-locate";
-import { compareFilings, SECTION_LABELS, type SectionKey } from "./compare";
+import {
+  compareFilings,
+  compareRegistrationFilingsFromPdfs,
+  SECTION_LABELS,
+  type SectionKey,
+} from "./compare";
 import { db } from "./storage";
 import { tickers as tickersTable, filings as filingsTable } from "@shared/schema";
 import { eq } from "drizzle-orm";
@@ -1564,6 +1569,50 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
       });
     } catch (e: any) {
       res.status(500).json({ error: e?.message || "Registration render failed" });
+    }
+  });
+
+  // Whole-filing PDF comparison for S-1 / S-1/A pairs. Requires both filings
+  // to already be rendered (the existing Registration render flow handles
+  // that). Reads the rendered PDF text and sends a front/middle/back-sampled
+  // version of each side to Claude. Auto-review stays off for the inputs —
+  // the user always opts in to spend explicitly here.
+  app.post("/api/registration/compare-pdfs", requireAuth, async (req, res) => {
+    if (!isReviewEnabled()) {
+      return res
+        .status(409)
+        .json({ error: "Claude comparison is not configured (ANTHROPIC_API_KEY is not set)." });
+    }
+    const body = req.body as { accessionA?: unknown; accessionB?: unknown };
+    const accessionA = typeof body.accessionA === "string" ? body.accessionA.trim() : "";
+    const accessionB = typeof body.accessionB === "string" ? body.accessionB.trim() : "";
+    if (!accessionA || !accessionB) {
+      return res.status(400).json({ error: "accessionA and accessionB are required" });
+    }
+    if (accessionA === accessionB) {
+      return res.status(400).json({ error: "Pick two different filings" });
+    }
+    const fa = await storage.getFilingByAccession(accessionA);
+    const fb = await storage.getFilingByAccession(accessionB);
+    if (!fa || !fb) {
+      return res
+        .status(404)
+        .json({ error: "One or both filings aren't in the library yet — render them first." });
+    }
+    if (fa.status !== "complete" || fb.status !== "complete") {
+      return res.status(409).json({
+        error:
+          "Both filings need to be in 'complete' status before comparison. Render the missing one first.",
+        statusA: fa.status,
+        statusB: fb.status,
+      });
+    }
+    try {
+      const result = await compareRegistrationFilingsFromPdfs(fa, fb);
+      res.json(result);
+    } catch (e: any) {
+      console.error("Registration PDF compare failed:", e?.message || e);
+      res.status(500).json({ error: e?.message || "Registration comparison failed" });
     }
   });
 }
