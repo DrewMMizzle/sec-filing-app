@@ -38,11 +38,7 @@ os.chdir(PROJECT_ROOT)
 from src.config import configure_logging
 from src.edgar.rate_limiter import sec_get, close_client
 from src.renderer.preprocess import preprocess_filing
-from src.renderer.playwright_render import (
-    render_html_to_pdf,
-    render_s1_url_to_pdf,
-    close_browser,
-)
+from src.renderer.playwright_render import render_html_to_pdf, close_browser
 
 logger = logging.getLogger(__name__)
 
@@ -146,47 +142,52 @@ async def poll_ticker_with_dates(
 async def render_filing(filing_info: dict) -> dict:
     """Preprocess and render one filing to PDF. Returns result dict.
 
-    S-1 / S-1/A take the URL-render path (Chromium fetches assets directly
-    from SEC with rate-limited subresources) — preprocess+base64-inline
-    inflates these documents to tens of MB and is the documented wedge.
-    Other forms keep the existing preprocess+render_html_to_pdf path,
-    unchanged, so this code path can't regress normal renders.
+    Every form — 10-K, 10-Q, 8-K, DEF 14A, S-1, S-1/A — goes through the
+    same path: preprocess in Python (httpx fetches the HTML using the
+    rate-limited SEC client, images are inlined as base64) → push the
+    cleaned HTML into Chromium with set_content → page.pdf().
 
-    For S-1 / S-1/A, also emits periodic heartbeat events so the Node-side
-    pipeline watchdog (which idle-times on stdout activity) doesn't
-    mistake a healthy multi-minute render for a hung pipeline.
+    Crucially, Chromium itself never makes outbound SEC requests during
+    rendering. SEC's anti-automation detection blocks Chromium's browser
+    fingerprint even with the correct User-Agent string, so we let httpx
+    (which SEC explicitly whitelists for declared traffic) do all the
+    SEC talking. This is what 1700+ historical renders rely on.
+
+    A periodic heartbeat event is emitted while the render is in flight
+    so the Node-side pipeline watchdog (which idle-times on stdout
+    activity) doesn't mistake a healthy multi-minute big-filing render
+    for a hung pipeline. Heartbeats apply to every form — most renders
+    finish before the first heartbeat fires, but the big ones (especially
+    S-1s) need it.
     """
     ticker = filing_info["ticker"]
     filing_type = filing_info["filing_type"]
     accession = filing_info["accession_number"]
     url = filing_info["primary_doc_url"]
 
-    if filing_type.upper().startswith("S-1"):
-        async def heartbeat():
-            try:
-                while True:
-                    await asyncio.sleep(60)
-                    emit({
-                        "event": "heartbeat",
-                        "ticker": ticker,
-                        "accession": accession,
-                        "filing_type": filing_type,
-                    })
-            except asyncio.CancelledError:
-                return
-
-        task = asyncio.create_task(heartbeat())
+    async def heartbeat():
         try:
-            pdf_bytes = await render_s1_url_to_pdf(url)
-        finally:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-    else:
+            while True:
+                await asyncio.sleep(60)
+                emit({
+                    "event": "heartbeat",
+                    "ticker": ticker,
+                    "accession": accession,
+                    "filing_type": filing_type,
+                })
+        except asyncio.CancelledError:
+            return
+
+    task = asyncio.create_task(heartbeat())
+    try:
         html = await preprocess_filing(url)
         pdf_bytes = await render_html_to_pdf(html)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
     safe_type = filing_type.replace(" ", "_")
     out_dir = OUTPUT_DIR / "filings" / ticker / safe_type
