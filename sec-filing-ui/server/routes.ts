@@ -223,7 +223,15 @@ function runFetchPipeline(
     });
 
     child.stderr.on("data", (data: Buffer) => {
-      stderrOutput += data.toString();
+      const text = data.toString();
+      // Forward to the Node process's own stderr so Railway / Deploy logs
+      // show what the Python pipeline is actually doing — logger.info
+      // lines, tracebacks, everything. Without this, all Python output
+      // was silently captured into the buffer below and only surfaced if
+      // the child exited non-zero. Net result: stuck renders were
+      // diagnostically invisible.
+      process.stderr.write(text);
+      stderrOutput += text;
     });
 
     child.on("close", (code) => {
@@ -279,6 +287,26 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     .recoverStaleRenders()
     .then((n) => n > 0 && console.log(`[startup] Reset ${n} stale 'rendering' filing(s) to error.`))
     .catch((err) => console.error("Stale-render recovery failed:", err));
+
+  // Periodic sweep: any row stuck at 'rendering' for >15 min is treated as
+  // orphaned. Active renders (heartbeats fire every 60s, page.pdf budget is
+  // 5 min, preprocess budget is 4 min) finish well inside this window, so
+  // a healthy in-flight render is never killed. Without this, a dying
+  // Python child leaves the UI spinning forever.
+  const STALE_RENDER_CHECK_INTERVAL_MS = 5 * 60 * 1000; // 5 min
+  const STALE_RENDER_AGE_MINUTES = 15;
+  setInterval(() => {
+    storage
+      .recoverStaleRenders({ olderThanMinutes: STALE_RENDER_AGE_MINUTES })
+      .then((n) => {
+        if (n > 0) {
+          console.log(
+            `[sweep] Reset ${n} render row(s) stuck >${STALE_RENDER_AGE_MINUTES} min to error.`,
+          );
+        }
+      })
+      .catch((err) => console.error("Periodic stale-render sweep failed:", err));
+  }, STALE_RENDER_CHECK_INTERVAL_MS).unref();
 
   // ─── Health check (public, unauthenticated) ─────────────
   // Used by Railway's deploy probe, which sends no auth cookie. Must stay
@@ -843,7 +871,7 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     // Clear any rows the pipeline left at 'rendering' (e.g. it was stalled and
     // killed) for these tickers so they don't spin forever.
     storage
-      .recoverStaleRenders(tickerNames)
+      .recoverStaleRenders({ tickerList: tickerNames })
       .catch((err) => console.error("Stale-render recovery failed:", err));
 
     // Newly-rendered filings were queued incrementally as each PDF landed. Also
