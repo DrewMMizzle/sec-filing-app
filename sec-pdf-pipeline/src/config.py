@@ -15,7 +15,13 @@ class Settings(BaseSettings):
     """Application settings populated from environment variables / .env file."""
 
     sec_user_agent: str = Field(
-        default="CompanyName admin@company.com",
+        # SEC blocks well-known placeholder defaults like "CompanyName
+        # admin@company.com" — keep the default value consistent with the
+        # Node app (sec-filing-ui's SEC_USER_AGENT default) so a deploy
+        # that forgets to set the env var still gets through SEC's
+        # bot-detection rather than rendering their anti-automation page.
+        # Override via the SEC_USER_AGENT env var for real production use.
+        default="DotAdda ameister@dotadda.com",
         description="SEC-required User-Agent header value",
     )
     aws_access_key_id: str = ""
