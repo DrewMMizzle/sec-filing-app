@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { Card } from "@/components/ui/card";
@@ -17,7 +17,17 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
-import { Rocket, Search, Loader2, AlertCircle, Sparkles } from "lucide-react";
+import {
+  Rocket,
+  Search,
+  Loader2,
+  AlertCircle,
+  Sparkles,
+  GitCompareArrows,
+  Plus,
+  Minus,
+  Pencil,
+} from "lucide-react";
 
 // ─── Types mirroring the /api/registration/* endpoints ───────────────
 type EdgarCompany = { cik: string; name: string; ticker?: string };
@@ -38,11 +48,31 @@ type RenderResponse = {
   companyName: string;
   rendered: number;
 };
+type ChangeItem = { headline: string; detail: string };
+type Changelog = {
+  unchanged: boolean;
+  summary: string;
+  added: ChangeItem[];
+  removed: ChangeItem[];
+  changed: ChangeItem[];
+};
+type RegistrationCompareResult = {
+  earlier: { accession: string; ticker: string; form: string; date: string; chars: number };
+  later: { accession: string; ticker: string; form: string; date: string; chars: number };
+  changelog: Changelog | null;
+  costUsd: number;
+  sampled: boolean;
+  note?: string;
+};
 
 // Reviewing one S-1 / S-1/A is genuinely expensive (large input, $5/1M
 // input tokens for Opus 4.7) — show this estimate before the user opts
 // in per filing.
 const REVIEW_COST_ESTIMATE = "$1.50 – $4.00 (Opus 4.7; rough)";
+// Whole-filing compare is bounded at ~400k chars per filing (~100k tokens each)
+// — so the input is materially smaller than a full review, and the output is
+// only a structured changelog. Rule of thumb: roughly $1 – $2 per compare.
+const COMPARE_COST_ESTIMATE = "$1.00 – $2.00 (Opus 4.7; rough)";
 
 export default function Registration() {
   const { toast } = useToast();
@@ -50,6 +80,10 @@ export default function Registration() {
   const [picked, setPicked] = useState<EdgarCompany | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [reviewConfirm, setReviewConfirm] = useState<string | null>(null);
+  // Compare flow: AlertDialog confirms cost; mutation holds the result so the
+  // changelog stays on-screen after the toast fades.
+  const [compareConfirm, setCompareConfirm] = useState(false);
+  const [compareResult, setCompareResult] = useState<RegistrationCompareResult | null>(null);
 
   // ─── Search ────────────────────────────────────────────────────────
   const search = useMutation<EdgarCompany[], Error, string>({
@@ -109,6 +143,33 @@ export default function Registration() {
       toast({ title: "Render failed", description: err.message, variant: "destructive" }),
   });
 
+  // ─── Compare two rendered S-1 / S-1/A filings ──────────────────────
+  // Whole-filing comparison from the rendered PDFs (extractPdfText →
+  // front/middle/back sampling → Claude). Requires BOTH selected filings
+  // to be rendered first — the button is gated by dbStatus.
+  const compare = useMutation<RegistrationCompareResult, Error, { accessions: [string, string] }>({
+    mutationFn: async ({ accessions }) => {
+      const res = await apiRequest("POST", "/api/registration/compare-pdfs", {
+        accessionA: accessions[0],
+        accessionB: accessions[1],
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || "Comparison failed");
+      }
+      return res.json();
+    },
+    onSuccess: (data) => {
+      setCompareResult(data);
+      toast({
+        title: "Comparison complete",
+        description: `${data.earlier.form} ${data.earlier.date} → ${data.later.form} ${data.later.date}`,
+      });
+    },
+    onError: (err) =>
+      toast({ title: "Comparison failed", description: err.message, variant: "destructive" }),
+  });
+
   // ─── Review (opt-in, per filing) ───────────────────────────────────
   const review = useMutation<{ ok: boolean }, Error, string>({
     mutationFn: async (accession) => {
@@ -128,6 +189,7 @@ export default function Registration() {
     if (!trimmed) return;
     setPicked(null);
     setSelected(new Set());
+    setCompareResult(null);
     search.mutate(trimmed);
   };
 
@@ -150,6 +212,29 @@ export default function Registration() {
   };
 
   const filings = filingsQuery.data ?? [];
+  // Compare-gating: need exactly two selected filings AND both have to be
+  // rendered (dbStatus === "complete"). We compute the rendered subset so
+  // the disabled-button tooltip can say "render the missing one(s) first".
+  const selectedFilings = filings.filter((f) => selected.has(f.accessionNumber));
+  const renderedSelected = selectedFilings.filter((f) => f.dbStatus === "complete");
+  const compareReady = selectedFilings.length === 2 && renderedSelected.length === 2;
+  const compareDisabledReason = (() => {
+    if (selectedFilings.length !== 2) return "Pick exactly two filings to compare.";
+    if (renderedSelected.length !== 2)
+      return "Render both filings first — Compare reads their rendered PDF text.";
+    return "";
+  })();
+
+  const runCompare = () => {
+    if (!compareReady) return;
+    setCompareConfirm(true);
+  };
+  const confirmRunCompare = () => {
+    setCompareConfirm(false);
+    setCompareResult(null);
+    const [a, b] = selectedFilings.map((f) => f.accessionNumber);
+    compare.mutate({ accessions: [a, b] });
+  };
 
   return (
     <div className="p-6 max-w-4xl mx-auto">
@@ -219,6 +304,7 @@ export default function Registration() {
               onClick={() => {
                 setPicked(c);
                 setSelected(new Set());
+                setCompareResult(null);
               }}
               data-testid={`button-registration-pick-${c.cik}`}
             >
@@ -243,7 +329,16 @@ export default function Registration() {
                 {picked.ticker ? ` · ${picked.ticker}` : " · pre-IPO"}
               </p>
             </div>
-            <Button variant="ghost" size="sm" onClick={() => setPicked(null)} data-testid="button-registration-back">
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => {
+                setPicked(null);
+                setSelected(new Set());
+                setCompareResult(null);
+              }}
+              data-testid="button-registration-back"
+            >
               Pick another
             </Button>
           </Card>
@@ -292,6 +387,25 @@ export default function Registration() {
                     </>
                   ) : (
                     `Render selected (${selected.size})`
+                  )}
+                </Button>
+                <Button
+                  variant="outline"
+                  onClick={runCompare}
+                  disabled={!compareReady || compare.isPending}
+                  title={compareReady ? "Compare the two rendered filings" : compareDisabledReason}
+                  data-testid="button-registration-compare"
+                >
+                  {compare.isPending ? (
+                    <>
+                      <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                      Comparing…
+                    </>
+                  ) : (
+                    <>
+                      <GitCompareArrows className="w-4 h-4 mr-2" />
+                      Compare two
+                    </>
                   )}
                 </Button>
               </div>
@@ -362,6 +476,82 @@ export default function Registration() {
                   );
                 })}
               </Card>
+
+              {/* Gentle hint when the Compare button is disabled — explains
+                  why, instead of leaving the user guessing at a greyed-out
+                  button. */}
+              {!compareReady && selectedFilings.length > 0 && (
+                <p className="text-xs text-muted-foreground mt-2">
+                  <AlertCircle className="w-3 h-3 inline mr-1" />
+                  {compareDisabledReason}
+                </p>
+              )}
+
+              {/* Compare result */}
+              {compareResult && (
+                <Card className="mt-4 p-4 space-y-4">
+                  <div className="flex items-center gap-2 text-sm flex-wrap border-b pb-2">
+                    <GitCompareArrows className="w-4 h-4 text-primary" />
+                    <span className="font-semibold">Whole-filing comparison</span>
+                    <Badge variant="outline">
+                      {compareResult.earlier.form} {compareResult.earlier.date}
+                    </Badge>
+                    <span className="text-muted-foreground">→</span>
+                    <Badge variant="outline">
+                      {compareResult.later.form} {compareResult.later.date}
+                    </Badge>
+                  </div>
+
+                  {compareResult.note && (
+                    <p className="rounded-md border border-amber-600/30 bg-amber-600/10 p-3 text-xs text-muted-foreground">
+                      {compareResult.note}
+                    </p>
+                  )}
+
+                  {compareResult.changelog ? (
+                    <>
+                      <p className="text-sm">{compareResult.changelog.summary}</p>
+                      {compareResult.changelog.added.length > 0 && (
+                        <ChangeGroup
+                          title="Added"
+                          icon={<Plus className="w-3.5 h-3.5 text-green-400" />}
+                          items={compareResult.changelog.added}
+                        />
+                      )}
+                      {compareResult.changelog.removed.length > 0 && (
+                        <ChangeGroup
+                          title="Removed"
+                          icon={<Minus className="w-3.5 h-3.5 text-red-400" />}
+                          items={compareResult.changelog.removed}
+                        />
+                      )}
+                      {compareResult.changelog.changed.length > 0 && (
+                        <ChangeGroup
+                          title="Changed"
+                          icon={<Pencil className="w-3.5 h-3.5 text-amber-400" />}
+                          items={compareResult.changelog.changed}
+                        />
+                      )}
+                      {compareResult.changelog.unchanged && (
+                        <p className="text-xs text-muted-foreground">
+                          Claude didn&apos;t identify material changes between these two filings.
+                        </p>
+                      )}
+                    </>
+                  ) : (
+                    <p className="text-sm text-muted-foreground">
+                      No changelog was returned for this comparison.
+                    </p>
+                  )}
+
+                  <p className="text-[11px] text-muted-foreground border-t pt-2">
+                    Claude comparison cost: ${compareResult.costUsd.toFixed(2)}
+                    {" · "}
+                    {compareResult.earlier.chars.toLocaleString()} →{" "}
+                    {compareResult.later.chars.toLocaleString()} chars of PDF text.
+                  </p>
+                </Card>
+              )}
             </>
           )}
         </div>
@@ -395,6 +585,60 @@ export default function Registration() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      {/* ─── Compare cost confirmation dialog ──────────────────────── */}
+      <AlertDialog
+        open={compareConfirm}
+        onOpenChange={(open) => { if (!open) setCompareConfirm(false); }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Compare these two filings with Claude?</AlertDialogTitle>
+            <AlertDialogDescription>
+              Claude will read both rendered PDFs (front, middle, and back samples for long
+              filings) and produce a changelog of added / removed / changed material between
+              the earlier and later filing. Estimated cost:{" "}
+              <span className="text-foreground font-medium">{COMPARE_COST_ESTIMATE}</span>. The
+              spend is charged against the team-wide review cap.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={confirmRunCompare} data-testid="button-confirm-compare">
+              Run comparison
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </div>
+  );
+}
+
+function ChangeGroup({
+  title,
+  icon,
+  items,
+}: {
+  title: string;
+  icon: ReactNode;
+  items: { headline: string; detail: string }[];
+}) {
+  return (
+    <div className="rounded-md border border-border/60 bg-muted/30 p-3">
+      <div className="flex items-center gap-1.5 mb-2">
+        {icon}
+        <span className="text-sm font-semibold">
+          {title} ({items.length})
+        </span>
+      </div>
+      <div className="space-y-2">
+        {items.map((item, i) => (
+          <div key={i} className="rounded-md border border-border/60 bg-background/50 p-2.5">
+            <p className="text-sm font-medium">{item.headline}</p>
+            <p className="text-xs text-muted-foreground mt-0.5">{item.detail}</p>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
