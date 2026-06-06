@@ -1,12 +1,13 @@
 """Render SEC filing pages to PDF using Playwright headless Chromium.
 
-The primary rendering path (:func:`render_url_to_pdf`) navigates to the
-SEC filing URL with the required User-Agent header so images, stylesheets
-and other resources load natively.  After the page loads, inline XBRL
-``ix:`` tags are stripped via JavaScript to produce a clean print.
-
-A fallback :func:`render_html_to_pdf` is retained for injecting
-pre-processed HTML directly.
+The pipeline preprocesses filings in Python (fetching the HTML via the
+rate-limited httpx client and inlining images as base64) and pushes the
+cleaned HTML into Chromium via :func:`render_html_to_pdf`. Chromium
+itself never talks to SEC — that's intentional, since SEC's anti-bot
+detection blocks browser fingerprints even when the User-Agent string
+is correct. Letting httpx do the SEC fetches with the documented UA is
+what 1700+ historical renders rely on; this module is just the
+rasterizer.
 """
 
 from __future__ import annotations
@@ -33,16 +34,23 @@ PDF_OPTIONS = {
     "print_background": True,
 }
 
-# Maximum time to wait for the page to load and reach networkidle.
-PAGE_TIMEOUT_MS = 120_000  # 2 minutes — some filings are very large.
+# Page load budget. Bumped from 2 min because S-1 / S-1/A filings — and
+# the occasional unusually large 10-K — can take longer than 2 minutes to
+# settle. Combined with wait_until="load" (instead of the previous
+# "networkidle"), this avoids the historical wedge where Chromium stayed
+# parked waiting for background keep-alives to drain.
+PAGE_TIMEOUT_MS = 5 * 60 * 1000  # 5 minutes for the set_content/load step.
+
+# Cap on the page.pdf() rasterization step itself. A 500-page S-1 with
+# dense tables can legitimately take a few minutes to paginate; Playwright
+# Python's default page timeout (30s) is way too short for that.
+PDF_TIMEOUT_MS = 5 * 60 * 1000  # 5 minutes.
 
 # JavaScript to strip ix: XBRL tags in the live DOM while preserving
-# their child content.  This runs after the page has fully loaded so
-# all images and styles are already resolved.
+# their child content. Runs after the page has fully loaded so all
+# images and styles are already resolved.
 STRIP_XBRL_JS = """
 () => {
-    // Collect all elements first, then process.  We iterate with a
-    // TreeWalker to avoid issues with live NodeList mutation.
     const toUnwrap = [];
     const toRemove = [];
     const walker = document.createTreeWalker(
@@ -60,11 +68,9 @@ STRIP_XBRL_JS = """
             }
         }
     }
-    // Remove ix:header blocks entirely (hidden metadata).
     for (const el of toRemove) {
         el.remove();
     }
-    // Unwrap remaining ix:* elements — keep children, remove wrapper.
     for (const el of toUnwrap) {
         const parent = el.parentNode;
         if (!parent) continue;
@@ -105,9 +111,6 @@ async def _get_context() -> BrowserContext:
     if _context is None:
         settings = get_settings()
         browser = await _get_browser()
-        # Log the UA so the next time SEC blocks Chromium (its anti-bot page
-        # has a generic "Reference ID" and gives no hint as to why), the
-        # deploy logs show what header was actually sent.
         logger.info("Creating browser context with User-Agent: %s", settings.sec_user_agent)
         _context = await browser.new_context(
             java_script_enabled=True,
@@ -124,54 +127,15 @@ async def render_html_to_pdf(
 ) -> bytes:
     """Render an HTML string to PDF bytes.
 
-    Prefer :func:`render_url_to_pdf` when a URL is available — it lets
-    Chromium load images and stylesheets from the original domain.
+    The HTML is expected to already be preprocessed (XBRL stripped,
+    URLs absolutized, images inlined as base64 data URIs). Chromium
+    loads it via ``set_content`` and never makes outbound network
+    requests during rendering — every external resource a SEC filing
+    references is already inlined by the time we get here.
 
     Args:
-        html: Cleaned HTML content of the filing.
-        timeout_ms: Maximum wait time for page load in milliseconds.
-
-    Returns:
-        PDF content as bytes.
-    """
-    context = await _get_context()
-    page = await context.new_page()
-    try:
-        # Emulate print media for proper styling.
-        await page.emulate_media(media="print")
-
-        # Load the HTML content.
-        await page.set_content(html, wait_until="networkidle", timeout=timeout_ms)
-
-        # Generate the PDF.
-        pdf_bytes: bytes = await page.pdf(**PDF_OPTIONS)
-        logger.info("PDF rendered successfully (%d bytes)", len(pdf_bytes))
-        return pdf_bytes
-
-    finally:
-        await page.close()
-
-
-async def render_url_to_pdf(
-    url: str,
-    *,
-    strip_xbrl: bool = True,
-    timeout_ms: int = PAGE_TIMEOUT_MS,
-) -> bytes:
-    """Navigate to a URL, optionally strip XBRL, and render to PDF.
-
-    This is the preferred rendering path because Chromium loads all
-    external resources (images, CSS) directly from the origin domain,
-    avoiding broken-image issues that occur with ``set_content()``.
-
-    After the page reaches ``networkidle``, XBRL ``ix:`` tags are
-    removed via in-page JavaScript so they don't pollute the PDF.
-
-    Args:
-        url: URL to navigate to.
-        strip_xbrl: If ``True`` (default), strip ``ix:`` XBRL tags
-            from the live DOM before rendering.
-        timeout_ms: Maximum wait time for page load in milliseconds.
+        html: Cleaned, image-inlined HTML content of the filing.
+        timeout_ms: Maximum wait time for the set_content step.
 
     Returns:
         PDF content as bytes.
@@ -181,104 +145,30 @@ async def render_url_to_pdf(
     try:
         await page.emulate_media(media="print")
 
-        logger.info("Navigating to %s", url)
-        await page.goto(url, wait_until="networkidle", timeout=timeout_ms)
+        # wait_until="load" fires once the document and its initial
+        # subresources finish — that's what we actually want. The previous
+        # "networkidle" required 500ms of zero network activity which
+        # bigger filings, especially image-heavy S-1s, never reliably
+        # reach because of trailing keep-alives and font requests.
+        await page.set_content(html, wait_until="load", timeout=timeout_ms)
 
-        if strip_xbrl:
-            logger.debug("Stripping XBRL tags via JavaScript")
-            await page.evaluate(STRIP_XBRL_JS)
-
-        pdf_bytes: bytes = await page.pdf(**PDF_OPTIONS)
-        logger.info("PDF rendered from URL %s (%d bytes)", url, len(pdf_bytes))
-        return pdf_bytes
-
-    finally:
-        await page.close()
-
-
-# ─── Registration / IPO mode (S-1 / S-1/A) ────────────────────────────
-#
-# Heavy filings get their own render path with three correctness improvements
-# that the normal render functions above intentionally don't have, to keep
-# regular 10-K / 10-Q / 8-K / DEF 14A renders unchanged:
-#
-#   - Browser-issued SEC subresource loads are throttled through the same
-#     10 req/s token bucket sec_get() uses, so a Chromium image-fetch storm
-#     can't earn the IP a 429/403 from SEC.
-#   - page.goto(wait_until="load") instead of "networkidle". S-1s with
-#     hundreds of inline assets never settle to networkidle.
-#   - page.pdf() gets an explicit, generous timeout — rasterizing a
-#     500-page S-1 with dense tables can legitimately take several minutes.
-#
-# Triggered only from fetch_filings.render_filing() when the form type
-# starts with "S-1", so existing flows keep their existing renderer.
-
-from urllib.parse import urlparse
-from src.edgar.rate_limiter import acquire_sec_token
-
-_S1_PAGE_TIMEOUT_MS = 5 * 60 * 1000   # 5 min for goto on big S-1s
-_S1_PDF_TIMEOUT_MS = 5 * 60 * 1000    # 5 min for page.pdf rasterization
-_SEC_HOST_SUFFIXES = ("sec.gov",)
-
-
-def _is_sec_host(url: str) -> bool:
-    try:
-        host = (urlparse(url).hostname or "").lower()
-    except Exception:
-        return False
-    return any(host == s or host.endswith("." + s) for s in _SEC_HOST_SUFFIXES)
-
-
-async def _throttle_sec_requests(route, request) -> None:
-    """Playwright route handler — gates SEC-host requests through the shared
-    token bucket so the browser respects the same 10 req/s rule that
-    sec_get() does. Non-SEC hosts continue immediately."""
-    if _is_sec_host(request.url):
-        await acquire_sec_token()
-    try:
-        await route.continue_()
-    except Exception:
-        # Page may have closed mid-route — swallow so we don't raise on an
-        # already-completed render.
-        pass
-
-
-async def render_s1_url_to_pdf(url: str) -> bytes:
-    """Render an S-1 / S-1/A directly from the SEC URL.
-
-    Bypasses preprocess_filing entirely — Chromium fetches images and CSS
-    in parallel from the SEC origin (with subresource rate-limiting) rather
-    than us downloading each one over httpx and base64-inlining it into the
-    HTML. That keeps the document Chromium has to lay out from ballooning
-    into tens of MB on image-heavy registration statements.
-    """
-    context = await _get_context()
-    page = await context.new_page()
-    try:
-        await page.route("**/*", _throttle_sec_requests)
-        await page.emulate_media(media="print")
-
-        logger.info("[S-1] Navigating to %s", url)
-        await page.goto(url, wait_until="load", timeout=_S1_PAGE_TIMEOUT_MS)
-        logger.debug("[S-1] Stripping XBRL tags via JavaScript")
-        await page.evaluate(STRIP_XBRL_JS)
-
-        # page.pdf() in this Playwright Python version doesn't accept a
-        # `timeout` keyword (the parameter exists in newer Playwright JS but
-        # not in the installed Python binding). Bound the rasterization step
-        # externally with asyncio.wait_for so a wedged Chromium can't hang
-        # the render indefinitely.
+        # Bound page.pdf() externally with asyncio.wait_for since this
+        # Playwright Python build doesn't accept a `timeout` keyword on
+        # page.pdf(). A wedged Chromium still can't hang the render
+        # indefinitely this way.
         try:
             pdf_bytes: bytes = await asyncio.wait_for(
                 page.pdf(**PDF_OPTIONS),
-                timeout=_S1_PDF_TIMEOUT_MS / 1000,
+                timeout=PDF_TIMEOUT_MS / 1000,
             )
         except asyncio.TimeoutError:
             raise RuntimeError(
-                f"page.pdf() exceeded the {_S1_PDF_TIMEOUT_MS // 1000}s S-1 budget."
+                f"page.pdf() exceeded the {PDF_TIMEOUT_MS // 1000}s budget."
             ) from None
-        logger.info("[S-1] PDF rendered from %s (%d bytes)", url, len(pdf_bytes))
+
+        logger.info("PDF rendered successfully (%d bytes)", len(pdf_bytes))
         return pdf_bytes
+
     finally:
         await page.close()
 
