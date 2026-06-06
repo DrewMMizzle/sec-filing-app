@@ -105,6 +105,10 @@ async def _get_context() -> BrowserContext:
     if _context is None:
         settings = get_settings()
         browser = await _get_browser()
+        # Log the UA so the next time SEC blocks Chromium (its anti-bot page
+        # has a generic "Reference ID" and gives no hint as to why), the
+        # deploy logs show what header was actually sent.
+        logger.info("Creating browser context with User-Agent: %s", settings.sec_user_agent)
         _context = await browser.new_context(
             java_script_enabled=True,
             bypass_csp=True,
