@@ -438,15 +438,28 @@ export class DatabaseStorage {
   // Filings left at status='rendering' by a crashed/killed/stalled fetch never
   // produced a PDF, so they'd otherwise spin forever. Flip them to 'error' so
   // the UI settles and they can be retried via re-fetch. Optionally scope to a
-  // set of tickers (used right after a fetch run).
-  async recoverStaleRenders(tickerList?: string[]): Promise<number> {
+  // set of tickers (used right after a fetch run) or to rows older than N
+  // minutes (used by the periodic sweep so an in-flight render isn't killed).
+  async recoverStaleRenders(opts?: {
+    tickerList?: string[];
+    olderThanMinutes?: number;
+  }): Promise<number> {
+    const tickerList = opts?.tickerList;
+    const olderThanMinutes = opts?.olderThanMinutes;
     const conditions: any[] = [eq(filings.status, "rendering")];
     if (tickerList && tickerList.length > 0) conditions.push(inArray(filings.ticker, tickerList));
+    if (olderThanMinutes !== undefined && olderThanMinutes > 0) {
+      const cutoff = new Date(Date.now() - olderThanMinutes * 60 * 1000).toISOString();
+      conditions.push(lte(filings.createdAt, cutoff));
+    }
     const rows = await db
       .update(filings)
       .set({
         status: "error",
-        errorMessage: "Render interrupted before completion — re-fetch to retry.",
+        errorMessage:
+          olderThanMinutes !== undefined
+            ? `Render stuck >${olderThanMinutes} min — pipeline likely died. Re-fetch to retry.`
+            : "Render interrupted before completion — re-fetch to retry.",
       })
       .where(and(...conditions))
       .returning({ id: filings.id });
