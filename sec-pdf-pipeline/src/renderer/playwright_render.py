@@ -129,9 +129,10 @@ async def render_html_to_pdf(
 
     The HTML is expected to already be preprocessed (XBRL stripped,
     URLs absolutized, images inlined as base64 data URIs). Chromium
-    loads it via ``set_content`` and never makes outbound network
-    requests during rendering — every external resource a SEC filing
-    references is already inlined by the time we get here.
+    loads it via ``set_content`` and is locked down so it makes no
+    outbound network requests during rendering — every external
+    resource the SEC filing references is either already inlined or
+    deliberately aborted at the route layer.
 
     Args:
         html: Cleaned, image-inlined HTML content of the filing.
@@ -143,14 +144,34 @@ async def render_html_to_pdf(
     context = await _get_context()
     page = await context.new_page()
     try:
+        # Block every outbound request except data: URIs. The preprocess
+        # step has already inlined images as base64; anything else the
+        # filing still references — external stylesheets, fonts, scripts —
+        # would otherwise be fetched by Chromium from sec.gov and trigger
+        # SEC's anti-bot block (same block the URL-render path hit), which
+        # causes the load event to never fire and set_content to time out.
+        async def _abort_external(route, request):
+            try:
+                if request.url.startswith("data:"):
+                    await route.continue_()
+                else:
+                    await route.abort()
+            except Exception:
+                # Page may have closed mid-route — swallow so we don't
+                # propagate routing errors out of an unrelated request.
+                pass
+
+        await page.route("**/*", _abort_external)
         await page.emulate_media(media="print")
 
-        # wait_until="load" fires once the document and its initial
-        # subresources finish — that's what we actually want. The previous
-        # "networkidle" required 500ms of zero network activity which
-        # bigger filings, especially image-heavy S-1s, never reliably
-        # reach because of trailing keep-alives and font requests.
-        await page.set_content(html, wait_until="load", timeout=timeout_ms)
+        # wait_until="domcontentloaded" fires once the HTML is fully
+        # parsed. That's the right primitive for preprocessed HTML: we
+        # have no external resources to wait on (they're either inlined
+        # or aborted above). "load" used to be the default here, but it
+        # waits for every subresource — including the SEC stylesheet /
+        # font / script references we've now aborted, which means it
+        # would never fire and we'd hit the page timeout.
+        await page.set_content(html, wait_until="domcontentloaded", timeout=timeout_ms)
 
         # Bound page.pdf() externally with asyncio.wait_for since this
         # Playwright Python build doesn't accept a `timeout` keyword on
