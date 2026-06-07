@@ -46,6 +46,15 @@ PAGE_TIMEOUT_MS = 5 * 60 * 1000  # 5 minutes for the set_content/load step.
 # Python's default page timeout (30s) is way too short for that.
 PDF_TIMEOUT_MS = 5 * 60 * 1000  # 5 minutes.
 
+# Hard wall-clock cap on the whole render. Sits outside the per-step
+# timeouts to catch wedges in the unbounded Playwright calls
+# (new_page / route / emulate_media / close): if Chromium hangs there,
+# the per-step timeouts inside set_content / page.pdf never get a chance
+# to fire and the worker silently sits until Railway kills the container.
+# The outer wait_for converts that into a regular exception the retry
+# loop can record.
+RENDER_WALL_CLOCK_TIMEOUT_S = 12 * 60  # 12 minutes.
+
 # JavaScript to strip ix: XBRL tags in the live DOM while preserving
 # their child content. Runs after the page has fully loaded so all
 # images and styles are already resolved.
@@ -134,6 +143,11 @@ async def render_html_to_pdf(
     resource the SEC filing references is either already inlined or
     deliberately aborted at the route layer.
 
+    The whole render is bounded by ``RENDER_WALL_CLOCK_TIMEOUT_S`` so a
+    wedged Chromium can't hang the worker indefinitely; if the budget
+    expires the cached browser is torn down so the next retry starts
+    with a fresh Chromium instance.
+
     Args:
         html: Cleaned, image-inlined HTML content of the filing.
         timeout_ms: Maximum wait time for the set_content step.
@@ -141,6 +155,28 @@ async def render_html_to_pdf(
     Returns:
         PDF content as bytes.
     """
+    try:
+        return await asyncio.wait_for(
+            _render_html_to_pdf_inner(html, timeout_ms=timeout_ms),
+            timeout=RENDER_WALL_CLOCK_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        # Chromium is wedged somewhere we can't bound from inside —
+        # drop the singleton so the next attempt rebuilds it.
+        try:
+            await close_browser()
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"render_html_to_pdf exceeded the {RENDER_WALL_CLOCK_TIMEOUT_S}s wall-clock budget."
+        ) from None
+
+
+async def _render_html_to_pdf_inner(
+    html: str,
+    *,
+    timeout_ms: int,
+) -> bytes:
     context = await _get_context()
     page = await context.new_page()
     try:
