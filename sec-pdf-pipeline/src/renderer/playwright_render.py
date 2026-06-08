@@ -1,12 +1,18 @@
 """Render SEC filing pages to PDF using Playwright headless Chromium.
 
 The pipeline preprocesses filings in Python (fetching the HTML via the
-rate-limited httpx client and inlining images as base64) and pushes the
-cleaned HTML into Chromium via :func:`render_html_to_pdf`. Chromium
-itself never talks to SEC — that's intentional, since SEC's anti-bot
-detection blocks browser fingerprints even when the User-Agent string
-is correct. Letting httpx do the SEC fetches with the documented UA is
-what 1700+ historical renders rely on; this module is just the
+rate-limited httpx client and inlining images as base64) and hands the
+cleaned HTML to Chromium via :func:`render_html_to_pdf`. The HTML is
+written to a temporary local ``.html`` file and loaded with
+``page.goto(file:// URI)`` rather than ``page.set_content``: large S-1 /
+S-1/A bodies wedged the Playwright IPC when pushed over set_content,
+and routing through a real file URL also gives Chromium a sane base
+URL for any stray relative references.
+
+Chromium itself never talks to SEC — that's intentional, since SEC's
+anti-bot detection blocks browser fingerprints even when the User-Agent
+string is correct. Letting httpx do the SEC fetches with the documented
+UA is what 1700+ historical renders rely on; this module is just the
 rasterizer.
 """
 
@@ -14,6 +20,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import tempfile
+from pathlib import Path
 from typing import Optional
 
 from playwright.async_api import async_playwright, Browser, BrowserContext
@@ -39,7 +47,7 @@ PDF_OPTIONS = {
 # settle. Combined with wait_until="load" (instead of the previous
 # "networkidle"), this avoids the historical wedge where Chromium stayed
 # parked waiting for background keep-alives to drain.
-PAGE_TIMEOUT_MS = 5 * 60 * 1000  # 5 minutes for the set_content/load step.
+PAGE_TIMEOUT_MS = 5 * 60 * 1000  # 5 minutes for the page.goto load step.
 
 # Cap on the page.pdf() rasterization step itself. A 500-page S-1 with
 # dense tables can legitimately take a few minutes to paginate; Playwright
@@ -137,11 +145,12 @@ async def render_html_to_pdf(
     """Render an HTML string to PDF bytes.
 
     The HTML is expected to already be preprocessed (XBRL stripped,
-    URLs absolutized, images inlined as base64 data URIs). Chromium
-    loads it via ``set_content`` and is locked down so it makes no
-    outbound network requests during rendering — every external
-    resource the SEC filing references is either already inlined or
-    deliberately aborted at the route layer.
+    URLs absolutized, images inlined as base64 data URIs). It is
+    written to a temporary local ``.html`` file and loaded into
+    Chromium via ``page.goto(file://...)``; outbound network requests
+    are restricted to local/data/document URLs at the route layer, so
+    Chromium never reaches sec.gov even if the document still references
+    something there.
 
     The whole render is bounded by ``RENDER_WALL_CLOCK_TIMEOUT_S`` so a
     wedged Chromium can't hang the worker indefinitely; if the budget
@@ -150,7 +159,7 @@ async def render_html_to_pdf(
 
     Args:
         html: Cleaned, image-inlined HTML content of the filing.
-        timeout_ms: Maximum wait time for the set_content step.
+        timeout_ms: Maximum wait time for the page.goto load step.
 
     Returns:
         PDF content as bytes.
@@ -177,57 +186,94 @@ async def _render_html_to_pdf_inner(
     *,
     timeout_ms: int,
 ) -> bytes:
-    context = await _get_context()
-    page = await context.new_page()
+    # Write the preprocessed HTML to a temp file and let Chromium load
+    # it via page.goto(file://...). set_content used to be the input
+    # path here, but the Playwright IPC choked on S-1 / S-1/A bodies
+    # (≥10 MB once images are inlined as base64), wedging before the
+    # set_content timeout could fire. A real file URL also gives the
+    # document a sane base URL for any stray relative references.
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".html", delete=False, encoding="utf-8"
+    )
     try:
-        # Block every outbound request except data: URIs. The preprocess
-        # step has already inlined images as base64; anything else the
-        # filing still references — external stylesheets, fonts, scripts —
-        # would otherwise be fetched by Chromium from sec.gov and trigger
-        # SEC's anti-bot block (same block the URL-render path hit), which
-        # causes the load event to never fire and set_content to time out.
-        async def _abort_external(route, request):
-            try:
-                if request.url.startswith("data:"):
-                    await route.continue_()
-                else:
-                    await route.abort()
-            except Exception:
-                # Page may have closed mid-route — swallow so we don't
-                # propagate routing errors out of an unrelated request.
-                pass
+        tmp.write(html)
+        tmp.close()
+        tmp_path = Path(tmp.name)
 
-        await page.route("**/*", _abort_external)
-        await page.emulate_media(media="print")
-
-        # wait_until="domcontentloaded" fires once the HTML is fully
-        # parsed. That's the right primitive for preprocessed HTML: we
-        # have no external resources to wait on (they're either inlined
-        # or aborted above). "load" used to be the default here, but it
-        # waits for every subresource — including the SEC stylesheet /
-        # font / script references we've now aborted, which means it
-        # would never fire and we'd hit the page timeout.
-        await page.set_content(html, wait_until="domcontentloaded", timeout=timeout_ms)
-
-        # Bound page.pdf() externally with asyncio.wait_for since this
-        # Playwright Python build doesn't accept a `timeout` keyword on
-        # page.pdf(). A wedged Chromium still can't hang the render
-        # indefinitely this way.
+        context = await _get_context()
+        page = await context.new_page()
         try:
-            pdf_bytes: bytes = await asyncio.wait_for(
-                page.pdf(**PDF_OPTIONS),
-                timeout=PDF_TIMEOUT_MS / 1000,
+            # Lock Chromium down to local/document URLs only. The preprocess
+            # step has already inlined images as base64; anything still
+            # referenced externally — SEC stylesheets, fonts, scripts —
+            # would otherwise be fetched by Chromium and trip SEC's
+            # anti-bot block (the same block the old URL-render path hit),
+            # which prevents the load event from ever firing.
+            #
+            # file:  → the temp HTML itself + any relative paths it tries
+            # data:  → already-inlined images and any other base64 payloads
+            # about: → about:blank and friends Chromium uses internally
+            async def _abort_external(route, request):
+                try:
+                    url = request.url
+                    if (
+                        url.startswith("file:")
+                        or url.startswith("data:")
+                        or url.startswith("about:")
+                    ):
+                        await route.continue_()
+                    else:
+                        await route.abort()
+                except Exception:
+                    # Page may have closed mid-route — swallow so we don't
+                    # propagate routing errors out of an unrelated request.
+                    pass
+
+            await page.route("**/*", _abort_external)
+            await page.emulate_media(media="print")
+
+            # wait_until="domcontentloaded" fires once the HTML is fully
+            # parsed. That's the right primitive for our preprocessed
+            # input: every external resource is either inlined or
+            # aborted above, so waiting for "load" would just stall.
+            await page.goto(
+                tmp_path.as_uri(),
+                wait_until="domcontentloaded",
+                timeout=timeout_ms,
             )
-        except asyncio.TimeoutError:
-            raise RuntimeError(
-                f"page.pdf() exceeded the {PDF_TIMEOUT_MS // 1000}s budget."
-            ) from None
 
-        logger.info("PDF rendered successfully (%d bytes)", len(pdf_bytes))
-        return pdf_bytes
+            # Bound page.pdf() externally with asyncio.wait_for since this
+            # Playwright Python build doesn't accept a `timeout` keyword on
+            # page.pdf(). A wedged Chromium still can't hang the render
+            # indefinitely this way.
+            try:
+                pdf_bytes: bytes = await asyncio.wait_for(
+                    page.pdf(**PDF_OPTIONS),
+                    timeout=PDF_TIMEOUT_MS / 1000,
+                )
+            except asyncio.TimeoutError:
+                raise RuntimeError(
+                    f"page.pdf() exceeded the {PDF_TIMEOUT_MS // 1000}s budget."
+                ) from None
 
+            logger.info("PDF rendered successfully (%d bytes)", len(pdf_bytes))
+            return pdf_bytes
+
+        finally:
+            # page.close() is normally instant, but a wedged Chromium can
+            # hang it forever. Bound it so a sick browser can't keep the
+            # render coroutine alive past its outer wall-clock budget.
+            try:
+                await asyncio.wait_for(page.close(), timeout=10)
+            except asyncio.TimeoutError:
+                logger.warning("page.close() exceeded 10s budget; abandoning page.")
+            except Exception as exc:
+                logger.warning("page.close() failed: %s", exc)
     finally:
-        await page.close()
+        try:
+            Path(tmp.name).unlink(missing_ok=True)
+        except Exception as exc:
+            logger.warning("Failed to remove temp HTML %s: %s", tmp.name, exc)
 
 
 async def close_browser() -> None:
