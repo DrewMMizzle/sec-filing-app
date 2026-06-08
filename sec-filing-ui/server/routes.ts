@@ -138,6 +138,11 @@ function runFetchPipeline(
 
     const events: any[] = [];
     const completedAccessions: string[] = [];
+    // Each "complete" event spawns an async copy + DB-update task. We keep
+    // refs so the close handler can await every outstanding persistence
+    // task before resolving — otherwise a fast filing's copy could still
+    // be in flight when the route claims success.
+    const persistenceTasks: Promise<void>[] = [];
     let stderrOutput = "";
     let settled = false;
 
@@ -186,28 +191,50 @@ function runFetchPipeline(
           } else if (event.event === "complete") {
             const pipelinePdf = path.join(PIPELINE_ROOT, event.path);
             const ticker = event.ticker || "UNKNOWN";
-            const safeType = (event.filing_type || "filing").replace(/ /g, "_");
+            // Collapse whitespace and "/" so forms like "S-1/A" become
+            // "S-1_A" instead of an awkward nested subdirectory or filename.
+            const safeType = (event.filing_type || "filing").replace(/[\s/]+/g, "_");
             const destDir = path.join(PDF_STORAGE_DIR, ticker, safeType);
             const destFile = path.join(destDir, `${event.accession}.pdf`);
             const appRelPath = path.relative(path.resolve(PDF_STORAGE_DIR, ".."), destFile);
-            completedAccessions.push(event.accession);
             // Async fs + DB so a 10-K-sized copy doesn't stall the event loop
-            // and starve other API requests / event handling. Order within the
-            // chain is preserved (mkdir → copy → DB update → queue review).
-            (async () => {
+            // and starve other API requests / event handling. We track the
+            // task in persistenceTasks so the close handler can await all
+            // outstanding copies/DB updates before resolving — without this
+            // a fast filing's persistence work could still be in flight when
+            // the route claims success. accession is only pushed into
+            // completedAccessions after the copy + DB update both succeed.
+            const accession: string = event.accession;
+            const size: number | undefined = event.size;
+            const task = (async () => {
               try {
                 await fs.promises.mkdir(destDir, { recursive: true });
                 await fs.promises.copyFile(pipelinePdf, destFile);
               } catch (copyErr) {
                 console.error(`Failed to copy PDF to app storage: ${copyErr}`);
+                try {
+                  await storage.updateFilingStatus(
+                    accession,
+                    "error",
+                    undefined,
+                    undefined,
+                    `Failed to copy rendered PDF into app storage: ${
+                      copyErr instanceof Error ? copyErr.message : String(copyErr)
+                    }`,
+                  );
+                } catch (err) {
+                  console.error("Failed to record copy failure:", err);
+                }
+                return;
               }
               try {
                 await storage.updateFilingStatus(
-                  event.accession,
+                  accession,
                   "complete",
                   appRelPath,
-                  event.size,
+                  size,
                 );
+                completedAccessions.push(accession);
                 if (isReviewEnabled() && !ctx.skipAutoReview) {
                   // Queue the review as soon as the PDF is rendered (and nudge
                   // the processor) so spend and review progress move during
@@ -215,7 +242,7 @@ function runFetchPipeline(
                   // Registration / IPO mode passes skipAutoReview=true so
                   // heavy S-1/S-1/A renders never auto-burn review budget —
                   // the user can opt in per-filing afterward.
-                  await storage.markFilingForReview(event.accession);
+                  await storage.markFilingForReview(accession);
                   kickReviewProcessor().catch((err) =>
                     console.error("Review processor failed:", err),
                   );
@@ -224,6 +251,7 @@ function runFetchPipeline(
                 console.error("Failed to update filing status:", err);
               }
             })();
+            persistenceTasks.push(task);
           } else if (event.event === "error" && event.accession) {
             storage
               .updateFilingStatus(event.accession, "error", undefined, undefined, event.message)
@@ -247,11 +275,17 @@ function runFetchPipeline(
       stderrOutput += text;
     });
 
-    child.on("close", (code) => {
+    child.on("close", async (code) => {
       if (currentFetchChild === child) currentFetchChild = null;
       if (settled) return;
       settled = true;
       clearInterval(watchdog);
+      // Wait for every copy/DB-update kicked off by stdout to finish
+      // (or fail) before we report success/failure. Otherwise the
+      // response could fire before the PDF is actually in app storage
+      // and the filing row is marked complete — exactly the race the
+      // user hit.
+      await Promise.allSettled(persistenceTasks);
       const doneEvent = events.find((e) => e.event === "done");
       if (stalled) {
         resolve({
@@ -1357,7 +1391,7 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
       return res.status(404).json({ error: "PDF file missing from disk" });
     }
 
-    const filename = `${filing.ticker}_${filing.filingType.replace(/ /g, "_")}_${filing.filingDate || filing.accessionNumber}.pdf`;
+    const filename = `${filing.ticker}_${filing.filingType.replace(/[\s/]+/g, "_")}_${filing.filingDate || filing.accessionNumber}.pdf`;
     // `?inline=1` tells the browser to display the PDF in-place (used by chat
     // citation links that open in a new tab). Default stays `attachment` so
     // the PDF Library's Download button still triggers a save.
@@ -1435,7 +1469,7 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
       return res.status(404).json({ error: "PDF file missing from disk" });
     }
 
-    const filename = `${filing.ticker}_${filing.filingType.replace(/ /g, "_")}_${filing.filingDate || filing.accessionNumber}.pdf`;
+    const filename = `${filing.ticker}_${filing.filingType.replace(/[\s/]+/g, "_")}_${filing.filingDate || filing.accessionNumber}.pdf`;
     res.setHeader("Content-Disposition", `inline; filename="${filename}"`);
     res.setHeader("Content-Type", "application/pdf");
     res.sendFile(fullPath);

@@ -189,7 +189,9 @@ async def render_filing(filing_info: dict) -> dict:
         except asyncio.CancelledError:
             pass
 
-    safe_type = filing_type.replace(" ", "_")
+    # Replace both spaces and "/" so forms like "S-1/A" become "S-1_A" instead
+    # of spawning a nested "S-1/A/" subdirectory.
+    safe_type = filing_type.replace(" ", "_").replace("/", "_")
     out_dir = OUTPUT_DIR / "filings" / ticker / safe_type
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{accession}.pdf"
