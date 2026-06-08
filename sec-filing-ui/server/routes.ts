@@ -107,7 +107,20 @@ type PipelineResult = {
 // fetch and re-render-missing endpoints.
 function runFetchPipeline(
   input: string,
-  ctx: { userId: number; cikByTicker: Map<string, string>; skipAutoReview?: boolean },
+  ctx: {
+    userId: number;
+    cikByTicker: Map<string, string>;
+    skipAutoReview?: boolean;
+    // When true, a pipeline run that finishes with errors but rendered no
+    // PDFs is treated as a failure (so the underlying render error surfaces
+    // to the caller). Used by the registration render endpoint where a
+    // user-initiated single-filing render has no useful "partial success"
+    // story. Default false preserves the existing main-fetch behavior of
+    // returning success: true with totalErrors counted, so a normal Quick
+    // Fetch where every filing errored still reports gracefully instead of
+    // 500-ing.
+    treatPartialAsFailure?: boolean;
+  },
 ): Promise<PipelineResult> {
   return new Promise((resolve) => {
     const pythonScript = path.join(PIPELINE_ROOT, "scripts", "fetch_filings.py");
@@ -248,7 +261,27 @@ function runFetchPipeline(
           error: `Pipeline stalled (no output for ${IDLE_TIMEOUT_MS / 60000} min) and was stopped after rendering ${completedAccessions.length} filing(s). Run it again to resume.`,
         });
       } else if (code === 0 && doneEvent) {
-        resolve({ success: true, events, completedAccessions, doneEvent });
+        const totalErrors = Number(doneEvent.total_errors ?? 0);
+        if (
+          ctx.treatPartialAsFailure &&
+          totalErrors > 0 &&
+          completedAccessions.length === 0
+        ) {
+          const lastError = [...events]
+            .reverse()
+            .find((e) => e?.event === "error" && typeof e?.message === "string");
+          resolve({
+            success: false,
+            events,
+            completedAccessions,
+            doneEvent,
+            error:
+              lastError?.message ||
+              `Pipeline finished with ${totalErrors} render error(s) and no completed PDFs.`,
+          });
+        } else {
+          resolve({ success: true, events, completedAccessions, doneEvent });
+        }
       } else {
         resolve({ success: false, events, completedAccessions, error: stderrOutput || "Pipeline process failed" });
       }
@@ -1583,6 +1616,9 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
         userId,
         cikByTicker,
         skipAutoReview: true,
+        // Single-filing user-initiated render — no useful "partial success"
+        // story. Surface the underlying render error rather than 200/empty.
+        treatPartialAsFailure: true,
       });
       if (!result.success) {
         return res.status(500).json({ error: result.error || "Render failed", events: result.events });
