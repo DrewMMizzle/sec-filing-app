@@ -121,6 +121,26 @@ const MIGRATIONS: Migration[] = [
       CREATE INDEX IF NOT EXISTS idx_filings_mdna_status ON filings(mdna_status);
     `,
   },
+  {
+    version: 3,
+    name: "filing_compares_cache",
+    sql: `
+      CREATE TABLE IF NOT EXISTS filing_compares (
+        id SERIAL PRIMARY KEY,
+        accession_low TEXT NOT NULL,
+        accession_high TEXT NOT NULL,
+        section TEXT NOT NULL,
+        result TEXT NOT NULL,
+        cost_cents INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_filing_compare_unique
+        ON filing_compares(accession_low, accession_high, section);
+      CREATE INDEX IF NOT EXISTS idx_filing_compare_low ON filing_compares(accession_low);
+      CREATE INDEX IF NOT EXISTS idx_filing_compare_high ON filing_compares(accession_high);
+    `,
+  },
 ];
 
 export async function runMigrations(pool: Pool): Promise<{ applied: number[] }> {

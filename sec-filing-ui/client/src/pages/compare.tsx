@@ -69,6 +69,10 @@ type CompareResult = {
   changelog: Changelog | null;
   costUsd: number;
   note?: string;
+  // Server flags when the result came from the compare cache (no Claude
+  // call, no spend) and when the cached row was originally written.
+  cached?: boolean;
+  cachedAt?: string;
 };
 
 const SECTIONS = [
@@ -159,7 +163,7 @@ export default function Compare() {
     onError: (err: Error) => toast({ title: "Error", description: err.message, variant: "destructive" }),
   });
 
-  const runCompare = async () => {
+  const runCompare = async (opts: { refresh?: boolean } = {}) => {
     if (!accA || !accB || accA === accB) return;
     setRunning(true);
     setResults([]);
@@ -171,6 +175,9 @@ export default function Compare() {
           accessionA: accA,
           accessionB: accB,
           section: sec,
+          // refresh: true forces the server to bypass its compare cache
+          // and re-call Claude (and re-spend) for this pair + section.
+          refresh: !!opts.refresh,
         });
         if (!res.ok) {
           const body = await res.json();
@@ -351,7 +358,7 @@ export default function Compare() {
 
                 {/* Compare action */}
                 <div className="pl-9 space-y-2">
-                  <Button onClick={runCompare} disabled={!canCompare} data-testid="button-compare">
+                  <Button onClick={() => runCompare()} disabled={!canCompare} data-testid="button-compare">
                     {running ? (
                       <>
                         <Loader2 className="w-4 h-4 mr-2 animate-spin" />
@@ -389,6 +396,21 @@ export default function Compare() {
           {totalCost > 0 && (
             <p className="text-xs text-muted-foreground">Comparison cost so far: ${totalCost.toFixed(2)}</p>
           )}
+          {results.some((r) => r.cached) && !running && (
+            <div className="flex items-center gap-2 text-xs text-muted-foreground">
+              <span>One or more sections were served from cache (no Claude call, no spend).</span>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 px-2"
+                onClick={() => runCompare({ refresh: true })}
+                disabled={!canCompare}
+                data-testid="button-compare-rerun"
+              >
+                Re-run compare
+              </Button>
+            </div>
+          )}
           {results.map((result) => (
             <div key={result.section} className="space-y-3">
               <div className="flex items-center gap-2 text-sm flex-wrap border-b pb-2">
@@ -400,6 +422,11 @@ export default function Compare() {
                 <Badge variant="outline">
                   {result.later.form} {result.later.date}
                 </Badge>
+                {result.cached && (
+                  <Badge variant="secondary" className="text-[10px]" data-testid="badge-compare-cached">
+                    Cached
+                  </Badge>
+                )}
               </div>
 
               {result.note && (
