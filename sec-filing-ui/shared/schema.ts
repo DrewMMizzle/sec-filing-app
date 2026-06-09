@@ -124,6 +124,36 @@ export const settings = pgTable("settings", {
   value: text("value"),
 });
 
+// ─── Cached compare results ────────────────────────────────
+//
+// Caches the JSON output of /api/compare and /api/registration/compare-pdfs
+// keyed on the (sorted) accession pair + section. Repeat clicks on the
+// same pair return the cached row without re-calling Claude. The cache
+// is invalidated when either accession is queued for re-render.
+
+export const filingCompares = pgTable("filing_compares", {
+  id: serial("id").primaryKey(),
+  // Sorted so the pair is order-insensitive: accessionLow <= accessionHigh.
+  accessionLow: text("accession_low").notNull(),
+  accessionHigh: text("accession_high").notNull(),
+  // Section key for /api/compare ("risk_factors" | "mdna" | "legal") or
+  // the sentinel "__whole__" for whole-filing registration compares.
+  section: text("section").notNull(),
+  // Full JSON result body returned by the compare endpoint — stored
+  // verbatim so the cached path returns exactly what the live path would.
+  result: text("result").notNull(),
+  // Stored as cents (integer) to avoid float drift across reads.
+  costCents: integer("cost_cents").notNull().default(0),
+  createdAt: text("created_at").notNull(),
+  userId: integer("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+}, (table) => [
+  uniqueIndex("idx_filing_compare_unique").on(
+    table.accessionLow, table.accessionHigh, table.section,
+  ),
+  index("idx_filing_compare_low").on(table.accessionLow),
+  index("idx_filing_compare_high").on(table.accessionHigh),
+]);
+
 // ─── Insert schemas ────────────────────────────────────────
 
 export const insertUserSchema = createInsertSchema(users).omit({ id: true });
@@ -149,3 +179,4 @@ export type InsertWatchlistShare = z.infer<typeof insertWatchlistShareSchema>;
 export type FindingAction = typeof findingActions.$inferSelect;
 export type InsertFindingAction = z.infer<typeof insertFindingActionSchema>;
 export type Setting = typeof settings.$inferSelect;
+export type FilingCompare = typeof filingCompares.$inferSelect;
