@@ -19,6 +19,7 @@ import {
   watchlistShares,
   findingActions,
   settings,
+  filingCompares,
 } from "@shared/schema";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
@@ -817,6 +818,111 @@ export class DatabaseStorage {
       cik: e.cik,
       filingTypes: Array.from(e.filingTypes),
     }));
+  }
+
+  // ─── Compare cache ────────────────────────────────────────
+  //
+  // The cache is keyed on (sorted accession pair, section). Section is
+  // either a SectionKey for /api/compare or the sentinel "__whole__" for
+  // whole-filing registration compares. Sorting normalizes (A,B) and
+  // (B,A) to the same key so the user doesn't pay twice just because
+  // the click order differed.
+
+  async getCachedCompare(
+    accessionA: string,
+    accessionB: string,
+    section: string,
+  ): Promise<{ result: any; createdAt: string; costUsd: number } | null> {
+    const [low, high] = accessionA <= accessionB ? [accessionA, accessionB] : [accessionB, accessionA];
+    const rows = await db
+      .select()
+      .from(filingCompares)
+      .where(
+        and(
+          eq(filingCompares.accessionLow, low),
+          eq(filingCompares.accessionHigh, high),
+          eq(filingCompares.section, section),
+        ),
+      )
+      .limit(1);
+    if (rows.length === 0) return null;
+    const row = rows[0];
+    try {
+      return {
+        result: JSON.parse(row.result),
+        createdAt: row.createdAt,
+        costUsd: row.costCents / 100,
+      };
+    } catch (err) {
+      console.error(`Cached compare row ${row.id} has invalid JSON; ignoring:`, err);
+      return null;
+    }
+  }
+
+  async saveCachedCompare(opts: {
+    accessionA: string;
+    accessionB: string;
+    section: string;
+    result: any;
+    costUsd: number;
+    userId: number;
+  }): Promise<void> {
+    const [low, high] =
+      opts.accessionA <= opts.accessionB
+        ? [opts.accessionA, opts.accessionB]
+        : [opts.accessionB, opts.accessionA];
+    const costCents = Math.max(0, Math.round(opts.costUsd * 100));
+    try {
+      await db
+        .insert(filingCompares)
+        .values({
+          accessionLow: low,
+          accessionHigh: high,
+          section: opts.section,
+          result: JSON.stringify(opts.result),
+          costCents,
+          createdAt: new Date().toISOString(),
+          userId: opts.userId,
+        })
+        .onConflictDoUpdate({
+          target: [
+            filingCompares.accessionLow,
+            filingCompares.accessionHigh,
+            filingCompares.section,
+          ],
+          set: {
+            result: JSON.stringify(opts.result),
+            costCents,
+            createdAt: new Date().toISOString(),
+            userId: opts.userId,
+          },
+        });
+    } catch (err) {
+      // Best-effort cache write — never let a cache failure break the
+      // request the user is waiting on.
+      console.error("Failed to save compare cache:", err);
+    }
+  }
+
+  // Drop any cached compares referencing this accession on either side.
+  // Called when a filing is queued for re-render, since the underlying
+  // PDF text may differ and the cached changelog would be stale.
+  async invalidateComparesForAccession(accession: string): Promise<void> {
+    try {
+      await db
+        .delete(filingCompares)
+        .where(
+          or(
+            eq(filingCompares.accessionLow, accession),
+            eq(filingCompares.accessionHigh, accession),
+          ),
+        );
+    } catch (err) {
+      console.error(
+        `Failed to invalidate compares for ${accession}:`,
+        err,
+      );
+    }
   }
 }
 

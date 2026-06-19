@@ -188,6 +188,15 @@ function runFetchPipeline(
                 userId: ctx.userId,
               })
               .catch((err) => console.error("Failed to upsert filing:", err));
+            // Re-render means the underlying PDF text may differ from
+            // whatever a cached compare was based on. Drop any stale
+            // cached compares for this accession so the next compare
+            // re-runs against the freshly-rendered text.
+            storage
+              .invalidateComparesForAccession(event.accession)
+              .catch((err) =>
+                console.error("Failed to invalidate compare cache:", err),
+              );
           } else if (event.event === "complete") {
             const pipelinePdf = path.join(PIPELINE_ROOT, event.path);
             const ticker = event.ticker || "UNKNOWN";
@@ -1089,10 +1098,11 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
         .status(409)
         .json({ error: "Claude review is not configured (ANTHROPIC_API_KEY is not set)." });
     }
-    const { accessionA, accessionB, section } = req.body as {
+    const { accessionA, accessionB, section, refresh } = req.body as {
       accessionA?: string;
       accessionB?: string;
       section?: string;
+      refresh?: boolean;
     };
     if (!accessionA || !accessionB) {
       return res.status(400).json({ error: "accessionA and accessionB are required" });
@@ -1106,9 +1116,26 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     const fa = await storage.getFilingByAccession(accessionA);
     const fb = await storage.getFilingByAccession(accessionB);
     if (!fa || !fb) return res.status(404).json({ error: "Filing not found" });
+
+    // Cache hit short-circuits the Claude call entirely. The client can
+    // pass refresh: true to force a re-run (e.g. "Re-run compare" button).
+    if (!refresh) {
+      const cached = await storage.getCachedCompare(accessionA, accessionB, section);
+      if (cached) {
+        return res.json({ ...cached.result, cached: true, cachedAt: cached.createdAt });
+      }
+    }
     try {
       const result = await compareFilings(fa, fb, section as SectionKey);
-      res.json(result);
+      await storage.saveCachedCompare({
+        accessionA,
+        accessionB,
+        section,
+        result,
+        costUsd: result.costUsd ?? 0,
+        userId: req.user!.id,
+      });
+      res.json({ ...result, cached: false });
     } catch (e: any) {
       console.error("Comparison failed:", e?.message || e);
       res.status(500).json({ error: e?.message || "Comparison failed" });
@@ -1681,9 +1708,10 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
         .status(409)
         .json({ error: "Claude comparison is not configured (ANTHROPIC_API_KEY is not set)." });
     }
-    const body = req.body as { accessionA?: unknown; accessionB?: unknown };
+    const body = req.body as { accessionA?: unknown; accessionB?: unknown; refresh?: unknown };
     const accessionA = typeof body.accessionA === "string" ? body.accessionA.trim() : "";
     const accessionB = typeof body.accessionB === "string" ? body.accessionB.trim() : "";
+    const refresh = body.refresh === true;
     if (!accessionA || !accessionB) {
       return res.status(400).json({ error: "accessionA and accessionB are required" });
     }
@@ -1705,9 +1733,27 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
         statusB: fb.status,
       });
     }
+
+    // Sentinel section for whole-filing compares; never collides with a
+    // real SectionKey ("risk_factors" / "mdna" / "legal").
+    const cacheSection = "__whole__";
+    if (!refresh) {
+      const cached = await storage.getCachedCompare(accessionA, accessionB, cacheSection);
+      if (cached) {
+        return res.json({ ...cached.result, cached: true, cachedAt: cached.createdAt });
+      }
+    }
     try {
       const result = await compareRegistrationFilingsFromPdfs(fa, fb);
-      res.json(result);
+      await storage.saveCachedCompare({
+        accessionA,
+        accessionB,
+        section: cacheSection,
+        result,
+        costUsd: result.costUsd ?? 0,
+        userId: req.user!.id,
+      });
+      res.json({ ...result, cached: false });
     } catch (e: any) {
       console.error("Registration PDF compare failed:", e?.message || e);
       res.status(500).json({ error: e?.message || "Registration comparison failed" });

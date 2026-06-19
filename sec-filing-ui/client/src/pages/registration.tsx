@@ -63,6 +63,10 @@ type RegistrationCompareResult = {
   costUsd: number;
   sampled: boolean;
   note?: string;
+  // Server flags when the result came from the compare cache (no Claude
+  // call, no spend) and when the cached row was originally written.
+  cached?: boolean;
+  cachedAt?: string;
 };
 
 // Reviewing one S-1 / S-1/A is genuinely expensive (large input, $5/1M
@@ -149,11 +153,18 @@ export default function Registration() {
   // Whole-filing comparison from the rendered PDFs (extractPdfText →
   // front/middle/back sampling → Claude). Requires BOTH selected filings
   // to be rendered first — the button is gated by dbStatus.
-  const compare = useMutation<RegistrationCompareResult, Error, { accessions: [string, string] }>({
-    mutationFn: async ({ accessions }) => {
+  const compare = useMutation<
+    RegistrationCompareResult,
+    Error,
+    { accessions: [string, string]; refresh?: boolean }
+  >({
+    mutationFn: async ({ accessions, refresh }) => {
       const res = await apiRequest("POST", "/api/registration/compare-pdfs", {
         accessionA: accessions[0],
         accessionB: accessions[1],
+        // refresh: true forces the server to bypass its compare cache
+        // and re-call Claude (and re-spend) for this pair.
+        refresh: !!refresh,
       });
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
@@ -164,7 +175,7 @@ export default function Registration() {
     onSuccess: (data) => {
       setCompareResult(data);
       toast({
-        title: "Comparison complete",
+        title: data.cached ? "Comparison loaded from cache" : "Comparison complete",
         description: `${data.earlier.form} ${data.earlier.date} → ${data.later.form} ${data.later.date}`,
       });
     },
@@ -546,12 +557,33 @@ export default function Registration() {
                     </p>
                   )}
 
-                  <p className="text-[11px] text-muted-foreground border-t pt-2">
-                    Claude comparison cost: ${compareResult.costUsd.toFixed(2)}
-                    {" · "}
-                    {compareResult.earlier.chars.toLocaleString()} →{" "}
-                    {compareResult.later.chars.toLocaleString()} chars of PDF text.
-                  </p>
+                  <div className="flex flex-wrap items-center gap-2 border-t pt-2">
+                    <p className="text-[11px] text-muted-foreground">
+                      {compareResult.cached
+                        ? "Loaded from cache — no Claude call, no spend."
+                        : `Claude comparison cost: $${compareResult.costUsd.toFixed(2)}`}
+                      {" · "}
+                      {compareResult.earlier.chars.toLocaleString()} →{" "}
+                      {compareResult.later.chars.toLocaleString()} chars of PDF text.
+                    </p>
+                    {compareResult.cached && selected.size === 2 && (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-7 px-2 ml-auto"
+                        onClick={() =>
+                          compare.mutate({
+                            accessions: Array.from(selected) as [string, string],
+                            refresh: true,
+                          })
+                        }
+                        disabled={compare.isPending}
+                        data-testid="button-registration-compare-rerun"
+                      >
+                        Re-run compare
+                      </Button>
+                    )}
+                  </div>
                 </Card>
               )}
             </>
