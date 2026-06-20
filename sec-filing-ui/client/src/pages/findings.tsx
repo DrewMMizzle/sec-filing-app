@@ -57,6 +57,24 @@ type Row = {
 
 const CATEGORY_KEYS = Object.keys(CATEGORY_LABELS);
 
+// Pull a "?ticker=…" param out of the current URL. The router uses
+// useHashLocation, so the real query string lives inside the hash
+// (e.g. "#/?ticker=ACN"). useSearch() from wouter can't be relied on
+// with the hash adapter, so we parse the hash ourselves. Returns the
+// empty string when there's no param or we're outside a browser.
+function readTickerParam(): string {
+  if (typeof window === "undefined") return "";
+  const hash = window.location.hash || "";
+  const qIdx = hash.indexOf("?");
+  if (qIdx === -1) return "";
+  try {
+    const params = new URLSearchParams(hash.slice(qIdx + 1));
+    return params.get("ticker")?.trim() || "";
+  } catch {
+    return "";
+  }
+}
+
 function downloadCsv(rows: Row[]) {
   const esc = (v: unknown) => `"${String(v ?? "").replace(/"/g, '""')}"`;
   const header = ["Ticker", "Form", "Filed", "Category", "Interest", "Status", "Headline", "Detail", "Why", "Accession"];
@@ -267,8 +285,15 @@ export default function Findings() {
   // qInput drives the input field for instant visual feedback; q is the
   // debounced value the filter pipeline actually reads. Without this, every
   // keystroke re-ran the filter/sort/group chain.
-  const [qInput, setQInput] = useState("");
-  const [q, setQ] = useState("");
+  //
+  // Both seeded from "?ticker=…" on the URL so cross-page "View in Findings"
+  // links from the Fetch & Review page land with the filter already applied
+  // to the originating ticker — otherwise the user would drop onto an
+  // empty-while-loading page and then have to manually search for their
+  // filing in the full list.
+  const initialTicker = readTickerParam();
+  const [qInput, setQInput] = useState(initialTicker);
+  const [q, setQ] = useState(initialTicker);
   useEffect(() => {
     const t = setTimeout(() => setQ(qInput), 200);
     return () => clearTimeout(t);
