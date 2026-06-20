@@ -1101,7 +1101,14 @@ export default function FetchFilings() {
               <span className="text-foreground font-medium">{totalFindings}</span> finding
               {totalFindings !== 1 ? "s" : ""} across {interestingCount} {filingsWord(interestingCount)} in{" "}
               {scopeTickerLabel} ·{" "}
-              <Link href="/" className="text-primary hover:underline">
+              <Link
+                href={
+                  selectedTickerList.length === 1
+                    ? `/?ticker=${encodeURIComponent(selectedTickerList[0])}`
+                    : "/"
+                }
+                className="text-primary hover:underline"
+              >
                 View in Findings
               </Link>
             </p>
@@ -1261,7 +1268,10 @@ export default function FetchFilings() {
                     className="text-xs mt-1.5 text-muted-foreground"
                     data-testid={`review-findings-link-${f.accessionNumber}`}
                   >
-                    <Link href="/" className="text-primary hover:underline">
+                    <Link
+                      href={`/?ticker=${encodeURIComponent(f.ticker)}`}
+                      className="text-primary hover:underline"
+                    >
                       View {findingsCount(f)} finding{findingsCount(f) !== 1 ? "s" : ""} in Findings →
                     </Link>
                   </p>
