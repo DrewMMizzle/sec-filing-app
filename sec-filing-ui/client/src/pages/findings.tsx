@@ -57,19 +57,30 @@ type Row = {
 
 const CATEGORY_KEYS = Object.keys(CATEGORY_LABELS);
 
-// Pull a "?ticker=…" param out of the current URL. The router uses
-// useHashLocation, so the real query string lives inside the hash
-// (e.g. "#/?ticker=ACN"). useSearch() from wouter can't be relied on
-// with the hash adapter, so we parse the hash ourselves. Returns the
-// empty string when there's no param or we're outside a browser.
+// Pull a "?ticker=…" param out of the current URL so cross-page
+// "View in Findings" links land pre-filtered to one ticker.
+//
+// wouter v3's hash-location navigate() splits the query off the target
+// and writes it to the REAL url.search, not into the hash — so a clicked
+// <Link href="/?ticker=BF-B"> lands as "…/?ticker=BF-B#/", with the param
+// in window.location.search. But the same link opened in a new tab (no
+// JS navigation) keeps the query inside the hash ("#/?ticker=BF-B").
+// Check the real search first, then fall back to an in-hash query, so
+// both entry paths work. Returns "" when there's no param.
 function readTickerParam(): string {
   if (typeof window === "undefined") return "";
+  try {
+    const fromSearch = new URLSearchParams(window.location.search).get("ticker");
+    if (fromSearch && fromSearch.trim()) return fromSearch.trim();
+  } catch {
+    // fall through to the hash check
+  }
   const hash = window.location.hash || "";
   const qIdx = hash.indexOf("?");
   if (qIdx === -1) return "";
   try {
-    const params = new URLSearchParams(hash.slice(qIdx + 1));
-    return params.get("ticker")?.trim() || "";
+    const fromHash = new URLSearchParams(hash.slice(qIdx + 1)).get("ticker");
+    return fromHash?.trim() || "";
   } catch {
     return "";
   }
