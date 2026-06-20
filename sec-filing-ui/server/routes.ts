@@ -937,11 +937,26 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
         .status(500)
         .json({ success: false, error: result.error || "Pipeline process failed", events: result.events });
     }
+    // Report what's actually available in app storage, not what Python
+    // rasterized — those diverge when Python's render succeeded but the
+    // Node-side copy into PDF_STORAGE_DIR failed (the per-filing task in
+    // runFetchPipeline marks the filing as `error` in that case and
+    // refuses to push the accession into completedAccessions). Using
+    // result.completedAccessions.length here keeps the UI's "N PDFs
+    // rendered" toast honest. totalErrors absorbs the persistence
+    // failures so the user sees an accurate error count too.
+    // pipelineRendered is exposed separately for observability and to
+    // make the gap discoverable from the API response.
+    const pipelineRendered = Number(result.doneEvent?.total_rendered ?? 0);
+    const persisted = result.completedAccessions.length;
+    const persistenceFailures = Math.max(0, pipelineRendered - persisted);
+    const pipelineErrors = Number(result.doneEvent?.total_errors ?? 0);
     res.json({
       success: true,
-      totalRendered: result.doneEvent?.total_rendered ?? 0,
+      totalRendered: persisted,
       totalSkipped: result.doneEvent?.total_skipped ?? 0,
-      totalErrors: result.doneEvent?.total_errors ?? 0,
+      totalErrors: pipelineErrors + persistenceFailures,
+      pipelineRendered,
       events: result.events,
     });
     // Clear any rows the pipeline left at 'rendering' (e.g. it was stalled and
