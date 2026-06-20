@@ -44,6 +44,7 @@ import {
   MessageSquare,
 } from "lucide-react";
 import { FilingChatDialog } from "@/components/filing-chat-dialog";
+import { DateRangeInput } from "@/components/DateRangeInput";
 import type { Filing, FindingAction } from "@shared/schema";
 import { CATEGORY_LABELS, parseFindings, interestColor, estimateReviewCost, formatCostRange, type ReviewFinding } from "@/lib/findings";
 
@@ -311,6 +312,11 @@ export default function Findings() {
   }, [qInput]);
   const [sortBy, setSortBy] = useState<string>("date");
   const [groupByTicker, setGroupByTicker] = useState(false);
+  // Filing-date lookback. Empty strings = "all dates" so the default
+  // matches the pre-filter behavior — adding the picker shouldn't
+  // hide findings on first load.
+  const [filedFrom, setFiledFrom] = useState("");
+  const [filedTo, setFiledTo] = useState("");
   const [confirmReview, setConfirmReview] = useState(false);
   const [askFiling, setAskFiling] = useState<{
     accession: string;
@@ -400,6 +406,15 @@ export default function Findings() {
         if (triage === "starred" && r.status !== "starred") return false;
         if (triage === "posted" && r.status !== "posted") return false;
         if (triage === "dismissed" && r.status !== "dismissed") return false;
+        // Filing-date lookback. filingDate is stored as YYYY-MM-DD so
+        // string comparison is calendar-correct. A row missing
+        // filingDate (rare; older imports) is excluded only when a
+        // bound is set — otherwise it stays visible.
+        if (filedFrom || filedTo) {
+          const d = r.filing.filingDate || "";
+          if (filedFrom && (!d || d < filedFrom)) return false;
+          if (filedTo && (!d || d > filedTo)) return false;
+        }
         if (tickerExact) {
           if (r.filing.ticker.toLowerCase() !== tickerExact) return false;
         } else if (term) {
@@ -408,7 +423,7 @@ export default function Findings() {
         }
         return true;
       }),
-    [allRows, activeCats, interest, triage, tickerExact, term],
+    [allRows, activeCats, interest, triage, tickerExact, term, filedFrom, filedTo],
   );
 
   // "Newest" on the findings panel = most recently reviewed (not SEC filing
@@ -854,6 +869,14 @@ export default function Findings() {
               <SelectItem value="interest">Interest</SelectItem>
             </SelectContent>
           </Select>
+          <DateRangeInput
+            from={filedFrom}
+            to={filedTo}
+            onChange={(from, to) => {
+              setFiledFrom(from);
+              setFiledTo(to);
+            }}
+          />
           <Button
             variant={groupByTicker ? "default" : "outline"}
             size="sm"
