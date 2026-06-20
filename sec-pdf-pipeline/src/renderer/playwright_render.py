@@ -4,16 +4,17 @@ The pipeline preprocesses filings in Python (fetching the HTML via the
 rate-limited httpx client and inlining images as base64) and hands the
 cleaned HTML to Chromium via :func:`render_html_to_pdf`. The HTML is
 written to a temporary local ``.html`` file and loaded with
-``page.goto(file:// URI)`` rather than ``page.set_content``: large S-1 /
-S-1/A bodies wedged the Playwright IPC when pushed over set_content,
-and routing through a real file URL also gives Chromium a sane base
-URL for any stray relative references.
+``page.goto(file:// URI)`` rather than ``page.set_content``: large
+S-1 / S-1/A bodies wedged the Playwright IPC when pushed over
+set_content.
 
 Chromium itself never talks to SEC — that's intentional, since SEC's
 anti-bot detection blocks browser fingerprints even when the User-Agent
 string is correct. Letting httpx do the SEC fetches with the documented
 UA is what 1700+ historical renders rely on; this module is just the
-rasterizer.
+rasterizer. The route allowlist is pinned to the exact temp HTML URL
+(plus ``data:`` and ``about:``) so a stray ``file://`` reference in
+the SEC HTML can't make Chromium read arbitrary local files.
 """
 
 from __future__ import annotations
@@ -190,8 +191,7 @@ async def _render_html_to_pdf_inner(
     # it via page.goto(file://...). set_content used to be the input
     # path here, but the Playwright IPC choked on S-1 / S-1/A bodies
     # (≥10 MB once images are inlined as base64), wedging before the
-    # set_content timeout could fire. A real file URL also gives the
-    # document a sane base URL for any stray relative references.
+    # set_content timeout could fire.
     tmp = tempfile.NamedTemporaryFile(
         mode="w", suffix=".html", delete=False, encoding="utf-8"
     )
@@ -199,25 +199,37 @@ async def _render_html_to_pdf_inner(
         tmp.write(html)
         tmp.close()
         tmp_path = Path(tmp.name)
+        # Compute the temp file's URI once and bind it into the route
+        # filter so Chromium can ONLY load this exact file: URL. The
+        # preprocessed HTML originated from external SEC content, so a
+        # blanket "allow all file: URLs" rule would let any stray
+        # file://… reference in the document pull arbitrary local
+        # files (config, credentials, the rendered PDF cache) into the
+        # render context. Pinning the allowlist to the one URL we
+        # actually need keeps the local-file render strategy without
+        # broadly permitting local filesystem reads.
+        allowed_file_url = tmp_path.as_uri()
 
         context = await _get_context()
         page = await context.new_page()
         try:
-            # Lock Chromium down to local/document URLs only. The preprocess
-            # step has already inlined images as base64; anything still
-            # referenced externally — SEC stylesheets, fonts, scripts —
-            # would otherwise be fetched by Chromium and trip SEC's
-            # anti-bot block (the same block the old URL-render path hit),
-            # which prevents the load event from ever firing.
+            # Lock Chromium down to the temp HTML + already-inlined data:
+            # payloads + about: pages. The preprocess step has inlined
+            # images as base64; anything still referenced externally —
+            # SEC stylesheets, fonts, scripts, or stray file:// references
+            # in the document — is aborted at the route layer so Chromium
+            # never reaches sec.gov (would trip the same anti-bot block
+            # the old URL-render path hit) or the local filesystem
+            # outside the one HTML temp file.
             #
-            # file:  → the temp HTML itself + any relative paths it tries
+            # file:  → exact match against the temp HTML URL only
             # data:  → already-inlined images and any other base64 payloads
             # about: → about:blank and friends Chromium uses internally
             async def _abort_external(route, request):
                 try:
                     url = request.url
                     if (
-                        url.startswith("file:")
+                        url == allowed_file_url
                         or url.startswith("data:")
                         or url.startswith("about:")
                     ):
