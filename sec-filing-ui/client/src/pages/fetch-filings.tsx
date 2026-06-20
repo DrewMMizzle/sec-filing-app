@@ -72,9 +72,17 @@ type WatchlistSummary = {
 
 type FetchResult = {
   success: boolean;
+  // App-available count: PDFs that were rasterized by Python AND copied
+  // into PDF_STORAGE_DIR AND marked complete in the DB.
   totalRendered: number;
   totalSkipped: number;
+  // Includes Python render errors plus persistence failures (rendered
+  // but failed to copy into app storage).
   totalErrors: number;
+  // Python-side render count (rasterized PDFs in the pipeline output
+  // directory). When this exceeds totalRendered, the gap is the number
+  // of filings whose copy into app storage failed.
+  pipelineRendered?: number;
   events: any[];
 };
 
