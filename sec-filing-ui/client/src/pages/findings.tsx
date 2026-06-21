@@ -896,6 +896,28 @@ export default function Findings() {
         {reviewing && <span className="ml-2 text-amber-400">· reviewing in progress…</span>}
       </div>
 
+      {/* When the user has narrowed to one ticker (via the exact-ticker
+          shortcut on the search box), surface the Ask AI CTA prominently.
+          The button is also on every group header below, but most of the
+          time users are looking at the flat list, not grouped — this is
+          where the affordance gets seen. */}
+      {tickerExact && rows.length > 0 && (
+        <Card className="mb-3 p-3 flex items-center gap-3 bg-primary/5 border-primary/30">
+          <Sparkles className="w-4 h-4 text-primary shrink-0" />
+          <div className="flex-1 text-sm">
+            <span className="font-medium">Ask AI about {tickerExact.toUpperCase()}</span>
+            <span className="text-muted-foreground ml-2">
+              — natural-language Q&amp;A across every reviewed filing
+            </span>
+          </div>
+          <Link href={`/ask?ticker=${encodeURIComponent(tickerExact)}`}>
+            <Button size="sm" variant="default" data-testid="button-ask-ai-banner">
+              Open Ask →
+            </Button>
+          </Link>
+        </Card>
+      )}
+
       {rows.length === 0 ? (
         <Card className="p-8 text-center">
           <div className="flex justify-center mb-4">
@@ -939,6 +961,20 @@ export default function Findings() {
                     <Badge variant="secondary" className="text-[10px]">
                       {item.count} finding{item.count !== 1 ? "s" : ""}
                     </Badge>
+                    {/* Sends the user to the Ask page scoped to this
+                        ticker so they can run an AI Q&A across every
+                        reviewed filing for the company. */}
+                    <Link href={`/ask?ticker=${encodeURIComponent(item.ticker)}`}>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-6 px-2 ml-auto text-xs text-muted-foreground hover:text-primary"
+                        data-testid={`button-ask-ticker-${item.ticker}`}
+                      >
+                        <Sparkles className="w-3 h-3 mr-1" />
+                        Ask AI about {item.ticker}
+                      </Button>
+                    </Link>
                   </div>
                 ) : (
                   <div className="pb-2">{renderRow(item.row)}</div>

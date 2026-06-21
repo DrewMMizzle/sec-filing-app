@@ -53,6 +53,46 @@ const SUGGESTIONS = [
   "Which companies had unusually high say-on-pay opposition?",
 ];
 
+// Ticker-scoped variants used when ?ticker=… landed the user here.
+// {ticker} is interpolated at render time so the suggestion chips
+// read naturally for the active ticker (e.g. "for BF-B in 2026").
+const TICKER_SUGGESTION_TEMPLATES = [
+  "Summarize the most material disclosures for {ticker} in the last 12 months.",
+  "What are the red-flag findings in {ticker}'s most recent filings?",
+  "How did {ticker}'s disclosures change between this year and last year?",
+  "What executive compensation or governance changes has {ticker} disclosed recently?",
+  "What lawsuits, investigations, or regulatory matters has {ticker} disclosed?",
+];
+
+// Read "?ticker=…" / "?q=…" from the URL. wouter v3's hash-location
+// navigate() writes the query string to window.location.search, not
+// inside the hash — so a clicked <Link href="/ask?ticker=BF-B"> lands
+// as ".../?ticker=BF-B#/ask". The same link opened in a new tab (no
+// JS nav) keeps the query in the hash ("#/ask?ticker=BF-B"). Check
+// the real search first, then fall back to an in-hash query so both
+// entry paths work. See PR #91 for the same pattern in Findings.
+function readAskParams(): { ticker: string; q: string } {
+  if (typeof window === "undefined") return { ticker: "", q: "" };
+  const read = (params: URLSearchParams) => ({
+    ticker: params.get("ticker")?.trim() || "",
+    q: params.get("q")?.trim() || "",
+  });
+  try {
+    const fromSearch = read(new URLSearchParams(window.location.search));
+    if (fromSearch.ticker || fromSearch.q) return fromSearch;
+  } catch {
+    // fall through to hash
+  }
+  const hash = window.location.hash || "";
+  const qIdx = hash.indexOf("?");
+  if (qIdx === -1) return { ticker: "", q: "" };
+  try {
+    return read(new URLSearchParams(hash.slice(qIdx + 1)));
+  } catch {
+    return { ticker: "", q: "" };
+  }
+}
+
 // Citation parser. Citations look like "TICKER FORM DATE" where FORM can be
 // multi-word ("DEF 14A"), so we capture ticker, then whatever's between
 // ticker and a YYYY-MM-DD date.
@@ -161,9 +201,23 @@ function renderAnswer(text: string, citationMap: Map<string, Citation>) {
 
 export default function Ask() {
   const { toast } = useToast();
+  // Pulled out of the URL on first mount so cross-page "Ask AI about
+  // TICKER" entry points (Library row, Findings group header, Findings
+  // single-ticker banner) land here with the ticker pre-scoped. The
+  // ticker state stays around so the user can drop the scope without
+  // losing the rest of their session.
+  const [initialParams] = useState(() => readAskParams());
+  const [scopedTicker, setScopedTicker] = useState(initialParams.ticker.toUpperCase());
   const [turns, setTurns] = useState<Turn[]>([]);
-  const [input, setInput] = useState("");
+  const [input, setInput] = useState(initialParams.q);
   const scrollerRef = useRef<HTMLDivElement>(null);
+
+  // Suggestion chips swap to a ticker-specific set when scoped. The
+  // template strings make it obvious what kind of questions Ask answers
+  // — the user can click one as a starting point or type their own.
+  const suggestions = scopedTicker
+    ? TICKER_SUGGESTION_TEMPLATES.map((t) => t.replace(/\{ticker\}/g, scopedTicker))
+    : SUGGESTIONS;
 
   const { data: config } = useQuery<{ reviewEnabled: boolean }>({
     queryKey: ["/api/config"],
@@ -253,6 +307,31 @@ export default function Ask() {
         </Card>
       )}
 
+      {/* Ticker-scope banner. When the user landed via "Ask AI about
+          TICKER" we make the scope obvious — the answers are still
+          drawn from the whole findings corpus (the server-side prompt
+          can mention other tickers when comparing), but the suggested
+          questions and the user's mental model are pinned to one
+          company. They can clear the scope to broaden the suggestions. */}
+      {scopedTicker && (
+        <Card className="p-3 mb-4 flex items-center gap-2 bg-primary/5 border-primary/30">
+          <Sparkles className="w-4 h-4 text-primary shrink-0" />
+          <p className="text-sm flex-1">
+            Scoped to <span className="font-mono font-semibold">{scopedTicker}</span>
+            <span className="text-muted-foreground"> — suggestions and prompts focus on this ticker.</span>
+          </p>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-7 px-2 text-xs"
+            onClick={() => setScopedTicker("")}
+            data-testid="button-ask-clear-scope"
+          >
+            Clear scope
+          </Button>
+        </Card>
+      )}
+
       {/* Chat transcript */}
       <div
         ref={scrollerRef}
@@ -263,10 +342,12 @@ export default function Ask() {
           <Card className="p-6">
             <div className="flex items-center gap-2 mb-2">
               <Sparkles className="w-4 h-4 text-primary" />
-              <p className="text-sm font-semibold">Try one of these</p>
+              <p className="text-sm font-semibold">
+                {scopedTicker ? `Try one of these about ${scopedTicker}` : "Try one of these"}
+              </p>
             </div>
             <div className="space-y-2">
-              {SUGGESTIONS.map((s) => (
+              {suggestions.map((s) => (
                 <button
                   key={s}
                   type="button"

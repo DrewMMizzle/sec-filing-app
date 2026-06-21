@@ -178,7 +178,7 @@ export function AppSidebar() {
                   >
                     <Link href="/ask">
                       <MessageSquare className="w-4 h-4" />
-                      <span>Ask</span>
+                      <span>Ask AI</span>
                     </Link>
                   </SidebarMenuButton>
                 </SidebarMenuItem>

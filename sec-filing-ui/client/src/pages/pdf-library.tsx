@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { Link } from "wouter";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { queryClient, apiRequest, API_BASE } from "@/lib/queryClient";
 import { Card } from "@/components/ui/card";
@@ -46,6 +47,7 @@ import {
   HardDrive,
   FileText,
   BarChart3,
+  Sparkles,
   AlertCircle,
   ChevronLeft,
   ChevronRight,
@@ -610,6 +612,20 @@ export default function PdfLibrary() {
                             {f.errorMessage}
                           </span>
                         )}
+                        {/* Sends the user to the Ask page with this ticker
+                            pre-scoped, so they can run a Claude Q&A across
+                            every reviewed filing for the company. */}
+                        <Link href={`/ask?ticker=${encodeURIComponent(f.ticker)}`}>
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="h-8 w-8 text-muted-foreground hover:text-primary"
+                            title={`Ask AI about ${f.ticker} — opens the Ask page scoped to this ticker`}
+                            data-testid={`button-ask-${f.id}`}
+                          >
+                            <Sparkles className="w-3.5 h-3.5" />
+                          </Button>
+                        </Link>
                         <Button
                           variant="ghost"
                           size="icon"
