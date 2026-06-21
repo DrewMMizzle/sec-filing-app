@@ -14,13 +14,14 @@ const __dirname_compat = path.dirname(__filename_compat);
 const PDF_STORAGE_DIR = process.env.PDF_STORAGE_DIR || path.resolve(__dirname_compat, "..", "pdfs");
 const PIPELINE_ROOT = process.env.PIPELINE_ROOT || path.resolve(__dirname_compat, "../../sec-pdf-pipeline");
 
-export const MODEL = "claude-opus-4-7";
+export const MODEL = "claude-opus-4-8";
 // Cap the text sent per filing to bound cost/latency on very large 10-Ks.
 const MAX_CHARS = 400_000;
 // Hard ceiling per review so one stalled call can't freeze the serial queue.
 const REVIEW_TIMEOUT_MS = 5 * 60 * 1000;
 
-// Opus 4.7 pricing (USD per 1M tokens).
+// Opus 4.7 / 4.8 pricing (USD per 1M tokens) — identical across the two
+// generations, so the model bump didn't change the spend-cap math.
 const PRICE_INPUT = 5;
 const PRICE_OUTPUT = 25;
 const PRICE_CACHE_READ = 0.5;
