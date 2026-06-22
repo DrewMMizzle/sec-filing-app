@@ -5,6 +5,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { PDFParse } from "pdf-parse";
 import { storage } from "./storage";
 import type { Filing } from "@shared/schema";
+import { UNTRUSTED_CONTENT_GUIDANCE, wrapUntrustedFiling, extractModelText } from "./prompt-safety";
 
 // Works in both ESM (dev via tsx) and CJS (prod via esbuild)
 const __filename_compat = typeof __filename !== "undefined" ? __filename : fileURLToPath(import.meta.url);
@@ -86,7 +87,9 @@ Respond ONLY with the structured JSON the schema requires:
     - category: one of "perks_comp", "severance_parachute", "related_party_insider", "language_governance_accounting", "other"
     - headline: a punchy, specific draft headline/angle a writer could build a post from
     - detail: the concrete buried detail — quote or closely paraphrase the language/numbers and note where in the filing it appears
-    - why: one sentence on why it's interesting or post-worthy`;
+    - why: one sentence on why it's interesting or post-worthy
+
+${UNTRUSTED_CONTENT_GUIDANCE}`;
 
 const FINDING_CATEGORIES = [
   "perks_comp",
@@ -165,7 +168,9 @@ async function callClaude(filing: Filing, text: string): Promise<ReviewResult> {
     `- Filing date: ${filing.filingDate || "unknown"}\n` +
     `- Accession: ${filing.accessionNumber}\n\n` +
     (trimmed ? `[NOTE: filing text truncated to the first ${MAX_CHARS} characters]\n\n` : "") +
-    (body.trim() ? `Filing text:\n${body}` : `Filing text: [no extractable text]`);
+    (body.trim()
+      ? `Filing text:\n${wrapUntrustedFiling(body, `${filing.ticker} ${filing.filingType}`)}`
+      : `Filing text: [no extractable text]`);
 
   // Bound each review so a single stalled Claude call can't wedge the whole
   // queue (the processor awaits this serially). The same controller is also
@@ -202,11 +207,7 @@ async function callClaude(filing: Filing, text: string): Promise<ReviewResult> {
     if (currentReviewAbort === controller) currentReviewAbort = null;
   }
 
-  const textBlock = message.content.find((b) => b.type === "text");
-  if (!textBlock || textBlock.type !== "text") {
-    throw new Error("No text block in Claude response");
-  }
-  const parsed = JSON.parse(textBlock.text) as Partial<ReviewResult>;
+  const parsed = JSON.parse(extractModelText(message, "Review")) as Partial<ReviewResult>;
   const findings = Array.isArray(parsed.findings) ? parsed.findings : [];
   const u = message.usage;
   return {

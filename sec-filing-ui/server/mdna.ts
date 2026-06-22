@@ -1,6 +1,7 @@
 import type { Filing } from "@shared/schema";
 import { MODEL, getAnthropicClient, resolvePdfPath, extractPdfText } from "./review";
 import { extractSection } from "./compare";
+import { UNTRUSTED_CONTENT_GUIDANCE, wrapUntrustedFiling, extractModelText } from "./prompt-safety";
 
 // The MD&A digest is for stock-research analysts: it pulls the operating story
 // out of Management's Discussion & Analysis (10-K Item 7 / 10-Q Item 2) —
@@ -117,7 +118,9 @@ Rules:
 - Base everything ONLY on the MD&A text provided. Never pull in outside knowledge or infer a driver management didn't state.
 - Quote concrete numbers and management's own language wherever possible.
 - If a field isn't disclosed, leave its string empty or its array empty — do NOT fabricate, and do NOT force a price/volume split management didn't give.
-- If the provided text isn't actually an MD&A section (or is empty), set available=false and leave everything else empty.`;
+- If the provided text isn't actually an MD&A section (or is empty), set available=false and leave everything else empty.
+
+${UNTRUSTED_CONTENT_GUIDANCE}`;
 
 export type MdnaResult = {
   digest: MdnaDigest;
@@ -160,7 +163,7 @@ export async function analyzeMdna(filing: Filing): Promise<MdnaResult> {
 
   const userContent =
     `Filing: ${filing.ticker} ${filing.filingType} ${filing.filingDate || ""} (accession ${filing.accessionNumber})\n\n` +
-    `MD&A section text:\n${section}`;
+    `MD&A section text:\n${wrapUntrustedFiling(section, `${filing.ticker} ${filing.filingType} MD&A`)}`;
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), MDNA_TIMEOUT_MS);
@@ -190,11 +193,7 @@ export async function analyzeMdna(filing: Filing): Promise<MdnaResult> {
     clearTimeout(timer);
   }
 
-  const textBlock = message.content.find((b) => b.type === "text");
-  if (!textBlock || textBlock.type !== "text") {
-    throw new Error("No text block in Claude response");
-  }
-  const parsed = JSON.parse(textBlock.text) as Partial<MdnaDigest>;
+  const parsed = JSON.parse(extractModelText(message, "MD&A analysis")) as Partial<MdnaDigest>;
   const digest: MdnaDigest = {
     ...EMPTY_DIGEST,
     ...parsed,
