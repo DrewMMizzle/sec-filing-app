@@ -2,7 +2,13 @@ import { storage } from "./storage";
 import { getAnthropicClient, MODEL, resolvePdfPath, extractPdfText } from "./review";
 import { getSecTickerIndex } from "./sec-index";
 import type { Filing } from "@shared/schema";
-import { UNTRUSTED_CONTENT_GUIDANCE, wrapUntrustedFiling, extractModelText } from "./prompt-safety";
+import {
+  UNTRUSTED_CONTENT_GUIDANCE,
+  STORED_CORPUS_GUIDANCE,
+  wrapUntrustedFiling,
+  sanitizeStoredField,
+  extractModelText,
+} from "./prompt-safety";
 
 // Ticker → official company name, projected from the shared SEC index. Used
 // for entity detection (e.g. "Thermo Fisher" → TMO) so we can scope the chat
@@ -112,7 +118,9 @@ Rules:
 - Quote concrete numbers and language from the corpus when relevant — editors want specifics.
 - When listing several companies, group cleanly and order from most striking to least.
 - If something isn't in the corpus, say so plainly. Important: the corpus is intentionally focused on buried, post-worthy details (perks, severance, related-party, governance/accounting tells). Routine operational/financial content (e.g. price escalators, revenue mix, segment results) often won't be a finding — if asked about that, point the user to the "Ask this filing" deep-dive on the relevant filing.
-- Tone: editorial and concise, like a footnoted.com reporter briefing another reporter. Concise does not mean confident — when the corpus is thin or silent on something, say so rather than filling the gap.`;
+- Tone: editorial and concise, like a footnoted.com reporter briefing another reporter. Concise does not mean confident — when the corpus is thin or silent on something, say so rather than filling the gap.
+
+${STORED_CORPUS_GUIDANCE}`;
 
 const FILING_SYSTEM_PROMPT = `You are a research assistant analyzing a single SEC filing for a footnoted.com editor.
 
@@ -196,20 +204,24 @@ async function buildFindingsCorpus(scopedTickers?: Set<string>): Promise<{
     if (scopedTickers && scopedTickers.size > 0 && !scopedTickers.has(f.ticker)) continue;
     const findings = parseFindingsField(f.reviewFindings);
     if (findings.length === 0 && !f.reviewSummary) continue;
+    // These fields were generated from untrusted issuer text, so a buried
+    // directive can persist into them. Defang any forged structural tags so a
+    // stored finding can't break out of its block, and the corpus system
+    // prompt marks the whole corpus as untrusted data (threat S2).
     const findingBlocks = findings
       .map(
         (fn) =>
-          `  <finding category="${fn.category}">` +
-          `\n    HEADLINE: ${fn.headline}` +
-          `\n    DETAIL: ${fn.detail}` +
-          (fn.why ? `\n    WHY: ${fn.why}` : "") +
+          `  <finding category="${sanitizeStoredField(fn.category).replace(/"/g, "")}">` +
+          `\n    HEADLINE: ${sanitizeStoredField(fn.headline)}` +
+          `\n    DETAIL: ${sanitizeStoredField(fn.detail)}` +
+          (fn.why ? `\n    WHY: ${sanitizeStoredField(fn.why)}` : "") +
           `\n  </finding>`,
       )
       .join("\n");
     const filingBlock =
       `<filing ticker="${f.ticker}" form="${f.filingType}" date="${f.filingDate || ""}" ` +
       `accession="${f.accessionNumber}" interest="${f.reviewMateriality || ""}">` +
-      (f.reviewSummary ? `\n  SUMMARY: ${f.reviewSummary}` : "") +
+      (f.reviewSummary ? `\n  SUMMARY: ${sanitizeStoredField(f.reviewSummary)}` : "") +
       (findingBlocks ? `\n${findingBlocks}` : "") +
       `\n</filing>`;
     if (totalLen + filingBlock.length > MAX_CORPUS_CHARS) {
