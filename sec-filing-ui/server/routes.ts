@@ -9,7 +9,7 @@ import { fileURLToPath } from "url";
 import { hashPassword, verifyPassword, createSession, clearSession, requireAuth } from "./auth";
 import { ensureSP500Seeded } from "./seed-sp500";
 import { getSecTickerIndex } from "./sec-index";
-import { isReviewEnabled, kickReviewProcessor, reviewCostUsd, requestCancelReview, isReviewProcessing } from "./review";
+import { isReviewEnabled, kickReviewProcessor, reviewCostUsd, requestCancelReview, isReviewProcessing, claudeHttpError } from "./review";
 import {
   lookupCikSubmissions,
   searchEdgarByName,
@@ -1153,7 +1153,8 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
       res.json({ ...result, cached: false });
     } catch (e: any) {
       console.error("Comparison failed:", e?.message || e);
-      res.status(500).json({ error: e?.message || "Comparison failed" });
+      const { status, message } = claudeHttpError(e);
+      res.status(status).json({ error: message });
     }
   });
 
@@ -1197,7 +1198,8 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
       });
     } catch (e: any) {
       console.error("Findings chat failed:", e?.message || e);
-      res.status(500).json({ error: e?.message || "Chat failed" });
+      const { status, message } = claudeHttpError(e);
+      res.status(status).json({ error: message });
     }
   });
 
@@ -1239,7 +1241,8 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
       });
     } catch (e: any) {
       console.error("Filing chat failed:", e?.message || e);
-      res.status(500).json({ error: e?.message || "Chat failed" });
+      const { status, message } = claudeHttpError(e);
+      res.status(status).json({ error: message });
     }
   });
 
@@ -1380,10 +1383,10 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
         analyzedAt: new Date().toISOString(),
       });
     } catch (e: any) {
-      const message = e?.message || "MD&A analysis failed";
+      const { status, message } = claudeHttpError(e);
       await storage.setFilingMdnaError(accession, String(message));
-      console.error("MD&A analysis failed:", message);
-      res.status(500).json({ error: message });
+      console.error("MD&A analysis failed:", e?.message || e);
+      res.status(status).json({ error: message });
     }
   });
 
@@ -1771,7 +1774,8 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
       res.json({ ...result, cached: false });
     } catch (e: any) {
       console.error("Registration PDF compare failed:", e?.message || e);
-      res.status(500).json({ error: e?.message || "Registration comparison failed" });
+      const { status, message } = claudeHttpError(e);
+      res.status(status).json({ error: message });
     }
   });
 }
