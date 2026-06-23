@@ -56,12 +56,50 @@ export function getAnthropicClient(): Anthropic {
   if (!_client) {
     _client = new Anthropic({
       defaultHeaders: { "anthropic-beta": "context-1m-2025-08-07" },
+      // Anthropic's fleet returns transient 429/5xx/529 ("overloaded_error")
+      // under load. The SDK retries these with jittered exponential backoff;
+      // the default of 2 is too few to ride out a capacity spike (a single
+      // S-1/S-1A compare can hit several seconds of overload), so we raise it.
+      maxRetries: 5,
     });
   }
   return _client;
 }
 function client(): Anthropic {
   return getAnthropicClient();
+}
+
+// Map an error from a Claude call to an HTTP response. Transient capacity and
+// rate-limit failures (overloaded_error / 429 / 5xx) — which the SDK already
+// retried and exhausted — become a 503 with a retry-friendly message, instead
+// of leaking the raw SDK error JSON into the UI. Everything else (our own
+// thrown errors like "section not found" or a safety refusal) passes through
+// as a 500 with its message intact.
+export function claudeHttpError(e: any): { status: number; message: string } {
+  const httpStatus = typeof e?.status === "number" ? e.status : undefined;
+  const apiType = e?.error?.error?.type ?? e?.error?.type;
+  const raw = typeof e?.message === "string" ? e.message : "";
+  const isOverloaded =
+    apiType === "overloaded_error" || httpStatus === 529 || /overloaded/i.test(raw);
+  const isTransient =
+    isOverloaded ||
+    httpStatus === 429 ||
+    (typeof httpStatus === "number" && httpStatus >= 500 && httpStatus < 600);
+  if (isOverloaded) {
+    return {
+      status: 503,
+      message:
+        "Anthropic is temporarily overloaded — the request was retried but couldn't complete. Please try again in a moment.",
+    };
+  }
+  if (isTransient) {
+    return {
+      status: 503,
+      message:
+        "The model service is temporarily unavailable (it was retried automatically). Please try again in a moment.",
+    };
+  }
+  return { status: 500, message: raw || "Request failed" };
 }
 
 const SYSTEM_PROMPT = `You are an investigative editor for footnoted.com, a publication that digs through SEC filings to find the buried, easy-to-miss, often telling details that make a great story — the kind of thing most readers and even most analysts skim right past. You are NOT looking for the big, obvious headline event. You are looking for what's hiding in the footnotes, the exhibits, the compensation tables, and the lawyerly language.
