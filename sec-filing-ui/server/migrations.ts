@@ -141,6 +141,17 @@ const MIGRATIONS: Migration[] = [
       CREATE INDEX IF NOT EXISTS idx_filing_compare_high ON filing_compares(accession_high);
     `,
   },
+  {
+    version: 4,
+    name: "invalidate_compares_for_evidence_grounding",
+    // Sprint 2 added evidence grounding to compares: the model now quotes
+    // verbatim source text per change and ungrounded entries are dropped.
+    // Results cached under the old prompt/schema predate that filter, so
+    // clear the cache and let them regenerate. The table itself is unchanged
+    // (the new evidence fields are stripped before persisting), so this only
+    // empties stale rows — it's a cache, nothing authoritative is lost.
+    sql: `DELETE FROM filing_compares;`,
+  },
 ];
 
 export async function runMigrations(pool: Pool): Promise<{ applied: number[] }> {
