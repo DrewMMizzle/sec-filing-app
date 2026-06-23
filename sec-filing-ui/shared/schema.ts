@@ -65,6 +65,12 @@ export const filings = pgTable("filings", {
   reviewFindings: text("review_findings"),      // JSON array of findings [{category, headline, detail, why}]
   reviewError: text("review_error"),
   reviewedAt: text("reviewed_at"),
+  // Sprint 3: second-model (Haiku) faithfulness check. Findings that aren't
+  // grounded in the source are dropped before reviewFindings is written; these
+  // record whether the verifier ran cleanly and a human-readable note of what
+  // (if anything) it dropped. reviewVerified is null for pre-Sprint-3 reviews.
+  reviewVerified: boolean("review_verified"),
+  verifierExplanation: text("verifier_explanation"),
   // Actual Claude token usage from the review (for cost tracking)
   reviewInputTokens: integer("review_input_tokens"),
   reviewOutputTokens: integer("review_output_tokens"),

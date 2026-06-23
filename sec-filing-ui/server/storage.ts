@@ -491,7 +491,14 @@ export class DatabaseStorage {
 
   async setFilingReviewResult(
     accession: string,
-    result: { interesting: boolean; interestingness: string; summary: string; findings: unknown[] },
+    result: {
+      interesting: boolean;
+      interestingness: string;
+      summary: string;
+      findings: unknown[];
+      verified?: boolean;
+      verifierExplanation?: string;
+    },
     usage?: {
       inputTokens: number;
       outputTokens: number;
@@ -507,6 +514,8 @@ export class DatabaseStorage {
         reviewMateriality: result.interestingness,
         reviewSummary: result.summary,
         reviewFindings: JSON.stringify(result.findings),
+        reviewVerified: result.verified ?? null,
+        verifierExplanation: result.verifierExplanation ?? null,
         reviewInputTokens: usage?.inputTokens ?? null,
         reviewOutputTokens: usage?.outputTokens ?? null,
         reviewCacheReadTokens: usage?.cacheReadTokens ?? null,

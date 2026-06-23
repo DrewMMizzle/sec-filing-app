@@ -152,6 +152,18 @@ const MIGRATIONS: Migration[] = [
     // empties stale rows — it's a cache, nothing authoritative is lost.
     sql: `DELETE FROM filing_compares;`,
   },
+  {
+    version: 5,
+    name: "review_verifier_columns",
+    // Sprint 3: Haiku faithfulness verifier on reviews. review_verified is
+    // true/false once the verifier runs (null for reviews from before this
+    // shipped); verifier_explanation is a human-readable note of what it
+    // dropped, or that everything passed.
+    sql: `
+      ALTER TABLE filings ADD COLUMN IF NOT EXISTS review_verified BOOLEAN;
+      ALTER TABLE filings ADD COLUMN IF NOT EXISTS verifier_explanation TEXT;
+    `,
+  },
 ];
 
 export async function runMigrations(pool: Pool): Promise<{ applied: number[] }> {
