@@ -2,7 +2,8 @@
 
 > Purpose: let a **fresh Claude Code chat with zero prior context** pick up
 > where the previous long session left off. Read this top to bottom first.
-> Last updated at main `e664d18` (PR #94 merged).
+> Last updated at main `63e997d` (PR #98 merged — prompt-injection Sprints 1–3
+> + Anthropic overload hardening all shipped).
 
 ---
 
@@ -38,47 +39,50 @@ filing.
   `Cannot find type definition file for 'node'` / `vite/client`, run
   `npm install` in `sec-filing-ui/` and retry — it's an env reset, not a code bug.
 - **Pre-existing build warnings (ignore):** `npm run build` always emits two
-  `import.meta` cjs warnings at `routes.ts:42` and `review.ts:10`. Unrelated to
-  any change; not worth fixing unless asked (would require flipping server output
-  to ESM).
+  `import.meta` cjs warnings at `routes.ts:42` and `review.ts:11` (line numbers
+  drift as files change). Unrelated to any change; not worth fixing unless asked
+  (would require flipping server output to ESM).
 - **Branch convention:** feature branch → PR → squash-merge to `main`. Don't push
   to `main` directly. Create PRs only when the user asks (they have been asking).
   Commit-message trailer + PR-body trailer conventions are enforced by the harness.
 - **Model:** the whole app uses one shared `MODEL` constant in
   `sec-filing-ui/server/review.ts` — currently `claude-opus-4-8`. Opus 4.7 and
-  4.8 are priced identically, so the `PRICE_*` constants there are correct.
+  4.8 are priced identically, so the `PRICE_*` constants there are correct. The
+  Sprint 3 verifier uses a separate `VERIFIER_MODEL = "claude-haiku-4-5"`.
+- **Anthropic transient overloads are handled (PR #97).** The shared client uses
+  `maxRetries: 5`; `claudeHttpError()` maps `overloaded_error`/429/5xx to a clean
+  503 ("temporarily overloaded — retry"). If a user reports an `overloaded_error`,
+  it's a transient Anthropic capacity spike, not a bug — retry usually clears it.
 - **Checks before every PR:** `cd sec-filing-ui && npm run check && npm run build`,
   plus `python3 -m py_compile` on any touched Python file.
 
 ---
 
-## 3. Everything shipped this session (all merged to `main`)
+## 3. Everything shipped (all merged to `main`)
 
-| PR | What |
-|----|------|
-| #82 | Block external resource loading in `render_html_to_pdf` |
-| #83 | Wall-clock timeout around `render_html_to_pdf` (12 min) so a wedged Chromium can't hang the worker silently |
-| #84 | `/api/registration/render` surfaces underlying render errors (treatPartialAsFailure flag) |
-| #85 | S-1/S-1A render robustness: `page.set_content` → temp file + `page.goto(file://)`; bounded `page.close`; await persistence before reporting success; sanitize `S-1/A` → `S-1_A` in paths/filenames |
-| #86 | Cache compare results in a `filing_compares` table (migration #3) so users don't pay twice; `refresh:true` + cache invalidation on re-render |
-| #87 | First-class date-range picker (`DateRangeInput`) on Fetch & Review |
-| #88 | "View in Findings" links carry `?ticker=` |
-| #89 | Renderer route allowlist pinned to the exact temp file URL (was `file:` blanket) |
-| #90 | `/api/filings/fetch` reports app-available PDF count (not Python pipeline count) |
-| #91 | Fix #88: read `?ticker=` from `window.location.search` (wouter v3 puts the query there, not in the hash) |
-| #92 | Filing-date lookback filter on Findings (reuses `DateRangeInput`) |
-| #93 | Bump `MODEL` Opus 4.7 → 4.8 |
-| #94 | **Prompt-injection Sprint 1** (see §5) |
+Earlier this project (pre-handoff): **#82–#93** — Python render hardening (#82,
+#83, #85), render-error surfacing (#84), compare cache + `filing_compares`
+migration #3 (#86), date-range UI (#87, #92), `?ticker=` deep-links (#88, #91),
+renderer route allowlist (#89), PDF-count fix (#90), `MODEL` Opus 4.7→4.8 (#93).
+(#75 closed unmerged — superseded by #77's PDF compare; its hardening landed as
+#84.)
 
-Closed without merging: **#75** (registration HTML compare — superseded by #77's
-PDF compare; its `treatPartialAsFailure` hardening was cherry-picked as #84).
+Prompt-injection project + recent hardening:
+
+| PR | Merged | What |
+|----|--------|------|
+| #94 | `e664d18` | **Prompt-injection Sprint 1** — `prompt-safety.ts` (see §5) |
+| #95 | `bb6b81a` | This handoff doc |
+| #96 | `22daeed` | **Prompt-injection Sprint 2** — corpus sanitization + compare evidence grounding (see §6) |
+| #97 | `e081e38` | Anthropic overload retry hardening (`maxRetries: 5` + `claudeHttpError`) — see §2 |
+| #98 | `63e997d` | **Prompt-injection Sprint 3** — Haiku faithfulness verifier on reviews (see §7) |
 
 ---
 
-## 4. Current state of the prompt-injection hardening project
+## 4. The prompt-injection threat model (framing)
 
 The user asked for a full prompt-injection threat model and a multi-sprint plan.
-The key framing finding: **Claude has no tools and no write access in this app** —
+Key framing finding: **Claude has no tools and no write access in this app** —
 every call is pure text→text. So blast radius is bounded to *content quality*
 (suppressed/fabricated findings) and *stored-corpus integrity*, NOT data
 exfiltration or unauthorized actions. Defenses are proportioned accordingly;
@@ -95,21 +99,28 @@ ruled out as overkill for a read-only-public-docs app with no tool surface.
 | `chat.ts` `chatAboutFindings` | CLAUDE-generated corpus + USER question | free text + citations |
 | `chat.ts` `chatAboutFiling` | EXTERNAL filing text + USER question | free text |
 
-### Top threats identified (ranked)
-1. **S1 (HIGH)** — filer embeds a directive in filing text → suppressed finding.
-2. **S2 (HIGH)** — injection survives review, persists into `reviewFindings`, then
-   re-activates every time `chatAboutFindings` rebuilds the corpus. ("persistence
-   laundering")
-3. **S3 (MED)** — cross-document confusion in compares (LATER doc claims things
-   about EARLIER).
-4. **S4 (MED)** — filing-chat boundary breach.
-5. **S5 (LOW-MED)** — fabricated `[TICKER FORM DATE]` citations rendered as links.
-6. **S6/S7 (LOW)** — cost amplification (bounded by $600 cap + per-filing caps);
-   refusal-mode silent breakage.
+### Top threats + current status
+1. **S1 (HIGH)** — filer embeds a directive in filing text. Two halves:
+   - *Fabrication* (invent/steer a finding): **mitigated** by Sprint 3 verifier.
+   - *Suppression* (omit a real finding): **STILL OPEN** — see §8. The verifier
+     can't see a finding that was never produced.
+2. **S2 (HIGH)** — injection survives review, persists into `reviewFindings`,
+   re-activates when `chatAboutFindings` rebuilds the corpus ("persistence
+   laundering"). **Mitigated:** Sprint 2 sanitizes the corpus + marks it
+   untrusted; Sprint 3 drops fabricated findings before they persist.
+3. **S3 (MED)** — cross-document confusion in compares. **Mitigated** by Sprint 2
+   evidence grounding.
+4. **S4 (MED)** — filing-chat boundary breach. **Mitigated** by Sprint 1
+   (`chatAboutFiling` wraps filing text + `FILING_SYSTEM_PROMPT` guidance).
+5. **S5 (LOW-MED)** — fabricated `[TICKER FORM DATE]` citations. Low risk: the
+   client only links citations that match real corpus filings; fabricated ones
+   just don't resolve. Not separately hardened.
+6. **S6/S7 (LOW)** — cost amplification (bounded by spend cap + per-filing caps);
+   refusal-mode silent breakage (**fixed** by Sprint 1 `extractModelText`).
 
 ---
 
-## 5. Sprint 1 (DONE — PR #94, merged `e664d18`)
+## 5. Sprint 1 (DONE — PR #94)
 
 New `sec-filing-ui/server/prompt-safety.ts`:
 - `UNTRUSTED_CONTENT_GUIDANCE` — system-prompt clause: tagged content is data,
@@ -120,58 +131,109 @@ New `sec-filing-ui/server/prompt-safety.ts`:
 - `extractModelText(message, context)` — central response parse; turns
   `stop_reason: "refusal"` into a thrown error instead of silent `""`.
 
-Wired into all six call sites. Output caps left as-is (already sane: chat 4000,
-structured 8000).
-
-**Watch in production:** refusal-rate spikes (could be adversarial filers OR
-false positives on benign disclosure language); reviews spuriously claiming "the
-filing attempted to direct the reviewer…" when it didn't (means guidance is too
-eager — dial back). User merged #94 specifically to test these in prod.
+Wired into all six call sites. **Observed good in prod** (user confirmed: no
+refusal-rate spike, no spurious "the filing attempted to direct the reviewer…").
 
 ---
 
-## 6. NEXT STEPS — Sprint 2 and Sprint 3 (NOT yet built)
+## 6. Sprint 2 (DONE — PR #96)
 
-### Sprint 2 — "Sanitize the corpus, ground the compares" (~3-4 days)
-Addresses S2 (persistence laundering) and S3 (cross-doc confusion).
-1. **Corpus tagging:** in `chat.ts` `buildFindingsCorpus` / where the corpus
-   string is assembled for `chatAboutFindings`, wrap each stored finding's
-   `detail`/`headline` in `<stored_finding accession="…">…</stored_finding>` so
-   residual injection in a persisted finding is treated as untrusted at chat time.
-2. **Evidence grounding on compares:** add `evidence_from_earlier: string` and
-   `evidence_from_later: string` to the compare JSON schema (`COMPARE_SCHEMA` in
-   `compare.ts`), require Claude to quote actual source text per `changed` entry,
-   then post-hoc string-match those quotes back into the input — drop/flag
-   entries whose "evidence" doesn't appear in the source.
-3. Migration to invalidate cached compares (the `filing_compares` table from #86)
-   so they regenerate under the new schema.
+"Sanitize the corpus, ground the compares." Addresses S2 + S3.
 
-### Sprint 3 — "Verifier pass on reviews" (~3-5 days)
-Addresses S1/S2 structurally with a second model.
-1. Add a **Haiku 4.5** (`claude-haiku-4-5`, $1/$5 per 1M) verification call in the
-   review pipeline: given a finding + the source excerpt, answer "is this finding
-   faithfully derived from the source?" Drop unverified findings before persisting.
-   Cost is ~$0.005-0.025/filing — cheap. Could alternatively use the Advisor tool
-   (beta) but a separate Haiku call is simpler and provider-agnostic.
-2. New DB columns `reviewVerified: boolean`, `verifierExplanation: text`
-   (Drizzle schema + migration #4).
-3. Drop unverified findings from the `chatAboutFindings` corpus.
+- **Corpus sanitization (S2)** in `prompt-safety.ts` + `chat.ts`:
+  - Generalized the tag-defang logic into `defangTags(content, tags)`; both
+    `wrapUntrustedFiling` and the new `sanitizeStoredField()` use it.
+  - `sanitizeStoredField()` defangs forged `<filing>`/`<finding>`/
+    `<untrusted_filing_content>` tags inside stored finding fields so a persisted
+    finding can't break out of its corpus block. Applied to summary/headline/
+    detail/why (+ category) in `buildFindingsCorpus`.
+  - `STORED_CORPUS_GUIDANCE` appended to `CORPUS_SYSTEM_PROMPT` — marks the whole
+    findings corpus as untrusted data.
+- **Compare evidence grounding (S3)** in `compare.ts`:
+  - `CHANGE_ITEM_SCHEMA` now requires `evidence_from_earlier` / `evidence_from_later`
+    (verbatim quotes). `EVIDENCE_GROUNDING_GUIDANCE` tells the model which side to
+    quote per added/removed/changed.
+  - `groundChangelog()` string-matches each quote against the **exact text the
+    model saw** (the *sampled* text for registration compares) via
+    `quoteAppearsInSource()` (whitespace-normalized, lowercased, ≥12 chars), and
+    **drops** ungrounded entries, appending `[N reported changes were omitted…]`
+    to the summary. Evidence fields are stripped before persisting → cached
+    `CompareResult` shape + client unchanged.
+- **Migration #4** (`invalidate_compares_for_evidence_grounding`) clears the
+  `filing_compares` cache so pre-Sprint-2 results regenerate under the new schema.
 
-### Operational follow-ups (not PRs)
-- Stand up a **Promptfoo** regression suite (~20 injection payloads a hostile
-  filer might try); run before every model bump.
-- Quarterly review of refusal rates per filing type.
-- Re-do the whole threat model the moment the app gives Claude ANY tool — tools
-  change the blast radius from "content quality" to "actions," which is a
-  completely different security posture.
+**Watch in prod:** the `[N reported changes were omitted…]` note. If legitimate
+changes get dropped (model paraphrasing instead of quoting verbatim), loosen the
+matcher — lower the 12-char floor in `quoteAppearsInSource`, or relax `changed`
+to require one side instead of both.
 
 ---
 
-## 7. How to resume in a new chat
+## 7. Sprint 3 (DONE — PR #98)
+
+"Verifier pass on reviews." A **Haiku 4.5** faithfulness check after the Opus
+review, all in `review.ts`:
+
+- `verifyFindings(filing, sourceBody, findings)` — **one call per filing** (not
+  per finding): sends the same truncated source body the reviewer saw + all
+  candidate findings, returns a per-finding `faithful` verdict by index
+  (`VERIFIER_SCHEMA`). Findings judged ungrounded are **dropped before
+  `reviewFindings` is written** → they never reach the chat corpus either.
+- **Best-effort:** a verifier error keeps all findings (`reviewVerified=false`);
+  a missing verdict defaults to **keep**, so an incomplete response can't
+  silently drop real findings.
+- Interest is downgraded to `none`/unflagged **only** when verification removes
+  *every* finding a filing had; a legitimately empty review is untouched.
+- Verifier tokens are **logged** (`[verify] <accession>: kept X/Y, ~$Z`) but NOT
+  folded into the Opus-priced `review_*_tokens` columns (would misprice the cap).
+- **Migration #5** (`review_verifier_columns`) adds `review_verified` (boolean)
+  + `verifier_explanation` (text) to `filings`. `null` for pre-Sprint-3 reviews.
+
+**Scope (important — don't overclaim):** this catches the **fabrication** half of
+S1/S2 and raises attacker cost via reviewer/verifier role separation. It does
+**NOT** address **suppression** (the verifier only judges findings that exist),
+and the verifier is itself injectable (mitigated by the Sprint 1 guidance, not
+eliminated). The PR #98 description and squash message say this explicitly.
+
+**Watch in prod:** the `[verify] … kept X/Y` logs. If lots of legitimate findings
+get dropped, the verifier prompt is too strict — loosen `VERIFIER_SYSTEM`. Cost
+note: the verifier re-sends the whole source to Haiku (≤400k chars → up to
+~$0.10 on a giant 10-K; typically far less). Excerpt-based verification is the
+dial if cost ever matters more than recall.
+
+---
+
+## 8. NEXT STEPS / open work
+
+The original three-sprint plan is fully shipped. Remaining:
+
+- **Suppression (S1) is still unaddressed** — the strongest open threat. No
+  current control detects a real finding the reviewer was steered to *omit*.
+  Candidate fix: an **affirmative-checklist review pass** that must answer
+  "is there a related-party transaction? a parachute? an auditor change? a
+  going-concern note?" so a missing answer is conspicuous. This is a different
+  mechanism from the faithfulness verifier.
+- **Optional UI surfacing** of the Sprint 3 data — a "verified" badge and/or the
+  `verifier_explanation` (dropped-findings note) in the Findings tab. Stored but
+  not shown today.
+- **Operational follow-ups (not PRs):**
+  - Stand up a **Promptfoo** regression suite (~20 injection payloads a hostile
+    filer might try); run before every model bump.
+  - Quarterly review of refusal rates + verifier drop rates per filing type.
+  - **Re-do the whole threat model the moment the app gives Claude ANY tool** —
+    tools change the blast radius from "content quality" to "actions," a
+    completely different security posture.
+
+---
+
+## 9. How to resume in a new chat
 
 1. Read this file.
-2. `git checkout main && git pull` — confirm HEAD is at or past `e664d18`.
-3. Ask the user what they observed from the Sprint 1 deploy (refusal rate, any
-   false-positive injection callouts) before starting Sprint 2.
-4. When building Sprint 2/3, follow the workflow in §2: feature branch → checks →
-   PR → wait for the user to say "merge."
+2. `git checkout main && git pull` — confirm HEAD is at or past `63e997d`.
+3. Ask the user what they observed from the latest deploys before starting new
+   work: verifier drop rate (`[verify]` logs), any compare `omitted` notes,
+   refusal rate. Confirm Sprints 1–3 + #97 are actually deployed (Railway is
+   manual — merged ≠ deployed).
+4. The obvious next build is the **suppression / affirmative-checklist** pass
+   (§8) if the user prioritizes it. Follow the workflow in §2: feature branch →
+   checks → PR → wait for the user to say "merge."
