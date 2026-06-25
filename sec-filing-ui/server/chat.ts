@@ -382,7 +382,12 @@ export async function chatAboutFiling(
         max_tokens: 4000,
         system: [
           { type: "text", text: FILING_SYSTEM_PROMPT },
-          { type: "text", text: filingBlock, cache_control: { type: "ephemeral" } },
+          // 1-hour cache TTL on the filing block. The body is large (up to
+          // ~500k tokens), so reusing the cached prefill makes repeat questions
+          // about the same filing — across a working session, not just the
+          // default 5-minute window — ~10x cheaper on the filing tokens. The
+          // 1h write premium (~2x vs 1.25x) pays off after a few reads.
+          { type: "text", text: filingBlock, cache_control: { type: "ephemeral", ttl: "1h" } },
         ],
         messages: history.map((t) => ({ role: t.role, content: t.content })),
       },
