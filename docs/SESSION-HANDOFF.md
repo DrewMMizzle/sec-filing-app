@@ -2,8 +2,9 @@
 
 > Purpose: let a **fresh Claude Code chat with zero prior context** pick up
 > where the previous long session left off. Read this top to bottom first.
-> Last updated at main `63e997d` (PR #98 merged — prompt-injection Sprints 1–3
-> + Anthropic overload hardening all shipped).
+> Last updated at main `372b91c` (PRs #94–#100 merged — prompt-injection
+> Sprints 1–3, Anthropic overload hardening, and the filing-chat truncation
+> cap raise all shipped).
 
 ---
 
@@ -76,6 +77,8 @@ Prompt-injection project + recent hardening:
 | #96 | `22daeed` | **Prompt-injection Sprint 2** — corpus sanitization + compare evidence grounding (see §6) |
 | #97 | `e081e38` | Anthropic overload retry hardening (`maxRetries: 5` + `claudeHttpError`) — see §2 |
 | #98 | `63e997d` | **Prompt-injection Sprint 3** — Haiku faithfulness verifier on reviews (see §7) |
+| #99 | (this doc) | Refresh of this handoff doc through #96–#98 |
+| #100 | `372b91c` | Raise `MAX_FILING_CHARS` 1.2M→2.0M in `chat.ts` to reduce the "Ask this filing" truncation badge — cost/latency cap only, well under the 1M-token window; revert the constant to roll back |
 
 ---
 
