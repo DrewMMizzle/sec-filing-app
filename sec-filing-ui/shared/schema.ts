@@ -71,6 +71,12 @@ export const filings = pgTable("filings", {
   // (if anything) it dropped. reviewVerified is null for pre-Sprint-3 reviews.
   reviewVerified: boolean("review_verified"),
   verifierExplanation: text("verifier_explanation"),
+  // A reusable structured "AI reading" of the filing (JSON), generated once
+  // from the full text and reused by the "Ask this filing" deep-dive so repeat
+  // sessions answer from this compact digest instead of re-sending the whole
+  // ~500k-token document each time. Null until first generated; cleared on
+  // re-render (the underlying text may change).
+  filingDigest: text("filing_digest"),
   // Actual Claude token usage from the review (for cost tracking)
   reviewInputTokens: integer("review_input_tokens"),
   reviewOutputTokens: integer("review_output_tokens"),

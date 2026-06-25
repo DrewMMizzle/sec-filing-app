@@ -80,6 +80,9 @@ function stripHeavyReviewFields(rows: Filing[]): void {
     r.reviewFindings = null;
     // The MD&A digest JSON is likewise heavy and only rendered on its own tab.
     r.mdnaDigest = null;
+    // The filing digest is an internal chat-cache artifact, never rendered in
+    // lists — strip it so polled views don't ship it.
+    r.filingDigest = null;
   }
 }
 
@@ -910,6 +913,37 @@ export class DatabaseStorage {
       // Best-effort cache write — never let a cache failure break the
       // request the user is waiting on.
       console.error("Failed to save compare cache:", err);
+    }
+  }
+
+  // ─── Filing digest (reusable "AI reading" for the chat cache) ───────────
+
+  async getFilingDigest(accession: string): Promise<string | null> {
+    const rows = await db
+      .select({ filingDigest: filings.filingDigest })
+      .from(filings)
+      .where(eq(filings.accessionNumber, accession))
+      .limit(1);
+    return rows[0]?.filingDigest ?? null;
+  }
+
+  async setFilingDigest(accession: string, digest: string): Promise<void> {
+    await db
+      .update(filings)
+      .set({ filingDigest: digest })
+      .where(eq(filings.accessionNumber, accession));
+  }
+
+  // Drop the cached digest — called when a filing is queued for re-render,
+  // since the underlying text (and therefore the right "reading") may change.
+  async clearFilingDigest(accession: string): Promise<void> {
+    try {
+      await db
+        .update(filings)
+        .set({ filingDigest: null })
+        .where(eq(filings.accessionNumber, accession));
+    } catch (err) {
+      console.error(`Failed to clear filing digest for ${accession}:`, err);
     }
   }
 

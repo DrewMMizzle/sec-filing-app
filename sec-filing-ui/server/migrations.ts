@@ -164,6 +164,13 @@ const MIGRATIONS: Migration[] = [
       ALTER TABLE filings ADD COLUMN IF NOT EXISTS verifier_explanation TEXT;
     `,
   },
+  {
+    version: 6,
+    name: "filing_digest_cache",
+    // Reusable structured "AI reading" of a filing, generated once and reused
+    // by the single-filing chat so repeat sessions don't re-send the full text.
+    sql: `ALTER TABLE filings ADD COLUMN IF NOT EXISTS filing_digest TEXT;`,
+  },
 ];
 
 export async function runMigrations(pool: Pool): Promise<{ applied: number[] }> {
