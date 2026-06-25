@@ -24,6 +24,7 @@ import type { ChildProcess } from "child_process";
 // it. Only one fetch runs at a time per process today (the route awaits it).
 let currentFetchChild: ChildProcess | null = null;
 import { chatAboutFindings, chatAboutFiling } from "./chat";
+import { ensureFilingDigest } from "./digest";
 import { findPageForQuote } from "./pdf-locate";
 import {
   compareFilings,
@@ -189,13 +190,18 @@ function runFetchPipeline(
               })
               .catch((err) => console.error("Failed to upsert filing:", err));
             // Re-render means the underlying PDF text may differ from
-            // whatever a cached compare was based on. Drop any stale
-            // cached compares for this accession so the next compare
-            // re-runs against the freshly-rendered text.
+            // whatever a cached compare or digest was based on. Drop both for
+            // this accession so the next compare / chat regenerates against
+            // the freshly-rendered text.
             storage
               .invalidateComparesForAccession(event.accession)
               .catch((err) =>
                 console.error("Failed to invalidate compare cache:", err),
+              );
+            storage
+              .clearFilingDigest(event.accession)
+              .catch((err) =>
+                console.error("Failed to clear filing digest:", err),
               );
           } else if (event.event === "complete") {
             const pipelinePdf = path.join(PIPELINE_ROOT, event.path);
@@ -1213,8 +1219,11 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
         .json({ error: "Claude is not configured (ANTHROPIC_API_KEY is not set)." });
     }
     const accession = req.params.accession as string;
-    const { messages } = req.body as {
+    const { messages, deep } = req.body as {
       messages?: Array<{ role: "user" | "assistant"; content: string }>;
+      // When true, answer against the full filing text instead of the cached
+      // digest — for verbatim/back-of-document questions the digest can't cover.
+      deep?: boolean;
     };
     if (!Array.isArray(messages) || messages.length === 0) {
       return res.status(400).json({ error: "messages array is required" });
@@ -1229,7 +1238,7 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
       return res.status(400).json({ error: "Last message must be a non-empty user question" });
     }
     try {
-      const result = await chatAboutFiling(accession, messages);
+      const result = await chatAboutFiling(accession, messages, { deep: !!deep });
       res.json({
         answer: result.answer,
         usage: result.usage,
@@ -1238,7 +1247,16 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
         form: result.form,
         date: result.date,
         truncated: result.truncated,
+        digestMode: result.digestMode,
       });
+      // If we just answered from the full text (no digest cached yet), generate
+      // and persist the digest in the background so the next session is cheap.
+      // Best-effort and runs after the response is sent.
+      if (!result.digestMode) {
+        ensureFilingDigest(accession).catch((err) =>
+          console.error("Background digest generation failed:", err?.message || err),
+        );
+      }
     } catch (e: any) {
       console.error("Filing chat failed:", e?.message || e);
       const { status, message } = claudeHttpError(e);
