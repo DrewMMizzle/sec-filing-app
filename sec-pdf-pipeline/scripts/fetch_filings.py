@@ -37,10 +37,16 @@ os.chdir(PROJECT_ROOT)
 
 from src.config import configure_logging
 from src.edgar.rate_limiter import sec_get, close_client
+from src.edgar.index_parser import find_information_statement
 from src.renderer.preprocess import preprocess_filing
 from src.renderer.playwright_render import render_html_to_pdf, close_browser
 
 logger = logging.getLogger(__name__)
+
+# Form 10 spin-off registrations. Their submissions `primaryDocument` is a thin
+# Form 10 cover/checklist; the substance is the Information Statement exhibit
+# (EX-99.1), so for these we render that exhibit instead.
+FORM_10_TYPES = {"10-12B", "10-12B/A", "10-12G", "10-12G/A"}
 
 SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
 OUTPUT_DIR = PROJECT_ROOT / "output"
@@ -121,6 +127,21 @@ async def poll_ticker_with_dates(
             f"https://www.sec.gov/Archives/edgar/data/"
             f"{cik_stripped}/{accession_nodash}/{primary_doc}"
         )
+
+        # Form 10 spin-offs: render the Information Statement exhibit (EX-99.1),
+        # which holds the actual disclosure, rather than the thin Form 10 cover.
+        # Best-effort — fall back to the primary document if it can't be found.
+        if form in FORM_10_TYPES:
+            try:
+                info_url = await find_information_statement(cik, accession_dashed)
+                if info_url:
+                    primary_doc_url = info_url
+            except Exception as exc:
+                logger.warning(
+                    "Information-statement lookup failed for %s: %s",
+                    accession_dashed,
+                    exc,
+                )
 
         results.append({
             "accession_number": accession_dashed,
