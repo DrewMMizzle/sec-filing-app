@@ -33,7 +33,8 @@ import {
 type EdgarCompany = { cik: string; name: string; ticker?: string };
 type RegistrationFiling = {
   accessionNumber: string;
-  form: "S-1" | "S-1/A" | string;
+  // S-1 / S-1/A (IPO) or 10-12B / 10-12G + "/A" (Form 10 spin-off registrations).
+  form: "S-1" | "S-1/A" | "10-12B" | "10-12B/A" | "10-12G" | "10-12G/A" | string;
   filingDate: string;
   primaryDocUrl: string;
   // null when the filing has no DB row yet — i.e. it hasn't been rendered.
@@ -141,7 +142,7 @@ export default function Registration() {
       }
       toast({
         title: data.rendered > 0 ? "Render complete" : "Pipeline ran but nothing rendered",
-        description: `${data.companyName} → ${data.rendered} S-1 / S-1/A PDF(s)`,
+        description: `${data.companyName} → ${data.rendered} registration PDF(s)`,
       });
       setSelected(new Set());
     },
@@ -260,10 +261,12 @@ export default function Registration() {
             Registration / IPO filings
           </h1>
           <p className="text-sm text-muted-foreground">
-            Pull S-1 and S-1/A filings from SEC EDGAR for any company — including
-            pre-IPO filers that aren&apos;t in the tickered universe yet. Kept separate
-            from the normal Fetch flow because these documents are very large
-            and slow to render.
+            Pull registration statements from SEC EDGAR for any company —
+            S-1 / S-1/A (IPOs) and Form 10 (10-12B / 10-12G spin-offs), including
+            pre-IPO and spin-off filers that aren&apos;t in the tickered universe yet.
+            For a spin-off, search the new entity (not the parent) — its Form 10
+            is filed under its own CIK. Kept separate from the normal Fetch flow
+            because these documents are very large and slow to render.
           </p>
         </div>
       </div>
@@ -271,7 +274,7 @@ export default function Registration() {
       <Card className="p-3 mb-4 flex items-start gap-2 border-amber-600/30">
         <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
         <p className="text-xs text-muted-foreground">
-          <span className="text-foreground font-medium">Heads up:</span> S-1 / S-1/A filings can
+          <span className="text-foreground font-medium">Heads up:</span> registration statements can
           be 500+ pages. Render runs single-filing, on-demand, and does not auto-review. Use the
           per-row <span className="text-foreground">Review</span> button after render if you want
           Claude findings (~{REVIEW_COST_ESTIMATE} per filing).
@@ -357,7 +360,7 @@ export default function Registration() {
           </Card>
 
           {filingsQuery.isLoading && (
-            <p className="text-sm text-muted-foreground">Loading S-1 / S-1/A history from EDGAR…</p>
+            <p className="text-sm text-muted-foreground">Loading registration history from EDGAR…</p>
           )}
           {filingsQuery.error && (
             <p className="text-sm text-destructive">
@@ -366,7 +369,7 @@ export default function Registration() {
           )}
           {!filingsQuery.isLoading && !filingsQuery.error && filings.length === 0 && (
             <Card className="p-6 text-center text-sm text-muted-foreground">
-              No S-1 or S-1/A filings in this company&apos;s recent submissions.
+              No registration filings (S-1 / S-1/A or Form 10) in this company&apos;s recent submissions.
             </Card>
           )}
 
@@ -598,7 +601,7 @@ export default function Registration() {
       >
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Run Claude review on this S-1?</AlertDialogTitle>
+            <AlertDialogTitle>Run Claude review on this registration statement?</AlertDialogTitle>
             <AlertDialogDescription>
               Reviewing a registration statement is expensive — input is much larger than a
               typical 10-K. Estimated Claude cost: <span className="text-foreground font-medium">{REVIEW_COST_ESTIMATE}</span>.

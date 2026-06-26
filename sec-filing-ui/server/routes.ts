@@ -1567,7 +1567,8 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
   });
 
   // ───────────────────────────────────────────────────────────
-  // Registration / IPO mode — explicit, opt-in S-1 / S-1/A lane.
+  // Registration / IPO mode — explicit, opt-in registration-statement lane
+  // (S-1 / S-1/A and Form 10 / 10-12B / 10-12G spin-off registrations).
   //
   // Kept separate from the normal Fetch flow so heavy registration
   // statements (often 500+ pages, image-dense) can't pollute regular
@@ -1575,8 +1576,8 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
   //   - Render is single-filing, on demand, with skipAutoReview=true.
   //   - Review is opt-in per filing via the existing
   //     /api/filings/:accession/review endpoint.
-  //   - Filing types are locked to S-1 / S-1/A — no schema or default
-  //     changes leak into the normal fetch defaults.
+  //   - Filing types are scoped to the registration forms — no schema or
+  //     default changes leak into the normal fetch defaults.
   // ───────────────────────────────────────────────────────────
 
   app.get("/api/registration/search", requireAuth, async (req, res) => {
@@ -1645,7 +1646,7 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     }
   });
 
-  // Render specific S-1 / S-1/A filings on demand. Single-filing scope,
+  // Render specific registration filings on demand. Single-filing scope,
   // skipAutoReview=true — review is opt-in afterwards via the regular
   // per-filing review endpoint. The ticker label stored on the filings row
   // is the SEC ticker if available, otherwise a name-derived placeholder —
@@ -1688,7 +1689,7 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     if (selected.length === 0) {
       return res
         .status(404)
-        .json({ error: "No matching S-1 / S-1/A filings found for the supplied accessions" });
+        .json({ error: "No matching registration filings found for the supplied accessions" });
     }
 
     const tickers = [
@@ -1733,7 +1734,8 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     }
   });
 
-  // Whole-filing PDF comparison for S-1 / S-1/A pairs. Requires both filings
+  // Whole-filing PDF comparison for registration-statement pairs (S-1 / S-1/A
+  // or Form 10 + amendments). Requires both filings
   // to already be rendered (the existing Registration render flow handles
   // that). Reads the rendered PDF text and sends a front/middle/back-sampled
   // version of each side to Claude. Auto-review stays off for the inputs —
