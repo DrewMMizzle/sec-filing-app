@@ -41,20 +41,11 @@ def _normalise_accession(accession: str) -> tuple[str, str]:
     return nodash, dashed
 
 
-async def find_primary_document(
-    cik: str,
-    accession_number: str,
-    filing_type: str | None = None,
-) -> str | None:
-    """Fetch the filing index and return the primary document URL.
+async def _fetch_index_candidates(cik: str, accession_number: str) -> list[dict[str, Any]]:
+    """Fetch the filing index page and return its document rows.
 
-    Args:
-        cik: CIK (may be zero-padded or not).
-        accession_number: Accession number (dashed or undashed).
-        filing_type: Optional filing type to improve document detection.
-
-    Returns:
-        Absolute URL to the primary document, or ``None`` if not found.
+    Each candidate is ``{"url", "description", "type", "filename"}``. Returns
+    an empty list if the index or its document table can't be parsed.
     """
     cik_stripped = cik.lstrip("0") or "0"
     nodash, dashed = _normalise_accession(accession_number)
@@ -79,7 +70,7 @@ async def find_primary_document(
 
     if table is None:
         logger.warning("No document table found at %s", index_url)
-        return None
+        return []
 
     rows = table.find_all("tr")
     candidates: list[dict[str, Any]] = []
@@ -116,6 +107,70 @@ async def find_primary_document(
 
     if not candidates:
         logger.warning("No document links found at %s", index_url)
+    return candidates
+
+
+async def find_information_statement(cik: str, accession_number: str) -> str | None:
+    """Locate the Information Statement exhibit (EX-99.1) in a filing.
+
+    Spin-off Form 10 registrations (10-12B / 10-12G) file a thin Form 10 cover
+    as the primary document; the substance — business, risk factors, MD&A,
+    financials — lives in Exhibit 99.1, the Information Statement. This returns
+    that exhibit's URL so the renderer fetches the real content, or ``None`` if
+    no such exhibit is present (caller falls back to the primary document).
+    """
+    candidates = await _fetch_index_candidates(cik, accession_number)
+    if not candidates:
+        return None
+
+    def is_html(c: dict[str, Any]) -> bool:
+        return c["filename"].lower().endswith((".htm", ".html"))
+
+    def type_is_ex991(c: dict[str, Any]) -> bool:
+        t = c["type"].upper().replace(" ", "")
+        return t in {"EX-99.1", "EX-99.01", "99.1"} or t.startswith("EX-99.1")
+
+    def desc_is_info_stmt(c: dict[str, Any]) -> bool:
+        return "information statement" in c["description"].lower()
+
+    # Most specific → least: EX-99.1 that's also described as the information
+    # statement, then any EX-99.1, then anything described as an information
+    # statement, then any EX-99.* exhibit. Prefer HTML at each tier.
+    tiers = [
+        lambda c: type_is_ex991(c) and desc_is_info_stmt(c),
+        type_is_ex991,
+        desc_is_info_stmt,
+        lambda c: c["type"].upper().replace(" ", "").startswith("EX-99"),
+    ]
+    for match in tiers:
+        hits = [c for c in candidates if match(c)]
+        if not hits:
+            continue
+        html_hits = [c for c in hits if is_html(c)]
+        chosen = (html_hits or hits)[0]
+        logger.info("Information statement exhibit: %s", chosen["url"])
+        return chosen["url"]
+
+    return None
+
+
+async def find_primary_document(
+    cik: str,
+    accession_number: str,
+    filing_type: str | None = None,
+) -> str | None:
+    """Fetch the filing index and return the primary document URL.
+
+    Args:
+        cik: CIK (may be zero-padded or not).
+        accession_number: Accession number (dashed or undashed).
+        filing_type: Optional filing type to improve document detection.
+
+    Returns:
+        Absolute URL to the primary document, or ``None`` if not found.
+    """
+    candidates = await _fetch_index_candidates(cik, accession_number)
+    if not candidates:
         return None
 
     # Try to match based on filing type patterns.
