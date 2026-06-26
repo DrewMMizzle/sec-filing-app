@@ -1,10 +1,12 @@
-// SEC EDGAR lookups used by the Registration / IPO mode (S-1 / S-1/A).
+// SEC EDGAR lookups used by the Registration / IPO mode (S-1 / S-1/A and
+// Form 10 spin-off registrations).
 //
 // Scoped to just what the registration flow needs:
 //   - lookupCikSubmissions: confirm a CIK, get the official name and tickers.
-//   - searchEdgarByName:    surface pre-IPO companies by name (those not in
-//                           company_tickers.json).
-//   - listRegistrationFilings: enumerate the S-1 / S-1/A history for a CIK.
+//   - searchEdgarByName:    surface pre-IPO / spin-off companies by name (those
+//                           not in company_tickers.json).
+//   - listRegistrationFilings: enumerate the S-1 / S-1/A and Form 10 history
+//                           for a CIK.
 //   - nameToLabel:          derive a short display label from a company name
 //                           when the company has no SEC ticker.
 
@@ -12,9 +14,21 @@ const SEC_USER_AGENT = process.env.SEC_USER_AGENT || "DotAdda ameister@dotadda.c
 
 export type EdgarCompany = { cik: string; name: string; ticker?: string };
 
+// Registration statements the lane supports: S-1 (IPO) and Form 10
+// (10-12B / 10-12G — used for spin-offs), plus their "/A" amendments. EDGAR
+// codes Form 10 as "10-12B"/"10-12G", never literally "Form 10" or "10".
+const REGISTRATION_FORMS = new Set([
+  "S-1",
+  "S-1/A",
+  "10-12B",
+  "10-12B/A",
+  "10-12G",
+  "10-12G/A",
+]);
+
 export type RegistrationFiling = {
   accessionNumber: string;
-  form: string; // "S-1" | "S-1/A"
+  form: string; // e.g. "S-1" | "S-1/A" | "10-12B" | "10-12B/A" | "10-12G"
   filingDate: string; // YYYY-MM-DD
   primaryDocUrl: string;
 };
@@ -75,7 +89,8 @@ export async function searchEdgarByName(q: string): Promise<EdgarCompany[]> {
   return out;
 }
 
-// List the company's S-1 and S-1/A history from its submissions JSON.
+// List the company's registration-statement history (S-1 / S-1/A and Form 10
+// 10-12B / 10-12G + amendments) from its submissions JSON.
 export async function listRegistrationFilings(cik: string): Promise<RegistrationFiling[]> {
   const padded = paddedCik(cik);
   if (!padded) return [];
@@ -96,7 +111,7 @@ export async function listRegistrationFilings(cik: string): Promise<Registration
   const out: RegistrationFiling[] = [];
   for (let i = 0; i < forms.length; i++) {
     const form = String(forms[i] ?? "");
-    if (form !== "S-1" && form !== "S-1/A") continue;
+    if (!REGISTRATION_FORMS.has(form)) continue;
     const acc = String(accessions[i] ?? "");
     const date = String(dates[i] ?? "");
     const primary = String(primaryDocs[i] ?? "");
