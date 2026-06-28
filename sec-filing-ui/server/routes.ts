@@ -13,6 +13,7 @@ import { isReviewEnabled, kickReviewProcessor, reviewCostUsd, requestCancelRevie
 import {
   lookupCikSubmissions,
   searchEdgarByName,
+  searchRegistrationFilingsByContent,
   listRegistrationFilings,
   nameToLabel,
   type EdgarCompany,
@@ -1611,6 +1612,18 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
         for (const m of edgar) push(m);
       } catch (err) {
         console.warn("EDGAR search failed:", err);
+      }
+
+      // 4. Full-text search filtered to the registration forms. This is the
+      //    bridge from a parent's name to its spin-off: a spin-off's Form 10
+      //    mentions the parent throughout, so searching "Honeywell" surfaces
+      //    the spin-off's filer (a different entity/CIK/ticker) that ticker/
+      //    name lookup can't reach. Tagged registrationHint for the UI.
+      try {
+        const reg = await searchRegistrationFilingsByContent(q);
+        for (const m of reg) push(m);
+      } catch (err) {
+        console.warn("EDGAR registration full-text search failed:", err);
       }
 
       res.json(matches.slice(0, 15));

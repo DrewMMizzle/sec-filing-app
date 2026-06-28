@@ -12,7 +12,15 @@
 
 const SEC_USER_AGENT = process.env.SEC_USER_AGENT || "DotAdda ameister@dotadda.com";
 
-export type EdgarCompany = { cik: string; name: string; ticker?: string };
+export type EdgarCompany = {
+  cik: string;
+  name: string;
+  ticker?: string;
+  // True when surfaced via the Form 10 full-text content search (i.e. this
+  // company filed a Form 10 whose text matched the query) rather than by
+  // ticker/name. Lets the UI flag likely spin-off registrations.
+  registrationHint?: boolean;
+};
 
 // Registration statements the lane supports: S-1 (IPO) and Form 10
 // (10-12B / 10-12G — used for spin-offs), plus their "/A" amendments. EDGAR
@@ -51,17 +59,13 @@ export async function lookupCikSubmissions(
   return { cik: padded, name, tickers };
 }
 
-// EDGAR full-text search-index — surfaces companies by name, including pre-IPO
-// filers that aren't in company_tickers.json. Returns up to 10 deduped matches.
-export async function searchEdgarByName(q: string): Promise<EdgarCompany[]> {
-  const query = q.trim();
-  if (!query) return [];
-  const url = `https://efts.sec.gov/LATEST/search-index?q=${encodeURIComponent(query)}&forms=`;
-  const res = await fetch(url, { headers: { "User-Agent": SEC_USER_AGENT } });
-  if (!res.ok) return [];
-  const data = (await res.json()) as {
-    hits?: { hits?: Array<{ _source?: { ciks?: unknown; display_names?: unknown } }> };
-  };
+// Parse the EDGAR full-text search response into deduped companies. Each hit is
+// a filing; we project it to its filer(s). `limit` caps the result count and
+// `hint` stamps registrationHint on every company (used for the Form 10 lane).
+function parseEdgarSearchHits(
+  data: { hits?: { hits?: Array<{ _source?: { ciks?: unknown; display_names?: unknown } }> } },
+  opts: { limit: number; hint?: boolean } = { limit: 10 },
+): EdgarCompany[] {
   const hits = data?.hits?.hits ?? [];
   const seen = new Set<string>();
   const out: EdgarCompany[] = [];
@@ -82,11 +86,42 @@ export async function searchEdgarByName(q: string): Promise<EdgarCompany[]> {
       const cleanName = (m ? m[1] : nameRaw).trim();
       const tickerHint = m ? m[2].trim() : "";
       const ticker = tickerHint && tickerHint !== "—" ? tickerHint : undefined;
-      out.push({ cik, name: cleanName, ticker });
-      if (out.length >= 10) return out;
+      out.push({ cik, name: cleanName, ticker, ...(opts.hint ? { registrationHint: true } : {}) });
+      if (out.length >= opts.limit) return out;
     }
   }
   return out;
+}
+
+// EDGAR full-text search-index — surfaces companies by name, including pre-IPO
+// filers that aren't in company_tickers.json. Returns up to 10 deduped matches.
+export async function searchEdgarByName(q: string): Promise<EdgarCompany[]> {
+  const query = q.trim();
+  if (!query) return [];
+  const url = `https://efts.sec.gov/LATEST/search-index?q=${encodeURIComponent(query)}&forms=`;
+  const res = await fetch(url, { headers: { "User-Agent": SEC_USER_AGENT } });
+  if (!res.ok) return [];
+  const data = await res.json();
+  return parseEdgarSearchHits(data, { limit: 10 });
+}
+
+// EDGAR full-text search filtered to the registration forms (S-1 + Form 10).
+// Because full-text search matches filing CONTENT, this is the bridge from a
+// PARENT's name to its spin-off: a spin-off's Form 10 mentions the parent
+// throughout, so q="Honeywell" + forms=10-12B… surfaces the spin-off's filer
+// (a different entity / CIK / ticker) that name- and ticker-based lookup can't
+// reach. Returns those filers tagged with registrationHint.
+export async function searchRegistrationFilingsByContent(q: string): Promise<EdgarCompany[]> {
+  const query = q.trim();
+  if (!query) return [];
+  const forms = Array.from(REGISTRATION_FORMS).join(",");
+  const url =
+    `https://efts.sec.gov/LATEST/search-index?q=${encodeURIComponent(query)}` +
+    `&forms=${encodeURIComponent(forms)}`;
+  const res = await fetch(url, { headers: { "User-Agent": SEC_USER_AGENT } });
+  if (!res.ok) return [];
+  const data = await res.json();
+  return parseEdgarSearchHits(data, { limit: 10, hint: true });
 }
 
 // List the company's registration-statement history (S-1 / S-1/A and Form 10
