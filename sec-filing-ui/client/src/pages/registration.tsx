@@ -30,7 +30,7 @@ import {
 } from "lucide-react";
 
 // ─── Types mirroring the /api/registration/* endpoints ───────────────
-type EdgarCompany = { cik: string; name: string; ticker?: string };
+type EdgarCompany = { cik: string; name: string; ticker?: string; registrationHint?: boolean };
 type RegistrationFiling = {
   accessionNumber: string;
   // S-1 / S-1/A (IPO) or 10-12B / 10-12G + "/A" (Form 10 spin-off registrations).
@@ -262,11 +262,13 @@ export default function Registration() {
           </h1>
           <p className="text-sm text-muted-foreground">
             Pull registration statements from SEC EDGAR for any company —
-            S-1 / S-1/A (IPOs) and Form 10 (10-12B / 10-12G spin-offs), including
-            pre-IPO and spin-off filers that aren&apos;t in the tickered universe yet.
-            For a spin-off, search the new entity (not the parent) — its Form 10
-            is filed under its own CIK. Kept separate from the normal Fetch flow
-            because these documents are very large and slow to render.
+            S-1 / S-1/A (IPOs) and Form 10 (10-12B / 10-12G spin-offs). Search a
+            company by name, ticker, or CIK. Searching a <strong>parent</strong>
+            {" "}(e.g. &quot;Honeywell&quot;) also surfaces its spin-offs&apos; Form 10
+            registrations — those are filed under a new entity with its own CIK
+            and ticker, and are tagged <em>Form 10 filer</em> in the results.
+            Kept separate from the normal Fetch flow because these documents are
+            very large and slow to render.
           </p>
         </div>
       </div>
@@ -324,7 +326,12 @@ export default function Registration() {
               }}
               data-testid={`button-registration-pick-${c.cik}`}
             >
-              <div className="text-sm font-medium truncate">{c.name}</div>
+              <div className="flex items-center gap-2">
+                <span className="text-sm font-medium truncate">{c.name}</span>
+                {c.registrationHint && (
+                  <Badge variant="secondary" className="text-[10px] shrink-0">Form 10 filer</Badge>
+                )}
+              </div>
               <div className="text-xs text-muted-foreground font-mono">
                 CIK {c.cik}
                 {c.ticker ? ` · ${c.ticker}` : " · (no ticker)"}
