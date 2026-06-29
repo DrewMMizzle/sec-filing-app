@@ -2,9 +2,12 @@
 
 > Purpose: let a **fresh Claude Code chat with zero prior context** pick up
 > where the previous long session left off. Read this top to bottom first.
-> Last updated at main `372b91c` (PRs #94–#100 merged — prompt-injection
-> Sprints 1–3, Anthropic overload hardening, and the filing-chat truncation
-> cap raise all shipped).
+> Last updated at main `6e16ec0` (PRs #94–#105 merged). Through #100:
+> prompt-injection Sprints 1–3, Anthropic overload hardening, filing-chat
+> truncation cap. #101–#105 added a two-layer filing-chat cache (1h prompt
+> cache + reusable digest) and full Form 10 / spin-off support (lane +
+> Information-Statement render + parent-name discovery) — see §10–§11.
+> #106 (open) adds the client "Deep search" toggle for the digest cache.
 
 ---
 
@@ -49,7 +52,9 @@ filing.
 - **Model:** the whole app uses one shared `MODEL` constant in
   `sec-filing-ui/server/review.ts` — currently `claude-opus-4-8`. Opus 4.7 and
   4.8 are priced identically, so the `PRICE_*` constants there are correct. The
-  Sprint 3 verifier uses a separate `VERIFIER_MODEL = "claude-haiku-4-5"`.
+  Sprint 3 verifier uses a separate `VERIFIER_MODEL = "claude-haiku-4-5"`, and
+  the filing-chat digest (§8) uses `DIGEST_MODEL = "claude-sonnet-4-6"` in
+  `digest.ts`.
 - **Anthropic transient overloads are handled (PR #97).** The shared client uses
   `maxRetries: 5`; `claudeHttpError()` maps `overloaded_error`/429/5xx to a clean
   503 ("temporarily overloaded — retry"). If a user reports an `overloaded_error`,
@@ -79,6 +84,12 @@ Prompt-injection project + recent hardening:
 | #98 | `63e997d` | **Prompt-injection Sprint 3** — Haiku faithfulness verifier on reviews (see §7) |
 | #99 | (this doc) | Refresh of this handoff doc through #96–#98 |
 | #100 | `372b91c` | Raise `MAX_FILING_CHARS` 1.2M→2.0M in `chat.ts` to reduce the "Ask this filing" truncation badge — cost/latency cap only, well under the 1M-token window; revert the constant to roll back |
+| #101 | `cd46778` | 1-hour prompt-cache TTL on the single-filing chat (`cache_control: { type:"ephemeral", ttl:"1h" }`) — see §10 |
+| #102 | `d00c439` | **Reusable filing digest** for the chat (`digest.ts`, Sonnet) + `deep` option / `digestMode` flag in `chat.ts` — see §10 |
+| #103 | `63daae0` | **Form 10 lane** — `10-12B`/`10-12G` (+`/A`) added to the registration forms; "Form 10 filer" badge — see §11 |
+| #104 | `5db779b` | **Render the Information Statement (EX-99.1)** for Form 10 spin-offs (Python `find_information_statement`) — see §11 |
+| #105 | `6e16ec0` | **Discover spin-offs by the parent's name** via EDGAR full-text content search (`searchRegistrationFilingsByContent`) — see §11 |
+| #106 | (open) | Client **Deep search toggle** + digest-mode badge in `filing-chat-dialog.tsx` — surfaces #102's `deep`/`digestMode` |
 
 ---
 
@@ -105,7 +116,7 @@ ruled out as overkill for a read-only-public-docs app with no tool surface.
 ### Top threats + current status
 1. **S1 (HIGH)** — filer embeds a directive in filing text. Two halves:
    - *Fabrication* (invent/steer a finding): **mitigated** by Sprint 3 verifier.
-   - *Suppression* (omit a real finding): **STILL OPEN** — see §8. The verifier
+   - *Suppression* (omit a real finding): **STILL OPEN** — see §10. The verifier
      can't see a finding that was never produced.
 2. **S2 (HIGH)** — injection survives review, persists into `reviewFindings`,
    re-activates when `chatAboutFindings` rebuilds the corpus ("persistence
@@ -206,7 +217,88 @@ dial if cost ever matters more than recall.
 
 ---
 
-## 8. NEXT STEPS / open work
+## 8. Filing-chat cost caching (DONE — PRs #100–#102, #106)
+
+The "Ask this filing" deep-dive (`chatAboutFiling` in `chat.ts`) re-reads a
+single filing's full text — up to ~500k tokens on a giant 10-K. Three layers
+now keep that cheap:
+
+1. **Bigger window before truncation (#100):** `MAX_FILING_CHARS` is 2.0M chars
+   (was 1.2M). Beyond it the text is truncated and the answer carries a
+   `truncated` flag → "filing text was truncated to fit" badge.
+2. **1-hour prompt cache (#101):** the filing text block is sent with
+   `cache_control: { type: "ephemeral", ttl: "1h" }`. Follow-up questions in
+   the same session reuse the cached read at ~10% input cost instead of
+   re-billing the whole document. (Default ephemeral TTL is 5 min; "1h" holds
+   it across a realistic back-and-forth.)
+3. **Reusable digest (#102):** `digest.ts` generates a one-time structured
+   **digest** of the filing with **`DIGEST_MODEL = "claude-sonnet-4-6"`** and
+   stores it (migration #6, `filing_digest` table). After the first chat,
+   answers are drawn from the *digest* (a few thousand tokens) instead of the
+   full text — much cheaper and faster.
+   - `chatAboutFiling(accession, history, { deep? })` branches: if a usable
+     digest exists and `deep` is **false** (default), it answers from the
+     digest and returns **`digestMode: true`**. If `deep` is **true** (or no
+     digest yet), it reads the full text and returns `digestMode: false`.
+     `ensureFilingDigest` is fired in the background by the ask route so the
+     digest exists for next time.
+   - The digest system prompt tells the model the digest is a *summary, not the
+     complete document*: if a question needs a verbatim quote / exact number /
+     back-of-document detail the digest lacks, it must say so and tell the user
+     to use **deep search** — never fabricate to fill the gap.
+
+**Client (#106, open):** `filing-chat-dialog.tsx` exposes a **Deep search**
+`Switch` (sends `deep: true`) and shows a badge — "answered from cached summary
+— turn on Deep search for full text" — whenever `digestMode` is true. Before
+#106 the server returned `digestMode` but nothing surfaced it.
+
+**Watch in prod:** if digest answers are routinely too thin (users always
+flipping Deep search on), enrich the digest schema/prompt in `digest.ts`, or
+default `deep` to true for certain forms. To fully roll back to always-full-text
+behavior, have the ask route call `chatAboutFiling(..., { deep: true })`.
+
+---
+
+## 9. Form 10 / spin-off support (DONE — PRs #103–#105)
+
+Motivating case: the app couldn't find **Honeywell's** spin-off Information
+Statement. The fix spanned three problems, each its own PR:
+
+1. **Form 10 wasn't in the registration lane (#103).** The registration mode
+   only knew S-1 / S-1/A. `REGISTRATION_FORMS` in `server/sec-edgar.ts` now also
+   includes **`10-12B`, `10-12B/A`, `10-12G`, `10-12G/A`** (EDGAR codes Form 10
+   this way — never literally "Form 10" or "10"). `listRegistrationFilings`
+   surfaces them; `registration.tsx` shows a "Form 10 filer" badge.
+2. **The rendered doc was the thin cover, not the substance (#104).** A spin-off
+   Form 10 files a skeletal cover as the *primary document*; the real content
+   (business, risk factors, MD&A, financials) lives in **Exhibit 99.1, the
+   Information Statement**. `sec-pdf-pipeline/src/edgar/index_parser.py` adds
+   `find_information_statement(cik, accession)` — tiered EX-99.1 selection
+   (EX-99.1 + "information statement" desc → any EX-99.1 → any info-statement →
+   any EX-99.*, preferring HTML), returning `None` to fall back to the primary.
+   `scripts/fetch_filings.py` swaps the primary-doc URL to that exhibit for
+   `FORM_10_TYPES`.
+3. **The spin-off is a different entity than the parent (#105).** Honeywell's
+   spin-off filed under its **own CIK** (the new "spinco", e.g. 2089271), so
+   searching the parent's name/ticker never reaches it. The bridge is **EDGAR
+   full-text content search**: a spin-off's Form 10 *mentions the parent
+   throughout*, so `searchRegistrationFilingsByContent(q)` in `sec-edgar.ts`
+   (`efts.sec.gov/LATEST/search-index?q=<parent>&forms=10-12B,…`) surfaces the
+   spinco's filer — a different CIK/ticker — tagged `registrationHint: true`.
+   `/api/registration/search` (routes.ts) runs **both** the name search and this
+   content search and merges them. User confirmed end-to-end: *"Everything is
+   working. We got the document."*
+
+**Env caveat (critical for testing):** the **build sandbox cannot reach sec.gov**
+— org egress policy blocks it (proxy returns 403 on CONNECT). This is NOT a
+User-Agent problem and must NOT be routed around. The registration/discovery and
+Python render paths therefore **can't be exercised locally** — they only run in
+**production (Railway)**, which reaches SEC fine. Verify these features by asking
+the user to test the deploy, not by curling SEC from the sandbox.
+
+---
+
+## 10. NEXT STEPS / open work
 
 The original three-sprint plan is fully shipped. Remaining:
 
@@ -229,14 +321,19 @@ The original three-sprint plan is fully shipped. Remaining:
 
 ---
 
-## 9. How to resume in a new chat
+## 11. How to resume in a new chat
 
 1. Read this file.
-2. `git checkout main && git pull` — confirm HEAD is at or past `63e997d`.
+2. `git checkout main && git pull` — confirm HEAD is at or past `6e16ec0`
+   (#105). #106 (Deep search toggle) may still be open — check.
 3. Ask the user what they observed from the latest deploys before starting new
    work: verifier drop rate (`[verify]` logs), any compare `omitted` notes,
-   refusal rate. Confirm Sprints 1–3 + #97 are actually deployed (Railway is
-   manual — merged ≠ deployed).
+   refusal rate, and — for the newer work — whether filing-chat digest answers
+   are good enough or users keep flipping Deep search on (§8), and whether
+   Form 10 / spin-off discovery is surfacing the right filer (§9). Confirm what
+   is actually deployed (Railway is manual — merged ≠ deployed). Note: the
+   build sandbox can't reach sec.gov, so SEC-dependent paths are only verifiable
+   in prod (§9).
 4. The obvious next build is the **suppression / affirmative-checklist** pass
-   (§8) if the user prioritizes it. Follow the workflow in §2: feature branch →
+   (§10) if the user prioritizes it. Follow the workflow in §2: feature branch →
    checks → PR → wait for the user to say "merge."
