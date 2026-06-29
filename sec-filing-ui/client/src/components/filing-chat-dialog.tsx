@@ -10,6 +10,8 @@ import {
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
+import { Switch } from "@/components/ui/switch";
+import { Label } from "@/components/ui/label";
 import { useToast } from "@/hooks/use-toast";
 import { Send, Loader2, MessageSquare, User } from "lucide-react";
 
@@ -17,7 +19,7 @@ type Turn = {
   role: "user" | "assistant";
   content: string;
   // Per-answer metadata shown beneath the response.
-  meta?: { costUsd: number; truncated: boolean };
+  meta?: { costUsd: number; truncated: boolean; digestMode: boolean };
 };
 type FilingChatResponse = {
   answer: string;
@@ -26,6 +28,8 @@ type FilingChatResponse = {
   form: string;
   date: string | null;
   truncated: boolean;
+  // True when the answer came from the cached digest rather than the full text.
+  digestMode: boolean;
 };
 
 type Props = {
@@ -51,6 +55,10 @@ export function FilingChatDialog({ open, onOpenChange, accession, ticker, form, 
   const { toast } = useToast();
   const [turns, setTurns] = useState<Turn[]>([]);
   const [input, setInput] = useState("");
+  // Deep search forces the server to read the full filing text instead of the
+  // cached digest. Off by default (cheaper); users escalate when an answer is
+  // too thin.
+  const [deep, setDeep] = useState(false);
   const scrollerRef = useRef<HTMLDivElement>(null);
 
   // Reset chat state when switching filings or closing.
@@ -58,6 +66,7 @@ export function FilingChatDialog({ open, onOpenChange, accession, ticker, form, 
     if (!open) {
       setTurns([]);
       setInput("");
+      setDeep(false);
     }
   }, [open]);
 
@@ -66,7 +75,7 @@ export function FilingChatDialog({ open, onOpenChange, accession, ticker, form, 
       const res = await apiRequest(
         "POST",
         `/api/filings/${encodeURIComponent(accession)}/ask`,
-        { messages },
+        { messages, deep },
       );
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
@@ -80,7 +89,7 @@ export function FilingChatDialog({ open, onOpenChange, accession, ticker, form, 
         {
           role: "assistant",
           content: data.answer,
-          meta: { costUsd: data.costUsd, truncated: data.truncated },
+          meta: { costUsd: data.costUsd, truncated: data.truncated, digestMode: data.digestMode },
         },
       ]);
     },
@@ -115,8 +124,8 @@ export function FilingChatDialog({ open, onOpenChange, accession, ticker, form, 
             {date && <span className="font-normal text-muted-foreground"> · {date}</span>}
           </DialogTitle>
           <DialogDescription className="text-xs">
-            Ask Claude about this filing's full text. Follow-up questions reuse a cached copy of
-            the filing, so they're cheap.
+            Ask Claude about this filing. Answers come from a cached summary by default, so
+            they're fast and cheap. Turn on Deep search to read the full filing text.
           </DialogDescription>
         </DialogHeader>
 
@@ -154,6 +163,8 @@ export function FilingChatDialog({ open, onOpenChange, accession, ticker, form, 
                     {t.meta && (
                       <p className="text-[10px] text-muted-foreground/70 mt-1.5" data-testid="filing-answer-cost">
                         cost ${t.meta.costUsd.toFixed(3)}
+                        {t.meta.digestMode &&
+                          " · answered from cached summary — turn on Deep search for full text"}
                         {t.meta.truncated && " · filing text was truncated to fit"}
                       </p>
                     )}
@@ -175,7 +186,20 @@ export function FilingChatDialog({ open, onOpenChange, accession, ticker, form, 
           )}
         </div>
 
-        <div className="px-5 py-3 border-t border-border flex items-end gap-2">
+        <div className="px-5 pt-3 pb-2 border-t border-border flex items-center gap-2">
+          <Switch
+            id="filing-chat-deep"
+            checked={deep}
+            onCheckedChange={setDeep}
+            disabled={askMutation.isPending}
+            data-testid="filing-chat-deep"
+          />
+          <Label htmlFor="filing-chat-deep" className="text-xs text-muted-foreground cursor-pointer">
+            Deep search (read full filing text — slower, costs more)
+          </Label>
+        </div>
+
+        <div className="px-5 pb-3 flex items-end gap-2">
           <Textarea
             value={input}
             onChange={(e) => setInput(e.target.value)}
