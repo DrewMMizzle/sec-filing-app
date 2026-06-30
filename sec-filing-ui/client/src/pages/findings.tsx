@@ -322,6 +322,39 @@ export default function Findings() {
     const t = setTimeout(() => setQ(qInput), 200);
     return () => clearTimeout(t);
   }, [qInput]);
+  // The "?ticker=" seed is one-shot. After consuming it into the search box
+  // above, strip it from the URL so navigating back to Findings later starts
+  // blank instead of silently re-applying a stale ticker filter. wouter's hash
+  // router otherwise leaves the query parked in window.location.search, where
+  // it persists across every subsequent navigation.
+  useEffect(() => {
+    if (!initialTicker) return;
+    try {
+      const url = new URL(window.location.href);
+      let changed = false;
+      if (url.searchParams.has("ticker")) {
+        url.searchParams.delete("ticker");
+        changed = true;
+      }
+      // Also handle a ticker carried inside the hash query ("#/?ticker=…").
+      const hash = url.hash || "";
+      const qIdx = hash.indexOf("?");
+      if (qIdx !== -1) {
+        const params = new URLSearchParams(hash.slice(qIdx + 1));
+        if (params.has("ticker")) {
+          params.delete("ticker");
+          const rest = params.toString();
+          url.hash = hash.slice(0, qIdx) + (rest ? `?${rest}` : "");
+          changed = true;
+        }
+      }
+      if (changed) window.history.replaceState(null, "", url.toString());
+    } catch {
+      // best-effort — a leftover param only re-seeds the box, nothing worse
+    }
+    // Run once on mount; initialTicker is computed once per mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const [sortBy, setSortBy] = useState<string>("filed");
   const [groupByTicker, setGroupByTicker] = useState(false);
   // Filing-date lookback. Default the fresh view to the last 7 days so the
