@@ -6,8 +6,13 @@
 > prompt-injection Sprints 1–3, Anthropic overload hardening, filing-chat
 > truncation cap. #101–#105 added a two-layer filing-chat cache (1h prompt
 > cache + reusable digest) and full Form 10 / spin-off support (lane +
-> Information-Statement render + parent-name discovery) — see §10–§11.
+> Information-Statement render + parent-name discovery) — see §8–§9.
 > #106 (open) adds the client "Deep search" toggle for the digest cache.
+>
+> **Deploy state (as of this update): production is live at #100.** #101–#105
+> are merged to `main` but **NOT yet deployed** — the filing-chat cache and the
+> Form 10 / spin-off features below are in the code but not live until the user
+> ships a newer commit to Railway (deploys are manual). "Merged" ≠ "live."
 
 ---
 
@@ -286,8 +291,10 @@ Statement. The fix spanned three problems, each its own PR:
    (`efts.sec.gov/LATEST/search-index?q=<parent>&forms=10-12B,…`) surfaces the
    spinco's filer — a different CIK/ticker — tagged `registrationHint: true`.
    `/api/registration/search` (routes.ts) runs **both** the name search and this
-   content search and merges them. User confirmed end-to-end: *"Everything is
-   working. We got the document."*
+   content search and merges them. User confirmed it worked end-to-end on a
+   test deploy of this code — *"Everything is working. We got the document."* —
+   but note this is **not on the live prod commit** (prod is at #100; see the
+   deploy-state note in the header).
 
 **Env caveat (critical for testing):** the **build sandbox cannot reach sec.gov**
 — org egress policy blocks it (proxy returns 403 on CONNECT). This is NOT a
