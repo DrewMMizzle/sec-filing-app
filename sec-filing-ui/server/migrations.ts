@@ -9,7 +9,16 @@ import type { Pool } from "pg";
 // On boot we read schema_migrations and apply only the unapplied entries, so
 // the steady-state cost of "initDatabase()" is a single SELECT instead of the
 // 30+ ALTER/CREATE/UPDATE statements the bootstrap block used to do.
-type Migration = { version: number; name: string; sql: string };
+//
+// SAFETY: a migration that removes data (DROP TABLE/COLUMN/SCHEMA/DATABASE,
+// TRUNCATE, DELETE FROM) can NEVER run silently. The runner scans each
+// unapplied migration's SQL; if it finds data-destructive statements it:
+//   - prints a loud, unmissable warning banner to the boot logs, AND
+//   - REFUSES to apply it (throws, halting boot) unless the migration is
+//     explicitly marked `destructive: true` to acknowledge the data loss.
+// So an *accidental* destructive change fails the deploy instead of wiping
+// data, and an *intentional* one still screams in the logs every time it runs.
+type Migration = { version: number; name: string; sql: string; destructive?: boolean };
 
 const MIGRATIONS: Migration[] = [
   {
@@ -144,6 +153,10 @@ const MIGRATIONS: Migration[] = [
   {
     version: 4,
     name: "invalidate_compares_for_evidence_grounding",
+    // Acknowledged data-removing migration (clears a regenerable cache table).
+    // The flag is what lets the destructive-statement guard apply it instead of
+    // halting boot — see the SAFETY note at the top of this file.
+    destructive: true,
     // Sprint 2 added evidence grounding to compares: the model now quotes
     // verbatim source text per change and ungrounded entries are dropped.
     // Results cached under the old prompt/schema predate that filter, so
@@ -173,6 +186,53 @@ const MIGRATIONS: Migration[] = [
   },
 ];
 
+// Data-removing statements we refuse to run silently. Note these are scoped to
+// operations that destroy *rows or columns of data* — DROP TABLE/COLUMN/
+// SCHEMA/DATABASE, TRUNCATE, DELETE FROM. `DROP CONSTRAINT` and `DROP INDEX`
+// are intentionally NOT here: they remove schema rules, not data (migration #1
+// legitimately drops a unique constraint), so flagging them would be noise.
+const DESTRUCTIVE_PATTERNS: Array<{ label: string; re: RegExp }> = [
+  { label: "DROP TABLE", re: /\bDROP\s+TABLE\b/i },
+  { label: "DROP COLUMN", re: /\bDROP\s+COLUMN\b/i },
+  { label: "DROP SCHEMA", re: /\bDROP\s+SCHEMA\b/i },
+  { label: "DROP DATABASE", re: /\bDROP\s+DATABASE\b/i },
+  { label: "TRUNCATE", re: /\bTRUNCATE\b/i },
+  { label: "DELETE FROM", re: /\bDELETE\s+FROM\b/i },
+];
+
+// Strip SQL comments so a destructive keyword mentioned in a comment doesn't
+// trip the guard (and, conversely, can't be used to hide real destructive SQL).
+function stripSqlComments(sql: string): string {
+  return sql
+    .replace(/\/\*[\s\S]*?\*\//g, " ") // block comments
+    .replace(/--[^\n]*/g, " "); // line comments
+}
+
+// Return the labels of any data-destructive statements found in a migration's
+// SQL. Empty array => safe (additive) migration. Exported for unit testing.
+export function findDestructiveStatements(sql: string): string[] {
+  const cleaned = stripSqlComments(sql);
+  return DESTRUCTIVE_PATTERNS.filter((p) => p.re.test(cleaned)).map((p) => p.label);
+}
+
+function warnDestructiveMigration(m: Migration, matched: string[]): void {
+  const bar = "!".repeat(74);
+  console.warn(
+    [
+      "",
+      bar,
+      `!!  DESTRUCTIVE MIGRATION #${m.version} (${m.name})`,
+      `!!  Contains data-removing SQL: ${matched.join(", ")}`,
+      "!!  Applying this PERMANENTLY DELETES data in the target database.",
+      m.destructive === true
+        ? "!!  Acknowledged via `destructive: true` — proceeding."
+        : "!!  NOT acknowledged — refusing to apply (set `destructive: true` to allow).",
+      bar,
+      "",
+    ].join("\n"),
+  );
+}
+
 export async function runMigrations(pool: Pool): Promise<{ applied: number[] }> {
   // Bookkeeping table — own table so the user-facing schema stays clean.
   await pool.query(
@@ -190,6 +250,29 @@ export async function runMigrations(pool: Pool): Promise<{ applied: number[] }> 
   const ordered = [...MIGRATIONS].sort((a, b) => a.version - b.version);
   for (const m of ordered) {
     if (already.has(m.version)) continue;
+
+    // Guard: never let a data-destructive migration run silently. Warn loudly,
+    // and refuse outright unless the author explicitly acknowledged it.
+    const destructive = findDestructiveStatements(m.sql);
+    if (destructive.length > 0) {
+      warnDestructiveMigration(m, destructive);
+      if (m.destructive !== true) {
+        throw new Error(
+          `[migrations] Refusing to apply migration #${m.version} (${m.name}): it contains ` +
+            `data-destructive statements (${destructive.join(", ")}) but is not marked ` +
+            "`destructive: true`. If the data loss is intentional, set that flag on the " +
+            "migration to acknowledge it; otherwise remove the destructive SQL.",
+        );
+      }
+    } else if (m.destructive === true) {
+      // Flagged destructive but the detector saw nothing — surface the mismatch
+      // rather than trusting a possibly-stale flag.
+      console.warn(
+        `[migrations] Migration #${m.version} (${m.name}) is marked destructive but no ` +
+          "data-removing statement was detected — double-check the flag is still warranted.",
+      );
+    }
+
     await pool.query(m.sql);
     await pool.query(
       `INSERT INTO schema_migrations (version, name) VALUES ($1, $2)`,
