@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { useWindowVirtualizer } from "@tanstack/react-virtual";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import { Link } from "wouter";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { API_BASE, apiRequest, queryClient } from "@/lib/queryClient";
@@ -480,11 +480,47 @@ export default function Findings() {
   }, [groupByTicker, tickerGroups, rows]);
 
   const listRef = useRef<HTMLDivElement>(null);
-  const virtualizer = useWindowVirtualizer({
+  // The app shell scrolls an inner `<main className="overflow-auto">`, NOT the
+  // window (see App.tsx). A window-scoped virtualizer never sees that scroll, so
+  // it only ever mounts the first screenful of rows and the rest are unreachable
+  // — the whole list looks like ~4 items however far you scroll. Bind the
+  // virtualizer to the actual scrolling ancestor instead, and track the list's
+  // offset within it as `scrollMargin` so item positions line up.
+  const [scrollEl, setScrollEl] = useState<HTMLElement | null>(null);
+  const [scrollMargin, setScrollMargin] = useState(0);
+  useLayoutEffect(() => {
+    const list = listRef.current;
+    if (!list) return;
+    // Nearest scrollable ancestor (the overflow-auto <main>).
+    let el: HTMLElement | null = list.parentElement;
+    while (el) {
+      const oy = getComputedStyle(el).overflowY;
+      if (oy === "auto" || oy === "scroll") break;
+      el = el.parentElement;
+    }
+    setScrollEl(el);
+    const recalc = () => {
+      if (!listRef.current) return;
+      const top = el
+        ? listRef.current.getBoundingClientRect().top -
+          el.getBoundingClientRect().top +
+          el.scrollTop
+        : listRef.current.offsetTop;
+      setScrollMargin(Math.max(0, Math.round(top)));
+    };
+    recalc();
+    window.addEventListener("resize", recalc);
+    return () => window.removeEventListener("resize", recalc);
+    // Recompute when the chrome above the list (how-to card, review/paused
+    // banners) appears or disappears, shifting the list down or up.
+  }, [virtualItems.length, showHowTo, reviewing, paused, reviewEnabled, reviewableCount]);
+
+  const virtualizer = useVirtualizer({
     count: virtualItems.length,
+    getScrollElement: () => scrollEl,
     estimateSize: (i) => (virtualItems[i]?.kind === "header" ? 40 : 180),
     overscan: 8,
-    scrollMargin: listRef.current?.offsetTop ?? 0,
+    scrollMargin,
   });
 
   const toggleCat = (c: string) =>
@@ -930,7 +966,7 @@ export default function Findings() {
                   top: 0,
                   left: 0,
                   width: "100%",
-                  transform: `translateY(${v.start - (listRef.current?.offsetTop ?? 0)}px)`,
+                  transform: `translateY(${v.start - scrollMargin}px)`,
                 }}
               >
                 {item.kind === "header" ? (
