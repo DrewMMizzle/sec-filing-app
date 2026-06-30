@@ -183,6 +183,18 @@ async function copyRich(html: string, text: string): Promise<void> {
 
 const interestRank = (l?: string | null) => (l === "high" ? 3 : l === "medium" ? 2 : l === "low" ? 1 : 0);
 
+// Default filing-date window for a fresh Findings view: the last 7 days
+// (today and the 6 days before, inclusive), in local time. Matches the
+// DateRangeInput "Last 7 days" preset so the default and the preset agree.
+function defaultFiledRange(): { from: string; to: string } {
+  const ymd = (d: Date) =>
+    `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  const to = new Date();
+  const from = new Date();
+  from.setDate(from.getDate() - 6);
+  return { from: ymd(from), to: ymd(to) };
+}
+
 type FilingsProgress = {
   totalCount: number;
   rendering: number;
@@ -310,13 +322,16 @@ export default function Findings() {
     const t = setTimeout(() => setQ(qInput), 200);
     return () => clearTimeout(t);
   }, [qInput]);
-  const [sortBy, setSortBy] = useState<string>("date");
+  const [sortBy, setSortBy] = useState<string>("filed");
   const [groupByTicker, setGroupByTicker] = useState(false);
-  // Filing-date lookback. Empty strings = "all dates" so the default
-  // matches the pre-filter behavior — adding the picker shouldn't
-  // hide findings on first load.
-  const [filedFrom, setFiledFrom] = useState("");
-  const [filedTo, setFiledTo] = useState("");
+  // Filing-date lookback. Default the fresh view to the last 7 days so the
+  // page opens on the most recent week of filings rather than the entire
+  // backlog. Exception: when arriving via a "?ticker=" deep-link from
+  // "View in Findings", keep dates open ("") — the linked filing may be
+  // older than a week and shouldn't be hidden on landing.
+  const initialFiled = initialTicker ? { from: "", to: "" } : defaultFiledRange();
+  const [filedFrom, setFiledFrom] = useState(initialFiled.from);
+  const [filedTo, setFiledTo] = useState(initialFiled.to);
   const [confirmReview, setConfirmReview] = useState(false);
   const [askFiling, setAskFiling] = useState<{
     accession: string;
