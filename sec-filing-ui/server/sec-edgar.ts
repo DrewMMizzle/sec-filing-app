@@ -12,6 +12,31 @@
 
 const SEC_USER_AGENT = process.env.SEC_USER_AGENT || "DotAdda ameister@dotadda.com";
 
+// Per-request wall-clock cap for SEC calls. Without it a slow/stalled SEC
+// endpoint would hang the Express request indefinitely (no default fetch
+// timeout in Node/undici), which shows up as the app "freezing" on
+// registration search/render. 20s is generous for these small JSON payloads.
+const SEC_FETCH_TIMEOUT_MS = 20_000;
+
+async function secFetch(url: string): Promise<Response | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), SEC_FETCH_TIMEOUT_MS);
+  try {
+    return await fetch(url, {
+      headers: { "User-Agent": SEC_USER_AGENT },
+      signal: controller.signal,
+    });
+  } catch (err) {
+    // Timeout (AbortError) or network failure — treat as "no data" so callers
+    // fall back to their empty/null result instead of throwing. The registration
+    // flow already handles a null/!ok response gracefully.
+    console.warn(`[sec-edgar] fetch failed for ${url}: ${(err as Error)?.message ?? err}`);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export type EdgarCompany = {
   cik: string;
   name: string;
@@ -49,8 +74,8 @@ export async function lookupCikSubmissions(
   const padded = paddedCik(cik);
   if (!padded) return null;
   const url = `https://data.sec.gov/submissions/CIK${padded}.json`;
-  const res = await fetch(url, { headers: { "User-Agent": SEC_USER_AGENT } });
-  if (!res.ok) return null;
+  const res = await secFetch(url);
+  if (!res || !res.ok) return null;
   const data = (await res.json()) as { name?: string; entityName?: string; tickers?: unknown };
   const name = (data.name || data.entityName || "").trim();
   const tickers = Array.isArray(data.tickers)
@@ -99,8 +124,8 @@ export async function searchEdgarByName(q: string): Promise<EdgarCompany[]> {
   const query = q.trim();
   if (!query) return [];
   const url = `https://efts.sec.gov/LATEST/search-index?q=${encodeURIComponent(query)}&forms=`;
-  const res = await fetch(url, { headers: { "User-Agent": SEC_USER_AGENT } });
-  if (!res.ok) return [];
+  const res = await secFetch(url);
+  if (!res || !res.ok) return [];
   const data = await res.json();
   return parseEdgarSearchHits(data, { limit: 10 });
 }
@@ -118,8 +143,8 @@ export async function searchRegistrationFilingsByContent(q: string): Promise<Edg
   const url =
     `https://efts.sec.gov/LATEST/search-index?q=${encodeURIComponent(query)}` +
     `&forms=${encodeURIComponent(forms)}`;
-  const res = await fetch(url, { headers: { "User-Agent": SEC_USER_AGENT } });
-  if (!res.ok) return [];
+  const res = await secFetch(url);
+  if (!res || !res.ok) return [];
   const data = await res.json();
   return parseEdgarSearchHits(data, { limit: 10, hint: true });
 }
@@ -130,8 +155,8 @@ export async function listRegistrationFilings(cik: string): Promise<Registration
   const padded = paddedCik(cik);
   if (!padded) return [];
   const url = `https://data.sec.gov/submissions/CIK${padded}.json`;
-  const res = await fetch(url, { headers: { "User-Agent": SEC_USER_AGENT } });
-  if (!res.ok) return [];
+  const res = await secFetch(url);
+  if (!res || !res.ok) return [];
   const data = (await res.json()) as {
     filings?: { recent?: Record<string, unknown[]> };
   };
