@@ -134,7 +134,16 @@ export default function Registration() {
       return res.json();
     },
     onSuccess: (data) => {
-      queryClient.invalidateQueries({ queryKey: ["/api/filings?slim=true"] });
+      // Invalidate every /api/filings* consumer — the PDF Library's paginated
+      // "/api/filings/page" and "/api/filings/stats" as well as the plain
+      // "/api/filings" list — so a freshly-rendered registration filing shows
+      // up everywhere, not just on the Findings list. (Same predicate the
+      // library delete path uses.)
+      queryClient.invalidateQueries({
+        predicate: (query) =>
+          typeof query.queryKey[0] === "string" &&
+          (query.queryKey[0] as string).startsWith("/api/filings"),
+      });
       // Refresh the registration listing so the just-rendered filing's
       // dbStatus flips to "complete" and the Review button appears.
       if (picked) {
