@@ -643,8 +643,8 @@ export default function Registration() {
               window) and produce a changelog of added / removed / changed material between
               the earlier and later filing. Very long filings (&gt;1.5M chars each) still get
               front / middle / back sampled. Estimated cost:{" "}
-              <span className="text-foreground font-medium">{COMPARE_COST_ESTIMATE}</span>. The
-              spend is charged against the team-wide review cap.
+              <span className="text-foreground font-medium">{COMPARE_COST_ESTIMATE}</span>. This
+              comparison is billed separately and is not governed by the team-wide review spend cap.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
