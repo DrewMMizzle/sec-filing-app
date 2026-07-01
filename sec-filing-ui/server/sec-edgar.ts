@@ -25,7 +25,7 @@ export type EdgarCompany = {
 // Registration statements the lane supports: S-1 (IPO) and Form 10
 // (10-12B / 10-12G — used for spin-offs), plus their "/A" amendments. EDGAR
 // codes Form 10 as "10-12B"/"10-12G", never literally "Form 10" or "10".
-const REGISTRATION_FORMS = new Set([
+export const REGISTRATION_FORMS = new Set([
   "S-1",
   "S-1/A",
   "10-12B",
