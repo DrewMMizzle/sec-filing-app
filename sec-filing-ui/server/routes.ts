@@ -16,6 +16,7 @@ import {
   searchRegistrationFilingsByContent,
   listRegistrationFilings,
   nameToLabel,
+  REGISTRATION_FORMS,
   type EdgarCompany,
 } from "./sec-edgar";
 import { analyzeMdna, isMdnaEligible } from "./mdna";
@@ -1782,6 +1783,28 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
           "Both filings need to be in 'complete' status before comparison. Render the missing one first.",
         statusA: fa.status,
         statusB: fb.status,
+      });
+    }
+
+    // Guard the inputs: the whole-PDF compare prompt assumes two related
+    // registration statements from the SAME company (an S-1 vs its S-1/A, or a
+    // Form 10 vs its amendment). The UI only ever offers valid pairs, but a
+    // direct API caller could pass two unrelated complete filings — burning
+    // Opus spend on a nonsensical diff. Enforce both here.
+    if (!REGISTRATION_FORMS.has(fa.filingType) || !REGISTRATION_FORMS.has(fb.filingType)) {
+      return res.status(400).json({
+        error:
+          "Both filings must be registration statements (S-1 / S-1/A or Form 10 10-12B / 10-12G + amendments) to compare here.",
+        formA: fa.filingType,
+        formB: fb.filingType,
+      });
+    }
+    // Same company: CIK is stored on every filing (notNull). Normalize away
+    // padding/formatting so "0001234567" and "1234567" match.
+    const cikKey = (c: string) => (c || "").replace(/\D/g, "").replace(/^0+/, "");
+    if (cikKey(fa.cik) !== cikKey(fb.cik)) {
+      return res.status(400).json({
+        error: "Pick two registration filings from the same company.",
       });
     }
 
