@@ -556,6 +556,56 @@ export class DatabaseStorage {
     };
   }
 
+  // Lean listing for the MD&A tab. Filters to complete 10-K / 10-Q filings in
+  // SQL (mirroring isMdnaEligible: form starts with 10-K or 10-Q) and selects
+  // only the MD&A-relevant columns — no reviewFindings / filingDigest text — so
+  // the route doesn't hydrate the entire complete-filings corpus just to filter
+  // it down in JS.
+  async getMdnaListing(): Promise<
+    Array<{
+      accessionNumber: string;
+      ticker: string;
+      filingType: string;
+      filingDate: string | null;
+      mdnaStatus: string | null;
+      mdnaAnalyzedAt: string | null;
+      mdnaError: string | null;
+      mdnaDigest: string | null;
+      mdnaInputTokens: number | null;
+      mdnaOutputTokens: number | null;
+      mdnaCacheReadTokens: number | null;
+      mdnaCacheCreationTokens: number | null;
+    }>
+  > {
+    const rows = await db
+      .select({
+        accessionNumber: filings.accessionNumber,
+        ticker: filings.ticker,
+        filingType: filings.filingType,
+        filingDate: filings.filingDate,
+        mdnaStatus: filings.mdnaStatus,
+        mdnaAnalyzedAt: filings.mdnaAnalyzedAt,
+        mdnaError: filings.mdnaError,
+        mdnaDigest: filings.mdnaDigest,
+        mdnaInputTokens: filings.mdnaInputTokens,
+        mdnaOutputTokens: filings.mdnaOutputTokens,
+        mdnaCacheReadTokens: filings.mdnaCacheReadTokens,
+        mdnaCacheCreationTokens: filings.mdnaCacheCreationTokens,
+      })
+      .from(filings)
+      .where(
+        and(
+          eq(filings.status, "complete"),
+          or(
+            sql`UPPER(${filings.filingType}) LIKE '10-K%'`,
+            sql`UPPER(${filings.filingType}) LIKE '10-Q%'`,
+          ),
+        ),
+      );
+    // Newest first (same order the old getFilings-based listing produced).
+    return rows.sort((a, b) => (b.filingDate || "").localeCompare(a.filingDate || ""));
+  }
+
   // ─── App settings (key/value) ───────────────────────────
 
   async getSetting(key: string): Promise<string | null> {

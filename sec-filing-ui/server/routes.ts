@@ -992,7 +992,10 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     const userId = req.user!.id;
     const TICKER_CAP = 20;
 
-    const complete = await storage.getFilings({ status: "complete" });
+    // slim: this route only needs metadata (ticker/cik/form/date/pdfPath/
+    // accession) to decide what to re-render — never the heavy review-findings /
+    // digest text. Stripping those keeps the whole complete-filings scan light.
+    const complete = await storage.getFilings({ status: "complete", slim: true });
     const missing = complete.filter((f) => !pdfExistsOnDisk(f.pdfPath));
     if (missing.length === 0) {
       return res.json({ rerendered: 0, missingTotal: 0, tickersRemaining: 0 });
@@ -1358,7 +1361,11 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
 
   // List every rendered 10-K/10-Q with its MD&A digest state, for the MD&A tab.
   app.get("/api/mdna", requireAuth, async (_req, res) => {
-    const filings = await storage.getFilings({ status: "complete" });
+    // Lean, SQL-filtered listing — only complete 10-K/10-Q rows with the MD&A
+    // columns, instead of loading every complete filing (heavy review text and
+    // all) and filtering in JS. isMdnaEligible stays as a guard against any
+    // drift between it and the SQL form filter.
+    const filings = await storage.getMdnaListing();
     const items = filings
       .filter((f) => isMdnaEligible(f.filingType))
       .map((f) => ({
