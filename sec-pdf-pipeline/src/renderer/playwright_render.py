@@ -58,7 +58,7 @@ PDF_TIMEOUT_MS = 5 * 60 * 1000  # 5 minutes.
 # Hard wall-clock cap on the whole render. Sits outside the per-step
 # timeouts to catch wedges in the unbounded Playwright calls
 # (new_page / route / emulate_media / close): if Chromium hangs there,
-# the per-step timeouts inside set_content / page.pdf never get a chance
+# the per-step timeouts inside page.goto / page.pdf never get a chance
 # to fire and the worker silently sits until Railway kills the container.
 # The outer wait_for converts that into a regular exception the retry
 # loop can record.
