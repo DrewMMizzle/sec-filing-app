@@ -165,8 +165,9 @@ async def render_filing(filing_info: dict) -> dict:
 
     Every form — 10-K, 10-Q, 8-K, DEF 14A, S-1, S-1/A — goes through the
     same path: preprocess in Python (httpx fetches the HTML using the
-    rate-limited SEC client, images are inlined as base64) → push the
-    cleaned HTML into Chromium with set_content → page.pdf().
+    rate-limited SEC client, images are inlined as base64) → write the
+    cleaned HTML to a temp file and load it into Chromium via file://
+    navigation (external requests blocked) → page.pdf().
 
     Crucially, Chromium itself never makes outbound SEC requests during
     rendering. SEC's anti-automation detection blocks Chromium's browser

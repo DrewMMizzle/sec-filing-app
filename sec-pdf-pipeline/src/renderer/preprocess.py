@@ -4,7 +4,9 @@ SEC filings use Inline XBRL (iXBRL) tags (``ix:`` namespace) to embed
 structured data within HTML.  These tags must be stripped before rendering
 to avoid visual artefacts in the PDF.  Relative URLs are rewritten to
 absolute URLs and images are embedded as base64 data URIs so they render
-correctly when loaded via ``set_content()`` in headless Chromium.
+correctly when Chromium loads the cleaned HTML offline — the render step
+writes it to a temporary local file and loads it via ``file://`` navigation
+with external requests blocked.
 """
 
 from __future__ import annotations
@@ -118,9 +120,10 @@ IMAGE_FETCH_CONCURRENCY = 4
 async def embed_images_as_base64(html: str, base_url: str) -> str:
     """Download all ``<img>`` sources and embed them as base64 data URIs.
 
-    This is necessary because ``page.set_content()`` in Playwright does
-    not have access to the SEC.gov origin, so external image URLs would
-    appear as broken images in the rendered PDF.
+    This is necessary because Chromium renders the cleaned HTML offline
+    (loaded from a local ``file://`` temp file with external requests
+    blocked), so any image URL still pointing at SEC.gov would appear as a
+    broken image in the rendered PDF.
 
     Downloads run concurrently — the global SEC token-bucket limiter
     (10 req/s) still throttles the actual outbound traffic, so we get
