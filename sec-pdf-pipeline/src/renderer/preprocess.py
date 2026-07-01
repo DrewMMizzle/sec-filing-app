@@ -109,6 +109,12 @@ def fix_image_references(html: str, base_url: str) -> str:
     return str(soup)
 
 
+# Max image downloads in flight at once. Caps how many raw image response
+# bodies are resident in memory simultaneously while embedding — an
+# image-heavy S-1 can reference hundreds of inline charts/signatures.
+IMAGE_FETCH_CONCURRENCY = 4
+
+
 async def embed_images_as_base64(html: str, base_url: str) -> str:
     """Download all ``<img>`` sources and embed them as base64 data URIs.
 
@@ -141,28 +147,32 @@ async def embed_images_as_base64(html: str, base_url: str) -> str:
             src = urljoin(base_url, src)
         work.append((img, src))
 
-    async def fetch_one(src: str) -> tuple[str, bytes] | None:
-        try:
-            resp = await sec_get(src)
-            content_type = resp.headers.get("content-type", "").split(";")[0].strip()
-            if not content_type:
-                content_type = mimetypes.guess_type(src)[0] or "image/png"
-            return content_type, resp.content
-        except Exception as exc:
-            logger.warning("Failed to embed image %s: %s", src, exc)
-            return None
+    # Bound how many downloads are in flight so only ~IMAGE_FETCH_CONCURRENCY
+    # raw image bodies are resident at once. The SEC token bucket already
+    # serializes actual requests to 10/s, but without this every <img> on a
+    # 500-image S-1 would have its raw bytes held in memory until gather()
+    # completed. Encoding to base64 and assigning the data URI inside the task
+    # lets each raw body be freed right after use.
+    sem = asyncio.Semaphore(IMAGE_FETCH_CONCURRENCY)
 
-    # Fan all image fetches out at once; the token bucket serializes the
-    # actual SEC requests to 10/s. One bad image warns and continues —
-    # the rest of the filing isn't held hostage by a single 404.
-    results = await asyncio.gather(*(fetch_one(src) for _, src in work))
-    for (img, src), result in zip(work, results):
-        if result is None:
-            continue
-        content_type, content = result
+    async def embed_one(img: Tag, src: str) -> None:
+        async with sem:
+            try:
+                resp = await sec_get(src)
+                content = resp.content
+                content_type = resp.headers.get("content-type", "").split(";")[0].strip()
+            except Exception as exc:
+                # One bad image warns and continues — the rest of the filing
+                # isn't held hostage by a single 404.
+                logger.warning("Failed to embed image %s: %s", src, exc)
+                return
+        if not content_type:
+            content_type = mimetypes.guess_type(src)[0] or "image/png"
         b64 = base64.b64encode(content).decode("ascii")
         img["src"] = f"data:{content_type};base64,{b64}"
         logger.debug("Embedded image: %s (%d bytes)", src, len(content))
+
+    await asyncio.gather(*(embed_one(img, src) for img, src in work))
 
     return str(soup)
 
