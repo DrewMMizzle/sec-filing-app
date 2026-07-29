@@ -147,10 +147,6 @@ export default function Compare() {
         dateFrom: historyStartDate(),
         limitPerTicker: HISTORY_LIMIT,
       });
-      if (!res.ok) {
-        const body = await res.json();
-        throw new Error(body.error || "Failed to load history");
-      }
       return res.json();
     },
     onSuccess: (data: any) => {
@@ -179,10 +175,6 @@ export default function Compare() {
           // and re-call Claude (and re-spend) for this pair + section.
           refresh: !!opts.refresh,
         });
-        if (!res.ok) {
-          const body = await res.json();
-          throw new Error(body.error || "Comparison failed");
-        }
         const data: CompareResult = await res.json();
         setResults((prev) => [...prev, data]);
       } catch (e: any) {

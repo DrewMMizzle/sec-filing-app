@@ -26,23 +26,74 @@ function candidates(quote: string): string[] {
   return out;
 }
 
-// Return the 1-indexed page number containing the quote, or null if not found.
-export async function findPageForQuote(absPath: string, quote: string): Promise<number | null> {
-  if (!quote || !quote.trim()) return null;
-  const buffer = fs.readFileSync(absPath);
+type PageText = { num: number; text: string };
+
+// Extracting text from a rendered filing is expensive — a 500-page S-1 takes
+// seconds and, when read synchronously, pins the event loop for every other
+// request. Citation deep-links hit the SAME document repeatedly (once per
+// quote the reader clicks), so the extraction is cached and the pages are
+// normalized once at extraction time instead of on every lookup.
+//
+// Entries hold whole documents' text, so the cache is deliberately small.
+// Keyed on path + mtime + size, so a re-render invalidates the old entry
+// rather than serving page numbers from stale text.
+const MAX_CACHED_DOCS = 4;
+
+// Stores the in-flight promise, not the resolved value, so two concurrent
+// citation clicks on the same uncached PDF share one extraction instead of
+// both paying for it.
+const cache = new Map<string, Promise<PageText[]>>();
+
+async function extractPages(absPath: string): Promise<PageText[]> {
+  const buffer = await fs.promises.readFile(absPath);
   const parser = new PDFParse({ data: buffer });
   try {
     const result = await parser.getText();
-    const pages = result.pages ?? [];
-    if (pages.length === 0) return null;
-    const queries = candidates(quote);
-    for (const q of queries) {
-      for (const p of pages) {
-        if (normalize(p.text).includes(q)) return p.num;
-      }
-    }
-    return null;
+    return (result.pages ?? []).map((p) => ({ num: p.num, text: normalize(p.text) }));
   } finally {
     await parser.destroy();
   }
+}
+
+async function getNormalizedPages(absPath: string): Promise<PageText[]> {
+  const stat = await fs.promises.stat(absPath);
+  const key = `${absPath}:${stat.mtimeMs}:${stat.size}`;
+
+  const hit = cache.get(key);
+  if (hit) {
+    // Refresh LRU position so a hot document isn't evicted by a one-off.
+    cache.delete(key);
+    cache.set(key, hit);
+    return hit;
+  }
+
+  const pending = extractPages(absPath);
+  cache.set(key, pending);
+  // A failed extraction must not be cached, or every later lookup for this
+  // file replays the same rejection.
+  pending.catch(() => cache.delete(key));
+
+  for (const oldest of Array.from(cache.keys())) {
+    if (cache.size <= MAX_CACHED_DOCS) break;
+    cache.delete(oldest);
+  }
+
+  return pending;
+}
+
+// Return the 1-indexed page number containing the quote, or null if not found.
+export async function findPageForQuote(absPath: string, quote: string): Promise<number | null> {
+  if (!quote || !quote.trim()) return null;
+  const queries = candidates(quote);
+  if (queries.length === 0) return null;
+
+  const pages = await getNormalizedPages(absPath);
+  if (pages.length === 0) return null;
+
+  for (const q of queries) {
+    for (const p of pages) {
+      if (p.text.includes(q)) return p.num;
+    }
+  }
+  return null;
 }

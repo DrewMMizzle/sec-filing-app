@@ -96,7 +96,6 @@ export default function Registration() {
   const search = useMutation<EdgarCompany[], Error, string>({
     mutationFn: async (q) => {
       const res = await apiRequest("GET", `/api/registration/search?q=${encodeURIComponent(q)}`);
-      if (!res.ok) throw new Error((await res.json()).error || "Search failed");
       return res.json();
     },
     onSuccess: (data) => {
@@ -111,7 +110,6 @@ export default function Registration() {
     queryFn: async () => {
       if (!picked) return [];
       const res = await apiRequest("GET", `/api/registration/filings?cik=${encodeURIComponent(picked.cik)}`);
-      if (!res.ok) throw new Error((await res.json()).error || "Failed to load filings");
       return res.json();
     },
     enabled: !!picked,
@@ -127,10 +125,6 @@ export default function Registration() {
         ticker: picked.ticker,
         accessions,
       });
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        throw new Error(body.error || "Render failed");
-      }
       return res.json();
     },
     onSuccess: (data) => {
@@ -176,10 +170,6 @@ export default function Registration() {
         // and re-call Claude (and re-spend) for this pair.
         refresh: !!refresh,
       });
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        throw new Error(body.error || "Comparison failed");
-      }
       return res.json();
     },
     onSuccess: (data) => {
@@ -197,7 +187,6 @@ export default function Registration() {
   const review = useMutation<{ ok: boolean }, Error, string>({
     mutationFn: async (accession) => {
       const res = await apiRequest("POST", `/api/filings/${encodeURIComponent(accession)}/review`, {});
-      if (!res.ok) throw new Error((await res.json()).error || "Review failed");
       return res.json();
     },
     onSuccess: () => {

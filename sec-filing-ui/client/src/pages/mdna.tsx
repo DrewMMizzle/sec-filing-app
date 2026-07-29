@@ -150,10 +150,6 @@ export default function Mdna() {
   const generate = useMutation<GenerateResponse, Error, string>({
     mutationFn: async (accession) => {
       const res = await apiRequest("POST", `/api/filings/${encodeURIComponent(accession)}/mdna`, {});
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        throw new Error(body.error || "MD&A analysis failed");
-      }
       return res.json();
     },
     onSuccess: (_data, accession) => {

@@ -77,10 +77,6 @@ export function FilingChatDialog({ open, onOpenChange, accession, ticker, form, 
         `/api/filings/${encodeURIComponent(accession)}/ask`,
         { messages, deep },
       );
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        throw new Error(body.error || "Chat failed");
-      }
       return res.json();
     },
     onSuccess: (data, messages) => {

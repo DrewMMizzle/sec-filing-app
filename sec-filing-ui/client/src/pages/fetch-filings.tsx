@@ -71,7 +71,6 @@ type WatchlistSummary = {
 };
 
 type FetchResult = {
-  success: boolean;
   // App-available count: PDFs that were rasterized by Python AND copied
   // into PDF_STORAGE_DIR AND marked complete in the DB.
   totalRendered: number;
@@ -83,8 +82,25 @@ type FetchResult = {
   // directory). When this exceeds totalRendered, the gap is the number
   // of filings whose copy into app storage failed.
   pipelineRendered?: number;
-  events: any[];
+  // Set when the run ended because the user canceled it — the cancel button
+  // owns that toast, so the fetch flow stays quiet rather than also reporting
+  // a misleading "0 rendered" completion.
+  canceled?: boolean;
 };
+
+// Shape of GET /api/filings/fetch/status.
+type FetchRunStatus = {
+  runId: string;
+  status: "running" | "done" | "error" | "canceled";
+  result: FetchResult | null;
+  error: string | null;
+};
+
+// How often to poll a background run, and how many consecutive poll failures
+// to absorb before giving up. The run itself is server-side and survives a
+// blip, so a transient network error should not abandon a healthy run.
+const RUN_POLL_MS = 3000;
+const RUN_POLL_MAX_CONSECUTIVE_FAILURES = 5;
 
 export default function FetchFilings() {
   const { toast } = useToast();
@@ -184,10 +200,6 @@ export default function FetchFilings() {
   const budgetMutation = useMutation<{ budgetUsd: number | null }, Error, number | null>({
     mutationFn: async (budgetUsd) => {
       const res = await apiRequest("POST", "/api/review/budget", { budgetUsd });
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        throw new Error(body.error || "Failed to update spend cap");
-      }
       return res.json();
     },
     onSuccess: (data) => {
@@ -319,18 +331,47 @@ export default function FetchFilings() {
   type FetchPayloadTicker = { ticker: string; cik: string; filing_types: string[] };
   const fetchMutation = useMutation<FetchResult, Error, FetchPayloadTicker[]>({
     mutationFn: async (tickersToFetch) => {
-      const res = await apiRequest("POST", "/api/filings/fetch", {
+      // The server accepts the run and responds immediately; the pipeline keeps
+      // going in the background. We poll for the outcome instead of holding one
+      // request open for the whole run — a multi-ticker fetch runs for minutes,
+      // longer than the deployment proxy keeps a connection alive, so the old
+      // blocking call surfaced successful runs to the user as network errors.
+      const startRes = await apiRequest("POST", "/api/filings/fetch", {
         tickers: tickersToFetch,
         dateFrom: dateFrom || undefined,
         dateTo: dateTo || undefined,
         limitPerTicker,
       });
+      const { runId } = (await startRes.json()) as { runId: string };
 
-      if (!res.ok) {
-        const body = await res.json();
-        throw new Error(body.error || "Fetch failed");
+      let consecutiveFailures = 0;
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        await new Promise((resolve) => setTimeout(resolve, RUN_POLL_MS));
+
+        let run: FetchRunStatus;
+        try {
+          const statusRes = await apiRequest(
+            "GET",
+            `/api/filings/fetch/status?runId=${encodeURIComponent(runId)}`,
+          );
+          run = (await statusRes.json()) as FetchRunStatus;
+          consecutiveFailures = 0;
+        } catch (err) {
+          // Absorb transient poll failures — the run is server-side and is
+          // unaffected by a dropped poll.
+          consecutiveFailures += 1;
+          if (consecutiveFailures >= RUN_POLL_MAX_CONSECUTIVE_FAILURES) throw err;
+          continue;
+        }
+
+        if (run.status === "running") continue;
+        if (run.status === "canceled") {
+          return { totalRendered: 0, totalSkipped: 0, totalErrors: 0, canceled: true };
+        }
+        if (run.status === "error") throw new Error(run.error || "Fetch failed");
+        return run.result ?? { totalRendered: 0, totalSkipped: 0, totalErrors: 0 };
       }
-      return res.json();
     },
     onMutate: () => {
       setFetchInFlight(true);
@@ -340,6 +381,8 @@ export default function FetchFilings() {
       queryClient.invalidateQueries({ queryKey: ["/api/review/usage"] });
     },
     onSuccess: (data) => {
+      // The cancel button already reports what it stopped — don't double-toast.
+      if (data.canceled) return;
       const parts: string[] = [];
       if (data.totalRendered > 0) parts.push(`${data.totalRendered} new PDF(s) rendered`);
       if (data.totalSkipped > 0) parts.push(`${data.totalSkipped} already in library`);
@@ -371,10 +414,6 @@ export default function FetchFilings() {
   >({
     mutationFn: async () => {
       const res = await apiRequest("POST", "/api/run/cancel", {});
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        throw new Error(body.error || "Cancel failed");
-      }
       return res.json();
     },
     onSuccess: (data) => {
@@ -397,10 +436,6 @@ export default function FetchFilings() {
   const retryReviewMutation = useMutation({
     mutationFn: async (accession: string) => {
       const res = await apiRequest("POST", `/api/filings/${encodeURIComponent(accession)}/review`);
-      if (!res.ok) {
-        const body = await res.json();
-        throw new Error(body.error || "Retry failed");
-      }
       return res.json();
     },
     onSuccess: () => {
@@ -414,10 +449,6 @@ export default function FetchFilings() {
   const renderMissingMutation = useMutation<{ rerendered: number; missingTotal: number; tickersRemaining: number }>({
     mutationFn: async () => {
       const res = await apiRequest("POST", "/api/filings/render-missing");
-      if (!res.ok) {
-        const body = await res.json();
-        throw new Error(body.error || "Re-render failed");
-      }
       return res.json();
     },
     onSuccess: (data) => {
@@ -498,10 +529,6 @@ export default function FetchFilings() {
   >({
     mutationFn: async (symbols) => {
       const res = await apiRequest("POST", "/api/resolve-tickers", { tickers: symbols });
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        throw new Error(body.error || "Couldn't resolve tickers");
-      }
       return res.json();
     },
     onSuccess: ({ resolved, unresolved }) => {
@@ -535,10 +562,6 @@ export default function FetchFilings() {
   >({
     mutationFn: async ({ watchlistId, tickers }) => {
       const res = await apiRequest("POST", `/api/watchlists/${watchlistId}/tickers/bulk`, { tickers });
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        throw new Error(body.error || "Failed to add tickers to watchlist");
-      }
       return res.json();
     },
     onSuccess: ({ added, skipped }) => {

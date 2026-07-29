@@ -173,10 +173,6 @@ export default function Ask() {
   const askMutation = useMutation<ChatResponse, Error, Turn[]>({
     mutationFn: async (messages) => {
       const res = await apiRequest("POST", "/api/findings/chat", { messages });
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        throw new Error(body.error || "Chat failed");
-      }
       return res.json();
     },
     onSuccess: (data, messages) => {
