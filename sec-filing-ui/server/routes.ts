@@ -184,6 +184,120 @@ function pdfExistsOnDisk(pdfPath: string | null | undefined): boolean {
   return fs.existsSync(appPath) || fs.existsSync(pipelinePath);
 }
 
+// Start a fetch/render run in the background and hand back the run record, or
+// null if the single run slot is already taken.
+//
+// Shared by the HTTP fetch route and the nightly scheduler so both go through
+// exactly one code path — the dedup, the slot, the stale-render recovery and
+// the review queueing all behave identically whether a person clicked Fetch or
+// the clock fired.
+export async function startFetchRun(opts: {
+  kind: RunKind;
+  userId: number;
+  tickerList: Array<{ ticker: string; cik: string; filing_types: string[] }>;
+  dateFrom?: string | null;
+  dateTo?: string | null;
+  limitPerTicker?: number;
+  // Whether to also queue every already-rendered-but-never-reviewed filing for
+  // these tickers. True for a human clicking Fetch ("catch me up"). FALSE for
+  // the scheduler: on its first run that would queue the entire back catalogue
+  // for review in one go and spend the shared cap on a decade of old filings.
+  // Newly-rendered filings are queued incrementally as each PDF lands either
+  // way, so the scheduler still reviews everything genuinely new.
+  queueBacklogReview: boolean;
+}): Promise<PipelineRun | null> {
+  const { kind, userId, tickerList, dateFrom, dateTo, limitPerTicker } = opts;
+
+  // ── Dedup: skip filings already complete AND whose PDF still exists on disk.
+  // (A redeploy can wipe ephemeral PDF storage while the DB row persists, so a
+  // status check alone would wrongly skip filings that need re-rendering.) ──
+  const tickerNames = tickerList.map((t) => t.ticker);
+  const completeRows = await storage.getCompleteFilings(tickerNames);
+  const alreadyComplete = new Set(
+    completeRows.filter((r) => pdfExistsOnDisk(r.pdfPath)).map((r) => r.accessionNumber),
+  );
+
+  const input = JSON.stringify({
+    tickers: tickerList,
+    date_from: dateFrom || null,
+    date_to: dateTo || null,
+    limit_per_ticker: limitPerTicker || 10,
+    skip_accessions: Array.from(alreadyComplete),
+  });
+
+  const cikByTicker = new Map(tickerList.map((t) => [t.ticker, t.cik]));
+
+  const run = beginRun(kind, userId);
+  if (!run) return null;
+
+  void (async () => {
+    try {
+      const result = await runFetchPipeline(input, { userId, cikByTicker });
+      if (!result.success) {
+        endRun(run, { status: "error", error: result.error || "Pipeline process failed" });
+      } else {
+        // Report what's actually available in app storage, not what Python
+        // rasterized — those diverge when Python's render succeeded but the
+        // Node-side copy into PDF_STORAGE_DIR failed (the per-filing task in
+        // runFetchPipeline marks the filing as `error` in that case and
+        // refuses to push the accession into completedAccessions). Using
+        // result.completedAccessions.length here keeps the UI's "N PDFs
+        // rendered" toast honest. totalErrors absorbs the persistence
+        // failures so the user sees an accurate error count too.
+        // pipelineRendered is exposed separately for observability and to
+        // make the gap discoverable from the API response.
+        const pipelineRendered = Number(result.doneEvent?.total_rendered ?? 0);
+        const persisted = result.completedAccessions.length;
+        const persistenceFailures = Math.max(0, pipelineRendered - persisted);
+        const pipelineErrors = Number(result.doneEvent?.total_errors ?? 0);
+        endRun(run, {
+          status: "done",
+          result: {
+            totalRendered: persisted,
+            totalSkipped: Number(result.doneEvent?.total_skipped ?? 0),
+            totalErrors: pipelineErrors + persistenceFailures,
+            pipelineRendered,
+          },
+        });
+      }
+    } catch (err: any) {
+      console.error("Fetch run failed:", err);
+      endRun(run, { status: "error", error: err?.message || "Fetch run failed" });
+    }
+
+    // Clear any rows the pipeline left at 'rendering' (e.g. it was stalled and
+    // killed) for these tickers so they don't spin forever.
+    await storage
+      .recoverStaleRenders({ tickerList: tickerNames })
+      .catch((err) => console.error("Stale-render recovery failed:", err));
+
+    if (opts.queueBacklogReview && isReviewEnabled()) {
+      storage
+        .markCompleteFilingsForReviewByTickers(tickerNames)
+        .then(() => kickReviewProcessor())
+        .catch((err) => console.error("Review processor failed:", err));
+    } else if (isReviewEnabled()) {
+      // Newly-rendered filings were already queued as each PDF landed; just
+      // make sure the processor is awake to pick them up.
+      kickReviewProcessor();
+    }
+  })();
+
+  return run;
+}
+
+// Remove the pipeline's rendered-PDF scratch tree. Safe to call at any time:
+// the only thing under it is output already copied into PDF_STORAGE_DIR, or
+// stranded partial output from a run that died.
+async function sweepPipelineOutput(): Promise<void> {
+  const outputDir = path.join(PIPELINE_ROOT, "output", "filings");
+  try {
+    await fs.promises.rm(outputDir, { recursive: true, force: true });
+  } catch (err) {
+    console.warn("[sweep] Could not clear pipeline output dir:", err);
+  }
+}
+
 type PipelineResult = {
   success: boolean;
   events: any[];
@@ -233,6 +347,32 @@ function runFetchPipeline(
     // task before resolving — otherwise a fast filing's copy could still
     // be in flight when the route claims success.
     const persistenceTasks: Promise<void>[] = [];
+
+    // DB writes for a single accession must land in the order the pipeline
+    // emitted them. The `rendering` upsert and the `complete` status update
+    // are both async, and nothing ordered them relative to each other — so
+    // when the two events arrive close together (a cached or very fast
+    // render) the upsert could land AFTER the completion and overwrite it,
+    // leaving the row stuck at 'rendering' with its PDF already copied into
+    // app storage. The filing then looks un-rendered, is never reviewed, and
+    // only the 15-minute stale sweep eventually flips it to 'error' so the
+    // work has to be redone. Chaining per accession makes the order the
+    // pipeline intended the order the database sees.
+    const writeChains = new Map<string, Promise<unknown>>();
+    function chainWrite(accession: string, fn: () => Promise<unknown>): Promise<void> {
+      const prev = writeChains.get(accession) ?? Promise.resolve();
+      // Run `fn` whether or not the previous write succeeded — one failed
+      // write shouldn't strand every later write for that accession.
+      const next = prev.then(fn, fn);
+      writeChains.set(accession, next);
+      return next.then(
+        () => undefined,
+        (err) => {
+          console.error(`Filing write failed for ${accession}:`, err);
+        },
+      );
+    }
+
     let stderrOutput = "";
     let settled = false;
 
@@ -266,18 +406,20 @@ function runFetchPipeline(
           const event = JSON.parse(line);
           events.push(event);
           if (event.event === "rendering") {
-            storage
-              .upsertFiling({
-                ticker: event.ticker,
-                cik: ctx.cikByTicker.get(event.ticker) || "",
-                accessionNumber: event.accession,
-                filingType: event.filing_type,
-                filingDate: event.filing_date || null,
-                status: "rendering",
-                createdAt: new Date().toISOString(),
-                userId: ctx.userId,
-              })
-              .catch((err) => console.error("Failed to upsert filing:", err));
+            persistenceTasks.push(
+              chainWrite(event.accession, () =>
+                storage.upsertFiling({
+                  ticker: event.ticker,
+                  cik: ctx.cikByTicker.get(event.ticker) || "",
+                  accessionNumber: event.accession,
+                  filingType: event.filing_type,
+                  filingDate: event.filing_date || null,
+                  status: "rendering",
+                  createdAt: new Date().toISOString(),
+                  userId: ctx.userId,
+                }),
+              ),
+            );
             // Re-render means the underlying PDF text may differ from
             // whatever a cached compare or digest was based on. Drop both for
             // this accession so the next compare / chat regenerates against
@@ -314,10 +456,18 @@ function runFetchPipeline(
               try {
                 await fs.promises.mkdir(destDir, { recursive: true });
                 await fs.promises.copyFile(pipelinePdf, destFile);
+                // The pipeline's copy under output/ has done its job the
+                // moment the file lands in app storage. Nothing reads it
+                // again and nothing else cleans it up, so without this every
+                // render leaks a PDF onto the container's ephemeral disk —
+                // invisible until a long run fills it. Best-effort: a failed
+                // unlink isn't worth failing the filing over. On copy failure
+                // we deliberately leave the file behind for diagnosis.
+                fs.promises.unlink(pipelinePdf).catch(() => {});
               } catch (copyErr) {
                 console.error(`Failed to copy PDF to app storage: ${copyErr}`);
-                try {
-                  await storage.updateFilingStatus(
+                await chainWrite(accession, () =>
+                  storage.updateFilingStatus(
                     accession,
                     "error",
                     undefined,
@@ -325,18 +475,13 @@ function runFetchPipeline(
                     `Failed to copy rendered PDF into app storage: ${
                       copyErr instanceof Error ? copyErr.message : String(copyErr)
                     }`,
-                  );
-                } catch (err) {
-                  console.error("Failed to record copy failure:", err);
-                }
+                  ),
+                );
                 return;
               }
               try {
-                await storage.updateFilingStatus(
-                  accession,
-                  "complete",
-                  appRelPath,
-                  size,
+                await chainWrite(accession, () =>
+                  storage.updateFilingStatus(accession, "complete", appRelPath, size),
                 );
                 completedAccessions.push(accession);
                 if (isReviewEnabled() && !ctx.skipAutoReview) {
@@ -357,9 +502,19 @@ function runFetchPipeline(
             })();
             persistenceTasks.push(task);
           } else if (event.event === "error" && event.accession) {
-            storage
-              .updateFilingStatus(event.accession, "error", undefined, undefined, event.message)
-              .catch((err) => console.error("Failed to update filing error:", err));
+            // Same chain as the other two: an error verdict must not be
+            // overtaken by the earlier `rendering` upsert.
+            persistenceTasks.push(
+              chainWrite(event.accession, () =>
+                storage.updateFilingStatus(
+                  event.accession,
+                  "error",
+                  undefined,
+                  undefined,
+                  event.message,
+                ),
+              ),
+            );
           }
         } catch {
           // non-JSON line from Python logging
@@ -454,6 +609,13 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
 
   // Warn loudly if the admin / signup gates are unconfigured.
   logAuthConfig();
+
+  // Clear anything the pipeline left in output/ from a previous process. The
+  // normal path deletes each PDF as soon as it's copied into app storage, but
+  // a crash or a kill mid-run strands whatever was in flight, and nothing else
+  // ever removes it. Cheap, and it keeps a restart loop from stacking up
+  // renders on the container's ephemeral disk.
+  void sweepPipelineOutput();
 
   // Recover filings left mid-render by a prior crash/stall so the UI doesn't
   // spin on them forever. Safe at boot: no render is in flight yet.
@@ -1149,26 +1311,17 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
       return res.status(400).json({ error: "tickers array is required" });
     }
 
-    // ── Dedup: skip filings already complete AND whose PDF still exists on disk.
-    // (A redeploy can wipe ephemeral PDF storage while the DB row persists, so a
-    // status check alone would wrongly skip filings that need re-rendering.) ──
-    const tickerNames = tickerList.map((t) => t.ticker);
-    const completeRows = await storage.getCompleteFilings(tickerNames);
-    const alreadyComplete = new Set(
-      completeRows.filter((r) => pdfExistsOnDisk(r.pdfPath)).map((r) => r.accessionNumber),
-    );
-
-    const input = JSON.stringify({
-      tickers: tickerList,
-      date_from: dateFrom || null,
-      date_to: dateTo || null,
-      limit_per_ticker: limitPerTicker || 10,
-      skip_accessions: Array.from(alreadyComplete),
+    const run = await startFetchRun({
+      kind: "fetch",
+      userId,
+      tickerList,
+      dateFrom,
+      dateTo,
+      limitPerTicker,
+      // A deliberate human "Fetch" means "catch me up on everything I have
+      // for these tickers", including old filings that were never reviewed.
+      queueBacklogReview: true,
     });
-
-    const cikByTicker = new Map(tickerList.map((t) => [t.ticker, t.cik]));
-
-    const run = beginRun("fetch", userId);
     if (!run) return res.status(409).json({ error: RUN_BUSY_MESSAGE });
 
     // Respond immediately — the run continues in the background and the client
@@ -1176,59 +1329,6 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     // which is longer than the deployment proxy will hold an idle connection
     // open, so awaiting it here surfaced successful runs as network errors.
     res.status(202).json(serializeRun(run));
-
-    void (async () => {
-      try {
-        const result = await runFetchPipeline(input, { userId, cikByTicker });
-        if (!result.success) {
-          endRun(run, { status: "error", error: result.error || "Pipeline process failed" });
-        } else {
-          // Report what's actually available in app storage, not what Python
-          // rasterized — those diverge when Python's render succeeded but the
-          // Node-side copy into PDF_STORAGE_DIR failed (the per-filing task in
-          // runFetchPipeline marks the filing as `error` in that case and
-          // refuses to push the accession into completedAccessions). Using
-          // result.completedAccessions.length here keeps the UI's "N PDFs
-          // rendered" toast honest. totalErrors absorbs the persistence
-          // failures so the user sees an accurate error count too.
-          // pipelineRendered is exposed separately for observability and to
-          // make the gap discoverable from the API response.
-          const pipelineRendered = Number(result.doneEvent?.total_rendered ?? 0);
-          const persisted = result.completedAccessions.length;
-          const persistenceFailures = Math.max(0, pipelineRendered - persisted);
-          const pipelineErrors = Number(result.doneEvent?.total_errors ?? 0);
-          endRun(run, {
-            status: "done",
-            result: {
-              totalRendered: persisted,
-              totalSkipped: Number(result.doneEvent?.total_skipped ?? 0),
-              totalErrors: pipelineErrors + persistenceFailures,
-              pipelineRendered,
-            },
-          });
-        }
-      } catch (err: any) {
-        console.error("Fetch run failed:", err);
-        endRun(run, { status: "error", error: err?.message || "Fetch run failed" });
-      }
-
-      // Clear any rows the pipeline left at 'rendering' (e.g. it was stalled and
-      // killed) for these tickers so they don't spin forever.
-      await storage
-        .recoverStaleRenders({ tickerList: tickerNames })
-        .catch((err) => console.error("Stale-render recovery failed:", err));
-
-      // Newly-rendered filings were queued incrementally as each PDF landed. Also
-      // queue any already-rendered filings (skipped by dedup) that were never
-      // reviewed, so a re-fetch reviews the whole outstanding backlog for these
-      // tickers — not just the brand-new filings.
-      if (isReviewEnabled()) {
-        storage
-          .markCompleteFilingsForReviewByTickers(tickerNames)
-          .then(() => kickReviewProcessor())
-          .catch((err) => console.error("Review processor failed:", err));
-      }
-    })();
   });
 
   // Poll the state of a background fetch run. `runId` is optional: without it
