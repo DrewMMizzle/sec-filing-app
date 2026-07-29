@@ -6,7 +6,18 @@ import { spawn } from "child_process";
 import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
-import { hashPassword, verifyPassword, createSession, clearSession, requireAuth } from "./auth";
+import {
+  hashPassword,
+  verifyPassword,
+  createSession,
+  clearSession,
+  requireAuth,
+  requireAdmin,
+  isAdminEmail,
+  checkSignupCode,
+  signupCodeConfigured,
+  logAuthConfig,
+} from "./auth";
 import { ensureSP500Seeded } from "./seed-sp500";
 import { getSecTickerIndex } from "./sec-index";
 import { isReviewEnabled, kickReviewProcessor, reviewCostUsd, requestCancelReview, isReviewProcessing, claudeHttpError } from "./review";
@@ -440,6 +451,9 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
   // Initialize database tables + indexes
   await initDatabase();
 
+  // Warn loudly if the admin / signup gates are unconfigured.
+  logAuthConfig();
+
   // Recover filings left mid-render by a prior crash/stall so the UI doesn't
   // spin on them forever. Safe at boot: no render is in flight yet.
   storage
@@ -477,7 +491,19 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
   // ─── Auth Routes ────────────────────────────────────────
 
   app.post("/api/auth/register", async (req, res) => {
-    const { email, password, displayName } = req.body;
+    const { email, password, displayName, inviteCode } = req.body;
+
+    // Signup is invite-gated: every account can read the entire shared filing
+    // corpus, so open registration would hand that to anyone with the URL.
+    if (!signupCodeConfigured()) {
+      return res.status(403).json({
+        error:
+          "Registration is disabled — no signup code is configured on this deployment.",
+      });
+    }
+    if (!checkSignupCode(inviteCode)) {
+      return res.status(403).json({ error: "That signup code isn't valid." });
+    }
 
     if (!email || !password || !displayName) {
       return res.status(400).json({ error: "email, password, and displayName are required" });
@@ -508,7 +534,12 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     // Clean up expired sessions in background
     storage.deleteExpiredSessions().catch(() => {});
 
-    res.status(201).json({ id: user.id, email: user.email, displayName: user.displayName });
+    res.status(201).json({
+      id: user.id,
+      email: user.email,
+      displayName: user.displayName,
+      isAdmin: isAdminEmail(user.email),
+    });
   });
 
   app.post("/api/auth/login", async (req, res) => {
@@ -533,7 +564,12 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     // Clean up expired sessions in background
     storage.deleteExpiredSessions().catch(() => {});
 
-    res.json({ id: user.id, email: user.email, displayName: user.displayName });
+    res.json({
+      id: user.id,
+      email: user.email,
+      displayName: user.displayName,
+      isAdmin: isAdminEmail(user.email),
+    });
   });
 
   app.post("/api/auth/logout", async (req, res) => {
@@ -542,7 +578,9 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
   });
 
   app.get("/api/auth/me", requireAuth, (req, res) => {
-    res.json(req.user);
+    // isAdmin lets the client hide admin-only controls instead of rendering
+    // buttons that 403 on click.
+    res.json({ ...req.user, isAdmin: isAdminEmail(req.user!.email) });
   });
 
   // ─── All remaining routes require auth ──────────────────
@@ -1097,7 +1135,7 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
   // Re-render filings that are "complete" in the DB but whose PDF is missing
   // on disk (e.g. wiped before the persistent volume existed). Processes a
   // bounded number of tickers per call; returns how many remain.
-  app.post("/api/filings/render-missing", requireAuth, async (req, res) => {
+  app.post("/api/filings/render-missing", requireAuth, requireAdmin, async (req, res) => {
     const userId = req.user!.id;
     const TICKER_CAP = 20;
 
@@ -1202,7 +1240,7 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
   // child if one is running, aborts the in-flight Claude review API call, and
   // drops any still-queued filings back to "not requested" so the next kick
   // doesn't pick them up automatically.
-  app.post("/api/run/cancel", requireAuth, async (_req, res) => {
+  app.post("/api/run/cancel", requireAuth, requireAdmin, async (_req, res) => {
     let fetchKilled = false;
     if (currentFetchChild) {
       const child = currentFetchChild;
@@ -1234,7 +1272,7 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
 
   // Set or clear the team-wide review spend cap (USD). Pass null/empty to clear.
   // Applies only to the fetch+review pipeline, never to Compare.
-  app.post("/api/review/budget", requireAuth, async (req, res) => {
+  app.post("/api/review/budget", requireAuth, requireAdmin, async (req, res) => {
     const { budgetUsd } = req.body as { budgetUsd?: number | null };
     if (budgetUsd === null || budgetUsd === undefined || budgetUsd === ("" as any)) {
       await storage.setSetting("review_budget_usd", null);
@@ -1612,7 +1650,7 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
   // ─── Filing management: delete, stats, view ────────────
 
   // Delete a single filing + remove PDF from disk
-  app.delete("/api/filings/:id", requireAuth, async (req, res) => {
+  app.delete("/api/filings/:id", requireAuth, requireAdmin, async (req, res) => {
     const id = Number(req.params.id);
     if (isNaN(id)) return res.status(400).json({ error: "Invalid ID" });
 
@@ -1632,7 +1670,7 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
   });
 
   // Batch delete filings + remove PDF files
-  app.post("/api/filings/batch-delete", requireAuth, async (req, res) => {
+  app.post("/api/filings/batch-delete", requireAuth, requireAdmin, async (req, res) => {
     const { ids } = req.body as { ids: number[] };
     if (!Array.isArray(ids) || ids.length === 0) {
       return res.status(400).json({ error: "ids array is required" });

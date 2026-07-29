@@ -6,13 +6,22 @@ type AuthUser = {
   id: number;
   email: string;
   displayName: string;
+  // Server-derived (ADMIN_EMAILS). Used only to hide controls the server would
+  // reject anyway — the gate itself is enforced server-side, never here.
+  isAdmin?: boolean;
 };
 
 type AuthContextType = {
   user: AuthUser | null;
   isLoading: boolean;
+  isAdmin: boolean;
   login: (email: string, password: string) => Promise<void>;
-  register: (email: string, password: string, displayName: string) => Promise<void>;
+  register: (
+    email: string,
+    password: string,
+    displayName: string,
+    inviteCode: string,
+  ) => Promise<void>;
   logout: () => Promise<void>;
 };
 
@@ -41,8 +50,23 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   });
 
   const registerMutation = useMutation({
-    mutationFn: async ({ email, password, displayName }: { email: string; password: string; displayName: string }) => {
-      const res = await apiRequest("POST", "/api/auth/register", { email, password, displayName });
+    mutationFn: async ({
+      email,
+      password,
+      displayName,
+      inviteCode,
+    }: {
+      email: string;
+      password: string;
+      displayName: string;
+      inviteCode: string;
+    }) => {
+      const res = await apiRequest("POST", "/api/auth/register", {
+        email,
+        password,
+        displayName,
+        inviteCode,
+      });
       return res.json();
     },
     onSuccess: (data: AuthUser) => {
@@ -65,8 +89,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     await loginMutation.mutateAsync({ email, password });
   };
 
-  const register = async (email: string, password: string, displayName: string) => {
-    await registerMutation.mutateAsync({ email, password, displayName });
+  const register = async (
+    email: string,
+    password: string,
+    displayName: string,
+    inviteCode: string,
+  ) => {
+    await registerMutation.mutateAsync({ email, password, displayName, inviteCode });
   };
 
   const logout = async () => {
@@ -74,7 +103,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   };
 
   return (
-    <AuthContext.Provider value={{ user: user ?? null, isLoading, login, register, logout }}>
+    <AuthContext.Provider
+      value={{
+        user: user ?? null,
+        isLoading,
+        isAdmin: !!user?.isAdmin,
+        login,
+        register,
+        logout,
+      }}
+    >
       {children}
     </AuthContext.Provider>
   );
