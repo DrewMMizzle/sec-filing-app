@@ -38,6 +38,26 @@ export function log(message: string, source = "express") {
   console.log(`${formattedTime} [${source}] ${message}`);
 }
 
+// Cap on how much of a response body goes into the access log. Without it a
+// single `GET /api/filings` writes its entire JSON array — thousands of
+// filings, megabytes — onto one log line, which drowns the boot sequence,
+// warnings and errors that anyone reading the logs is actually looking for.
+// The prefix is still enough to tell what came back; the length suffix says
+// how much was elided.
+const MAX_LOGGED_BODY_CHARS = 400;
+
+function summarizeBody(body: unknown): string | null {
+  let json: string;
+  try {
+    json = JSON.stringify(body);
+  } catch {
+    return "[unserializable response body]";
+  }
+  if (!json) return null;
+  if (json.length <= MAX_LOGGED_BODY_CHARS) return json;
+  return `${json.slice(0, MAX_LOGGED_BODY_CHARS)}… [truncated, ${json.length} chars]`;
+}
+
 app.use((req, res, next) => {
   const start = Date.now();
   const path = req.path;
@@ -54,7 +74,8 @@ app.use((req, res, next) => {
     if (path.startsWith("/api")) {
       let logLine = `${req.method} ${path} ${res.statusCode} in ${duration}ms`;
       if (capturedJsonResponse) {
-        logLine += ` :: ${JSON.stringify(capturedJsonResponse)}`;
+        const summary = summarizeBody(capturedJsonResponse);
+        if (summary) logLine += ` :: ${summary}`;
       }
 
       log(logLine);
