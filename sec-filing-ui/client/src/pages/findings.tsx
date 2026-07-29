@@ -681,6 +681,7 @@ export default function Findings() {
                     size="icon"
                     className={`h-7 w-7 ${r.status === "starred" ? "text-amber-400" : "text-muted-foreground"}`}
                     onClick={() => setStatus(r, "starred")}
+                    aria-label={r.status === "starred" ? "Unstar finding" : "Star finding (shortlist)"}
                     data-testid={`action-star-${r.key}`}
                   >
                     <Star className="w-3.5 h-3.5" />
@@ -695,6 +696,7 @@ export default function Findings() {
                     size="icon"
                     className={`h-7 w-7 ${r.status === "posted" ? "text-green-400" : "text-muted-foreground"}`}
                     onClick={() => setStatus(r, "posted")}
+                    aria-label={r.status === "posted" ? "Unmark finding as posted" : "Mark finding as posted"}
                     data-testid={`action-posted-${r.key}`}
                   >
                     <CheckCircle2 className="w-3.5 h-3.5" />
@@ -709,6 +711,7 @@ export default function Findings() {
                     size="icon"
                     className={`h-7 w-7 ${r.status === "dismissed" ? "text-foreground" : "text-muted-foreground"}`}
                     onClick={() => setStatus(r, "dismissed")}
+                    aria-label={r.status === "dismissed" ? "Un-dismiss finding" : "Dismiss finding (hide)"}
                     data-testid={`action-dismiss-${r.key}`}
                   >
                     <Ban className="w-3.5 h-3.5" />
@@ -723,6 +726,7 @@ export default function Findings() {
                     size="icon"
                     className="h-7 w-7 text-muted-foreground"
                     onClick={() => copyOne(r)}
+                    aria-label="Copy finding (for Word / Outlook)"
                     data-testid={`action-copy-${r.key}`}
                   >
                     <Copy className="w-3.5 h-3.5" />
@@ -744,6 +748,7 @@ export default function Findings() {
                         date: filing.filingDate,
                       })
                     }
+                    aria-label={`Ask about the ${filing.ticker} ${filing.filingType} filing (full text)`}
                     data-testid={`action-ask-filing-${r.key}`}
                   >
                     <MessageSquare className="w-3.5 h-3.5" />

@@ -172,11 +172,14 @@ export default function WatchlistPage() {
       const res = await apiRequest("POST", `/api/watchlists/${watchlistId}/share`, data);
       return res.json();
     },
-    onSuccess: () => {
+    onSuccess: (data: { message?: string }) => {
       queryClient.invalidateQueries({ queryKey: ["/api/watchlists", watchlistId, "shares"] });
       setShareEmail("");
       setSharePermission("view");
-      toast({ title: "Watchlist shared" });
+      // The server answers the same way whether or not the address has an
+      // account, so it owns the wording here. The refreshed list below is
+      // where the owner sees what actually happened.
+      toast({ title: "Sharing updated", description: data?.message });
     },
     onError: (err: Error) => {
       toast({ title: "Error", description: err.message, variant: "destructive" });
