@@ -84,6 +84,10 @@ const SECTION_KEYS = SECTIONS.map((s) => s.key);
 
 // Forms that contain the comparable sections (excludes 8-K)
 const HISTORY_FORMS = ["10-K", "10-Q", "DEF 14A"];
+// The periodic reports, which share the sections Compare diffs (MD&A, Risk
+// Factors, Legal Proceedings). A 10-K and a 10-Q pair fine against each other;
+// DEF 14A does not pair with either, so it isn't in here.
+const PERIODIC_FORMS = ["10-K", "10-Q"];
 const HISTORY_LIMIT = 30;
 const HISTORY_YEARS = 3;
 
@@ -105,26 +109,41 @@ function historyStartDate(): string {
 //
 // Returns [older, newer] — the A/B order the diff expects.
 function defaultPair(filings: Filing[]): [string, string] | null {
+  if (filings.length < 2) return null;
+
+  // `filings` arrives newest-first, so the first two of any subset are its
+  // two most recent.
+  const twoMostRecent = (fs: Filing[]): [string, string] | null =>
+    fs.length >= 2 ? [fs[1].accessionNumber, fs[0].accessionNumber] : null;
+
+  // 1. Any two periodic reports. 10-K and 10-Q are interchangeable here on
+  //    purpose: both carry MD&A, Risk Factors and Legal Proceedings, so a
+  //    10-Q against the prior 10-K is a normal comparison — arguably the most
+  //    useful default there is. Requiring the SAME form was too strict, and
+  //    sent every ticker holding one 10-K and one 10-Q down to its 8-Ks.
+  const periodic = twoMostRecent(filings.filter((f) => PERIODIC_FORMS.includes(f.filingType)));
+  if (periodic) return periodic;
+
+  // 2. Proxies compare only against other proxies — different sections.
+  const proxies = twoMostRecent(filings.filter((f) => f.filingType === "DEF 14A"));
+  if (proxies) return proxies;
+
+  // 3. Nothing with comparable sections. Fall back to a same-type pair (two
+  //    8-Ks beats an 8-K against a Form 4), preferring whichever type holds
+  //    the most recent filing.
   const byType = new Map<string, Filing[]>();
   for (const f of filings) {
     const list = byType.get(f.filingType) ?? [];
     list.push(f);
     byType.set(f.filingType, list);
   }
+  const sameType = Array.from(byType.values())
+    .filter((fs) => fs.length >= 2)
+    .sort((a, b) => (b[0].filingDate || "").localeCompare(a[0].filingDate || ""));
+  if (sameType.length > 0) return twoMostRecent(sameType[0]);
 
-  const pairable = Array.from(byType.entries()).filter(([, fs]) => fs.length >= 2);
-  if (pairable.length === 0) {
-    if (filings.length < 2) return null;
-    return [filings[1].accessionNumber, filings[0].accessionNumber];
-  }
-
-  const comparable = pairable.filter(([type]) => HISTORY_FORMS.includes(type));
-  const candidates = comparable.length > 0 ? comparable : pairable;
-  // `filings` arrives newest-first, so each group's [0] is its most recent.
-  const [, chosen] = candidates.sort(
-    (a, b) => (b[1][0].filingDate || "").localeCompare(a[1][0].filingDate || ""),
-  )[0];
-  return [chosen[1].accessionNumber, chosen[0].accessionNumber];
+  // 4. No pair of anything shares a form — just take the two newest.
+  return twoMostRecent(filings);
 }
 
 export default function Compare() {
