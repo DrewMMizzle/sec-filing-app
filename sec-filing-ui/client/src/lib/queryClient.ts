@@ -2,11 +2,35 @@ import { QueryClient, QueryFunction } from "@tanstack/react-query";
 
 export const API_BASE = "__PORT_5000__".startsWith("__") ? "" : "__PORT_5000__";
 
+export type ApiError = Error & { status: number };
+
+// Surface the server's own message rather than a raw `500: {"error":"…"}`
+// string. Routes return `{ error }`; the Express error handler returns
+// `{ message }`; zod validation failures return a structured `error` object.
+// Anything non-JSON (a proxy's HTML error page, an empty body) falls back to
+// the raw text and then the status line, so a caller always gets something
+// readable to show the user.
 async function throwIfResNotOk(res: Response) {
-  if (!res.ok) {
-    const text = (await res.text()) || res.statusText;
-    throw new Error(`${res.status}: ${text}`);
+  if (res.ok) return;
+
+  const raw = await res.text().catch(() => "");
+  let message = raw;
+  if (raw) {
+    try {
+      const body = JSON.parse(raw);
+      const detail = body?.error ?? body?.message;
+      if (typeof detail === "string" && detail.trim()) message = detail;
+      else if (detail) message = JSON.stringify(detail);
+    } catch {
+      // Not JSON — keep the raw body as the message.
+    }
   }
+
+  const err = new Error(
+    message || res.statusText || `Request failed (${res.status})`,
+  ) as ApiError;
+  err.status = res.status;
+  throw err;
 }
 
 export async function apiRequest(

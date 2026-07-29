@@ -115,10 +115,6 @@ export default function WatchlistPage() {
   const addTickerMutation = useMutation({
     mutationFn: async (data: { ticker: string; filingTypes: string[] }) => {
       const res = await apiRequest("POST", `/api/watchlists/${watchlistId}/tickers`, data);
-      if (!res.ok) {
-        const body = await res.json();
-        throw new Error(body.error || "Failed to add ticker");
-      }
       return res.json();
     },
     onSuccess: () => {
@@ -174,10 +170,6 @@ export default function WatchlistPage() {
   const shareMutation = useMutation({
     mutationFn: async (data: { email: string; permission: string }) => {
       const res = await apiRequest("POST", `/api/watchlists/${watchlistId}/share`, data);
-      if (!res.ok) {
-        const body = await res.json();
-        throw new Error(body.error || "Failed to share");
-      }
       return res.json();
     },
     onSuccess: () => {

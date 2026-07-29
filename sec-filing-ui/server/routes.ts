@@ -21,10 +21,6 @@ import {
 } from "./sec-edgar";
 import { analyzeMdna, isMdnaEligible } from "./mdna";
 import type { ChildProcess } from "child_process";
-
-// Tracks the in-flight fetch/render pipeline child so a user cancel can kill
-// it. Only one fetch runs at a time per process today (the route awaits it).
-let currentFetchChild: ChildProcess | null = null;
 import { chatAboutFindings, chatAboutFiling } from "./chat";
 import { ensureFilingDigest } from "./digest";
 import { findPageForQuote } from "./pdf-locate";
@@ -37,6 +33,85 @@ import {
 import { db } from "./storage";
 import { tickers as tickersTable, filings as filingsTable } from "@shared/schema";
 import { eq } from "drizzle-orm";
+
+// Tracks the in-flight fetch/render pipeline child so a user cancel can kill it.
+let currentFetchChild: ChildProcess | null = null;
+
+// ─── Pipeline run slot ───────────────────────────────────────────────────
+//
+// Every route that spawns the Python pipeline claims this single slot first.
+// Two purposes:
+//
+//   1. Only one pipeline child can exist at a time, so `currentFetchChild`
+//      can't be clobbered by a second run — which previously left the first
+//      child orphaned and unkillable by /api/run/cancel.
+//   2. The main fetch runs in the BACKGROUND and reports progress through
+//      this record. A full multi-ticker fetch takes minutes; holding the HTTP
+//      request open for the whole run meant the deployment proxy dropped the
+//      connection and the client showed a network error for a run that had
+//      actually succeeded. The route now returns 202 + a runId immediately
+//      and the client polls /api/filings/fetch/status.
+type RunStatus = "running" | "done" | "error" | "canceled";
+type RunKind = "fetch" | "render-missing" | "registration-render";
+
+type FetchRunResult = {
+  totalRendered: number;
+  totalSkipped: number;
+  totalErrors: number;
+  pipelineRendered: number;
+};
+
+type PipelineRun = {
+  id: string;
+  kind: RunKind;
+  userId: number;
+  status: RunStatus;
+  startedAt: string;
+  finishedAt?: string;
+  result?: FetchRunResult;
+  error?: string;
+};
+
+let currentRun: PipelineRun | null = null;
+
+function runIsActive(): boolean {
+  return currentRun?.status === "running";
+}
+
+// Claim the slot, or return null if a run is already in flight.
+function beginRun(kind: RunKind, userId: number): PipelineRun | null {
+  if (runIsActive()) return null;
+  currentRun = {
+    id: `run_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+    kind,
+    userId,
+    status: "running",
+    startedAt: new Date().toISOString(),
+  };
+  return currentRun;
+}
+
+function endRun(run: PipelineRun, patch: Partial<PipelineRun>): void {
+  // A cancel may have already marked this run; don't overwrite that verdict.
+  if (run.status !== "running") return;
+  Object.assign(run, patch, { finishedAt: new Date().toISOString() });
+}
+
+// Public shape — never leaks the child handle or internal fields.
+function serializeRun(run: PipelineRun) {
+  return {
+    runId: run.id,
+    kind: run.kind,
+    status: run.status,
+    startedAt: run.startedAt,
+    finishedAt: run.finishedAt ?? null,
+    result: run.result ?? null,
+    error: run.error ?? null,
+  };
+}
+
+const RUN_BUSY_MESSAGE =
+  "Another fetch or render is already running. Wait for it to finish, or cancel it first.";
 
 const SEC_COMPANY_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json";
 const SEC_USER_AGENT = process.env.SEC_USER_AGENT || "DotAdda ameister@dotadda.com";
@@ -939,50 +1014,84 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     });
 
     const cikByTicker = new Map(tickerList.map((t) => [t.ticker, t.cik]));
-    const result = await runFetchPipeline(input, { userId, cikByTicker });
-    if (!result.success) {
-      return res
-        .status(500)
-        .json({ success: false, error: result.error || "Pipeline process failed", events: result.events });
-    }
-    // Report what's actually available in app storage, not what Python
-    // rasterized — those diverge when Python's render succeeded but the
-    // Node-side copy into PDF_STORAGE_DIR failed (the per-filing task in
-    // runFetchPipeline marks the filing as `error` in that case and
-    // refuses to push the accession into completedAccessions). Using
-    // result.completedAccessions.length here keeps the UI's "N PDFs
-    // rendered" toast honest. totalErrors absorbs the persistence
-    // failures so the user sees an accurate error count too.
-    // pipelineRendered is exposed separately for observability and to
-    // make the gap discoverable from the API response.
-    const pipelineRendered = Number(result.doneEvent?.total_rendered ?? 0);
-    const persisted = result.completedAccessions.length;
-    const persistenceFailures = Math.max(0, pipelineRendered - persisted);
-    const pipelineErrors = Number(result.doneEvent?.total_errors ?? 0);
-    res.json({
-      success: true,
-      totalRendered: persisted,
-      totalSkipped: result.doneEvent?.total_skipped ?? 0,
-      totalErrors: pipelineErrors + persistenceFailures,
-      pipelineRendered,
-      events: result.events,
-    });
-    // Clear any rows the pipeline left at 'rendering' (e.g. it was stalled and
-    // killed) for these tickers so they don't spin forever.
-    storage
-      .recoverStaleRenders({ tickerList: tickerNames })
-      .catch((err) => console.error("Stale-render recovery failed:", err));
 
-    // Newly-rendered filings were queued incrementally as each PDF landed. Also
-    // queue any already-rendered filings (skipped by dedup) that were never
-    // reviewed, so a re-fetch reviews the whole outstanding backlog for these
-    // tickers — not just the brand-new filings.
-    if (isReviewEnabled()) {
-      storage
-        .markCompleteFilingsForReviewByTickers(tickerNames)
-        .then(() => kickReviewProcessor())
-        .catch((err) => console.error("Review processor failed:", err));
+    const run = beginRun("fetch", userId);
+    if (!run) return res.status(409).json({ error: RUN_BUSY_MESSAGE });
+
+    // Respond immediately — the run continues in the background and the client
+    // polls /api/filings/fetch/status. A large fetch runs for many minutes,
+    // which is longer than the deployment proxy will hold an idle connection
+    // open, so awaiting it here surfaced successful runs as network errors.
+    res.status(202).json(serializeRun(run));
+
+    void (async () => {
+      try {
+        const result = await runFetchPipeline(input, { userId, cikByTicker });
+        if (!result.success) {
+          endRun(run, { status: "error", error: result.error || "Pipeline process failed" });
+        } else {
+          // Report what's actually available in app storage, not what Python
+          // rasterized — those diverge when Python's render succeeded but the
+          // Node-side copy into PDF_STORAGE_DIR failed (the per-filing task in
+          // runFetchPipeline marks the filing as `error` in that case and
+          // refuses to push the accession into completedAccessions). Using
+          // result.completedAccessions.length here keeps the UI's "N PDFs
+          // rendered" toast honest. totalErrors absorbs the persistence
+          // failures so the user sees an accurate error count too.
+          // pipelineRendered is exposed separately for observability and to
+          // make the gap discoverable from the API response.
+          const pipelineRendered = Number(result.doneEvent?.total_rendered ?? 0);
+          const persisted = result.completedAccessions.length;
+          const persistenceFailures = Math.max(0, pipelineRendered - persisted);
+          const pipelineErrors = Number(result.doneEvent?.total_errors ?? 0);
+          endRun(run, {
+            status: "done",
+            result: {
+              totalRendered: persisted,
+              totalSkipped: Number(result.doneEvent?.total_skipped ?? 0),
+              totalErrors: pipelineErrors + persistenceFailures,
+              pipelineRendered,
+            },
+          });
+        }
+      } catch (err: any) {
+        console.error("Fetch run failed:", err);
+        endRun(run, { status: "error", error: err?.message || "Fetch run failed" });
+      }
+
+      // Clear any rows the pipeline left at 'rendering' (e.g. it was stalled and
+      // killed) for these tickers so they don't spin forever.
+      await storage
+        .recoverStaleRenders({ tickerList: tickerNames })
+        .catch((err) => console.error("Stale-render recovery failed:", err));
+
+      // Newly-rendered filings were queued incrementally as each PDF landed. Also
+      // queue any already-rendered filings (skipped by dedup) that were never
+      // reviewed, so a re-fetch reviews the whole outstanding backlog for these
+      // tickers — not just the brand-new filings.
+      if (isReviewEnabled()) {
+        storage
+          .markCompleteFilingsForReviewByTickers(tickerNames)
+          .then(() => kickReviewProcessor())
+          .catch((err) => console.error("Review processor failed:", err));
+      }
+    })();
+  });
+
+  // Poll the state of a background fetch run. `runId` is optional: without it
+  // the caller gets whatever run is current (or an idle marker). With it, a
+  // mismatch 404s rather than silently reporting a different run's outcome —
+  // so a stale tab can't mistake someone else's result for its own.
+  app.get("/api/filings/fetch/status", requireAuth, (req, res) => {
+    const runId = typeof req.query.runId === "string" ? req.query.runId : "";
+    if (!currentRun) {
+      if (runId) return res.status(404).json({ error: "Run not found" });
+      return res.json({ status: "idle" });
     }
+    if (runId && runId !== currentRun.id) {
+      return res.status(404).json({ error: "Run not found" });
+    }
+    res.json(serializeRun(currentRun));
   });
 
   // Re-render filings that are "complete" in the DB but whose PDF is missing
@@ -1038,10 +1147,23 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
       skip_accessions: present,
     });
 
-    const result = await runFetchPipeline(input, { userId, cikByTicker });
+    // Claim the pipeline slot so this can't spawn a second child alongside an
+    // in-flight fetch (which would orphan one of them past /api/run/cancel).
+    const run = beginRun("render-missing", userId);
+    if (!run) return res.status(409).json({ error: RUN_BUSY_MESSAGE });
+
+    let result: PipelineResult;
+    try {
+      result = await runFetchPipeline(input, { userId, cikByTicker });
+    } catch (err: any) {
+      endRun(run, { status: "error", error: err?.message || "Re-render failed" });
+      throw err;
+    }
     if (!result.success) {
+      endRun(run, { status: "error", error: result.error || "Re-render failed" });
       return res.status(500).json({ error: result.error || "Re-render failed" });
     }
+    endRun(run, { status: "done" });
     // Reviews are queued incrementally as each PDF re-renders; final nudge only.
     if (isReviewEnabled() && result.completedAccessions.length > 0) {
       kickReviewProcessor().catch((err) => console.error("Review processor failed:", err));
@@ -1069,7 +1191,10 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     const pendingCount = await storage.getPendingReviewCount();
     const paused = budgetUsd !== null && rawCost >= budgetUsd && pendingCount > 0;
     const processing = isReviewProcessing();
-    const fetching = currentFetchChild !== null;
+    // Reflects the run slot rather than the child handle: a run is "fetching"
+    // from the moment it's accepted, including the window before the Python
+    // child has actually spawned.
+    const fetching = runIsActive();
     res.json({ ...u, costUsd, budgetUsd, pendingCount, paused, processing, fetching });
   });
 
@@ -1093,6 +1218,14 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
       } catch (err: any) {
         console.error("[cancel] Failed to signal fetch child:", err?.message || err);
       }
+    }
+    // Mark the run canceled before the child's close handler resolves, so the
+    // background task's endRun() (which refuses to patch a run that is no
+    // longer "running") can't overwrite this with a spurious "error".
+    if (currentRun?.status === "running") {
+      currentRun.status = "canceled";
+      currentRun.error = "Run canceled.";
+      currentRun.finishedAt = new Date().toISOString();
     }
     const { abortedInFlight } = requestCancelReview();
     const pendingCleared = await storage.clearPendingReviews();
@@ -1730,6 +1863,13 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     });
     const cikByTicker = new Map<string, string>([[label, sub.cik]]);
     const userId = req.user!.id;
+
+    // Claim the pipeline slot — see the note on beginRun. Registration renders
+    // are the heaviest single filings in the app, so overlapping one with a
+    // fetch previously left an unkillable orphan child.
+    const run = beginRun("registration-render", userId);
+    if (!run) return res.status(409).json({ error: RUN_BUSY_MESSAGE });
+
     try {
       const result = await runFetchPipeline(input, {
         userId,
@@ -1740,8 +1880,10 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
         treatPartialAsFailure: true,
       });
       if (!result.success) {
+        endRun(run, { status: "error", error: result.error || "Render failed" });
         return res.status(500).json({ error: result.error || "Render failed", events: result.events });
       }
+      endRun(run, { status: "done" });
       res.json({
         ok: true,
         label,
@@ -1751,6 +1893,7 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
         events: result.events,
       });
     } catch (e: any) {
+      endRun(run, { status: "error", error: e?.message || "Registration render failed" });
       res.status(500).json({ error: e?.message || "Registration render failed" });
     }
   });

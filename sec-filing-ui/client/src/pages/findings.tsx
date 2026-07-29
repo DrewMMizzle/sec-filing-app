@@ -272,7 +272,6 @@ export default function Findings() {
   const actionMutation = useMutation({
     mutationFn: async (vars: { accessionNumber: string; findingIndex: number; status: string }) => {
       const res = await apiRequest("POST", "/api/finding-actions", vars);
-      if (!res.ok) throw new Error("Failed to update finding");
       return res.json();
     },
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["/api/finding-actions"] }),
@@ -282,10 +281,6 @@ export default function Findings() {
   const reviewMutation = useMutation<{ queued: number }>({
     mutationFn: async () => {
       const res = await apiRequest("POST", "/api/filings/review");
-      if (!res.ok) {
-        const body = await res.json();
-        throw new Error(body.error || "Review request failed");
-      }
       return res.json();
     },
     onSuccess: (data) => {
