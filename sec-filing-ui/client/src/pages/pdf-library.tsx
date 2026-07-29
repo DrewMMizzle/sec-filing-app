@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { useAuth } from "@/hooks/use-auth";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { queryClient, apiRequest, API_BASE } from "@/lib/queryClient";
 import { Card } from "@/components/ui/card";
@@ -65,6 +66,9 @@ type SortField = "ticker" | "filingType" | "filingDate" | "status" | "pdfSize";
 type SortDir = "asc" | "desc";
 
 export default function PdfLibrary() {
+  // Deleting removes filings from the SHARED library for everyone, so it is
+  // admin-only. Enforced server-side; hidden here to avoid dead buttons.
+  const { isAdmin } = useAuth();
   const { toast } = useToast();
 
   // Filters
@@ -443,7 +447,7 @@ export default function PdfLibrary() {
             </span>
           )}
         </p>
-        {selectedIds.size > 0 && (
+        {selectedIds.size > 0 && isAdmin && (
           <Button
             variant="destructive"
             size="sm"
@@ -610,17 +614,19 @@ export default function PdfLibrary() {
                             {f.errorMessage}
                           </span>
                         )}
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          className="h-8 w-8 text-muted-foreground hover:text-destructive"
-                          title="Delete"
-                          onClick={() => confirmDelete([f.id])}
-                          disabled={deleteMutation.isPending}
-                          data-testid={`button-delete-${f.id}`}
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </Button>
+                        {isAdmin && (
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="h-8 w-8 text-muted-foreground hover:text-destructive"
+                            title="Delete"
+                            onClick={() => confirmDelete([f.id])}
+                            disabled={deleteMutation.isPending}
+                            data-testid={`button-delete-${f.id}`}
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </Button>
+                        )}
                       </div>
                     </TableCell>
                   </TableRow>

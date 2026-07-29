@@ -14,23 +14,27 @@ export default function RegisterPage() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [displayName, setDisplayName] = useState("");
+  const [inviteCode, setInviteCode] = useState("");
   const [loading, setLoading] = useState(false);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!email.trim() || !password || !displayName.trim()) return;
+    if (!email.trim() || !password || !displayName.trim() || !inviteCode.trim()) return;
     if (password.length < 8) {
       toast({ title: "Error", description: "Password must be at least 8 characters", variant: "destructive" });
       return;
     }
     setLoading(true);
     try {
-      await register(email.trim(), password, displayName.trim());
+      await register(email.trim(), password, displayName.trim(), inviteCode.trim());
       setLocation("/");
     } catch (err: any) {
+      // apiRequest surfaces the server's own message (e.g. "An account with
+      // this email already exists", "That signup code isn't valid."), so it
+      // can be shown as-is.
       toast({
         title: "Registration failed",
-        description: err.message?.includes("409") ? "An account with this email already exists" : err.message,
+        description: err.message,
         variant: "destructive",
       });
     } finally {
@@ -80,6 +84,17 @@ export default function RegisterPage() {
               onChange={(e) => setPassword(e.target.value)}
               required
               minLength={8}
+            />
+          </div>
+          <div>
+            <label className="text-sm font-medium mb-1.5 block">Signup code</label>
+            <Input
+              type="text"
+              placeholder="Ask your team for the code"
+              value={inviteCode}
+              onChange={(e) => setInviteCode(e.target.value)}
+              required
+              autoComplete="off"
             />
           </div>
           <Button type="submit" className="w-full" disabled={loading}>

@@ -44,6 +44,7 @@ import { Search, Download, Loader2, FileText, Check, X, AlertCircle, ShieldAlert
 import type { Filing } from "@shared/schema";
 import { findingsCount, estimateReviewCost, formatCostRange } from "@/lib/findings";
 import { DateRangeInput } from "@/components/DateRangeInput";
+import { useAuth } from "@/hooks/use-auth";
 
 // SEC filing dates are plain calendar dates (YYYY-MM-DD); convert to/from local
 // Date objects so the calendar never shifts a day across timezones.
@@ -104,6 +105,9 @@ const RUN_POLL_MAX_CONSECUTIVE_FAILURES = 5;
 
 export default function FetchFilings() {
   const { toast } = useToast();
+  // Admin-only controls act on the shared corpus / team-wide spend cap. The
+  // server enforces this; hiding them just avoids buttons that 403 on click.
+  const { isAdmin } = useAuth();
 
   // Default the range to 2026 YTD so the common "what's been filed this year?"
   // case is one click away. The DateRangeInput component owns the typeable
@@ -723,7 +727,7 @@ export default function FetchFilings() {
             </p>
           )}
         </div>
-        {reviewEnabled && (
+        {reviewEnabled && isAdmin && (
           <Button
             variant="outline"
             size="sm"
@@ -743,11 +747,14 @@ export default function FetchFilings() {
           <PauseCircle className="w-4 h-4 text-amber-400 shrink-0" />
           <p className="text-xs text-muted-foreground flex-1">
             Review paused — the ${usage.budgetUsd?.toFixed(2)} spend cap has been reached (${usage.costUsd.toFixed(2)} spent).{" "}
-            {usage.pendingCount} filing{usage.pendingCount !== 1 ? "s" : ""} still queued. Raise the cap to continue.
+            {usage.pendingCount} filing{usage.pendingCount !== 1 ? "s" : ""} still queued.{" "}
+            {isAdmin ? "Raise the cap to continue." : "An administrator can raise the cap to continue."}
           </p>
-          <Button size="sm" variant="secondary" onClick={openBudgetDialog} data-testid="button-raise-budget">
-            Raise cap
-          </Button>
+          {isAdmin && (
+            <Button size="sm" variant="secondary" onClick={openBudgetDialog} data-testid="button-raise-budget">
+              Raise cap
+            </Button>
+          )}
         </Card>
       )}
 
@@ -934,10 +941,11 @@ export default function FetchFilings() {
 
           {/* Cancel: visible whenever something cancelable is in flight — the
               Python fetch child, the Claude review drain, or queued reviews. */}
-          {(fetchMutation.isPending ||
-            usage?.fetching ||
-            usage?.processing ||
-            (usage?.pendingCount ?? 0) > 0) && (
+          {isAdmin &&
+            (fetchMutation.isPending ||
+              usage?.fetching ||
+              usage?.processing ||
+              (usage?.pendingCount ?? 0) > 0) && (
             <Button
               variant="destructive"
               onClick={() => cancelMutation.mutate()}
@@ -988,7 +996,7 @@ export default function FetchFilings() {
             {scopeDateLabel}
           </p>
         </div>
-        {completedFilings.length > 0 && (
+        {completedFilings.length > 0 && isAdmin && (
           <Button
             variant="outline"
             size="sm"
@@ -1040,7 +1048,7 @@ export default function FetchFilings() {
                   {scopeDateLabel}
                 </p>
               </div>
-              {paused && (
+              {paused && isAdmin && (
                 <Button
                   size="sm"
                   variant="secondary"
@@ -1110,7 +1118,13 @@ export default function FetchFilings() {
           </div>
 
           {/* What-to-do-next when the spend cap pauses the queue */}
-          {paused && (
+          {paused && !isAdmin && (
+            <p className="text-xs text-muted-foreground">
+              {queuedCount} filing{queuedCount !== 1 ? "s are" : " is"} held and won't be reviewed until an
+              administrator raises or removes the spend cap.
+            </p>
+          )}
+          {paused && isAdmin && (
             <p className="text-xs text-muted-foreground">
               {queuedCount} filing{queuedCount !== 1 ? "s are" : " is"} held and won't be reviewed until you{" "}
               <button
