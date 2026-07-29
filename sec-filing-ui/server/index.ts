@@ -4,6 +4,7 @@ import { registerRoutes } from "./routes";
 import { serveStatic } from "./static";
 import { backfillSP500 } from "./seed-sp500";
 import { resumeReviews } from "./review";
+import { startScheduler } from "./scheduler";
 import { createServer } from "http";
 
 const app = express();
@@ -150,6 +151,8 @@ app.use((req, res, next) => {
       backfillSP500().catch((err) => console.error("S&P 500 backfill failed:", err));
       // Resume any material-disclosure reviews left pending from a prior run.
       resumeReviews().catch((err) => console.error("Review resume failed:", err));
+      // Arm the nightly fetch (a no-op unless NIGHTLY_FETCH_UTC_HOUR is set).
+      startScheduler();
     },
   );
 })();

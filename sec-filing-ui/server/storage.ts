@@ -859,6 +859,43 @@ export class DatabaseStorage {
     }));
   }
 
+  // Every tracked ticker across EVERY user's watchlists, deduped by CIK and
+  // with each CIK's tracked forms unioned.
+  //
+  // Deliberately not user-scoped: the filing library is a shared corpus, and
+  // the nightly fetch feeds that corpus on behalf of everyone. Scoping it to
+  // one account would silently stop fetching for tickers only a teammate
+  // tracks. Shaped like the pipeline's ticker input so it can be handed
+  // straight to startFetchRun.
+  async getAllWatchlistTickersGlobal(): Promise<
+    Array<{ ticker: string; cik: string; filing_types: string[] }>
+  > {
+    const rows = await db
+      .select({ ticker: tickers.ticker, cik: tickers.cik, filingTypes: tickers.filingTypes })
+      .from(tickers);
+    const byCik = new Map<string, { cik: string; ticker: string; filing_types: Set<string> }>();
+    for (const t of rows) {
+      if (!t.cik) continue;
+      const types = parseFilingTypesSafe(t.filingTypes);
+      const existing = byCik.get(t.cik);
+      if (existing) types.forEach((ft) => existing.filing_types.add(ft));
+      else byCik.set(t.cik, { cik: t.cik, ticker: t.ticker, filing_types: new Set(types) });
+    }
+    return Array.from(byCik.values()).map((e) => ({
+      ticker: e.ticker,
+      cik: e.cik,
+      filing_types: Array.from(e.filing_types),
+    }));
+  }
+
+  // Lowest user id — the account a scheduled run is attributed to when no
+  // admin is configured. Filing rows require a userId; the corpus is shared,
+  // so which account owns the row carries no access meaning.
+  async getFirstUserId(): Promise<number | undefined> {
+    const rows = await db.select({ id: users.id }).from(users).orderBy(users.id).limit(1);
+    return rows[0]?.id;
+  }
+
   async getAllTickers(userId: number): Promise<Array<{ ticker: string; cik: string; filingTypes: string[] }>> {
     const userWatchlists = await this.getWatchlists(userId);
     const allTickers: Ticker[] = [];
