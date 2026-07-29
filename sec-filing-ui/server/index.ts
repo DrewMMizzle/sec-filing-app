@@ -25,6 +25,18 @@ app.use(
   }),
 );
 
+// express.json rejects malformed bodies by throwing a SyntaxError whose
+// message is the raw parser complaint ("Expected property name or '}' in JSON
+// at position 1"). That's internal detail with no value to a caller, so
+// answer with a plain 400 instead and let everything else through.
+app.use((err: any, _req: Request, res: Response, next: NextFunction) => {
+  if (err instanceof SyntaxError && (err as any).status === 400 && "body" in err) {
+    res.status(400).json({ error: "Malformed JSON in request body." });
+    return;
+  }
+  next(err);
+});
+
 app.use(express.urlencoded({ extended: false }));
 
 export function log(message: string, source = "express") {
@@ -87,6 +99,15 @@ app.use((req, res, next) => {
 
 (async () => {
   await registerRoutes(httpServer, app);
+
+  // Anything under /api that no route matched is a client error, not a page.
+  // Without this the SPA catch-all further down answers unmatched API paths
+  // and methods with 200 + index.html — so `DELETE /api/all-tickers` looked
+  // like it succeeded, and any client parsing the reply got HTML where it
+  // expected JSON.
+  app.use("/api", (req: Request, res: Response) => {
+    res.status(404).json({ error: `Cannot ${req.method} ${req.originalUrl}` });
+  });
 
   app.use((err: any, _req: Request, res: Response, next: NextFunction) => {
     const status = err.status || err.statusCode || 500;

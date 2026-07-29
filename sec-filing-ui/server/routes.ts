@@ -642,8 +642,18 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
   // get a 201 and an empty watchlist, with nothing anywhere saying the tickers
   // had been thrown away. Same for the rename route below. Silently discarding
   // half a request is worse than refusing it.
+  // 120 chars is well past any real watchlist name and short enough that the
+  // sidebar and page headings stay sane. Without a cap a 5,000-character name
+  // was accepted and then rendered everywhere the list appears.
+  const WATCHLIST_NAME_MAX = 120;
   const createWatchlistBodySchema = z
-    .object({ name: z.string().trim().min(1, "name is required") })
+    .object({
+      name: z
+        .string()
+        .trim()
+        .min(1, "name is required")
+        .max(WATCHLIST_NAME_MAX, `name must be ${WATCHLIST_NAME_MAX} characters or fewer`),
+    })
     .strict();
 
   // Drizzle wraps the driver error, so the Postgres SQLSTATE sits on the cause
@@ -704,7 +714,11 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     if (!body.success) {
       const unknown = unknownKeyError(body.error);
       if (unknown) return res.status(400).json({ error: unknown });
-      return res.status(400).json({ error: "name is required" });
+      // Surface the actual complaint — "name is required" is wrong when what
+      // failed was the length cap.
+      return res
+        .status(400)
+        .json({ error: body.error.issues[0]?.message ?? "name is required" });
     }
 
     try {
@@ -745,6 +759,40 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     res.json(shares);
   });
 
+  // Sharing must not answer "does this address have an account?". Login is
+  // already careful about that; share was the one endpoint that would tell you
+  // outright, one address at a time.
+  //
+  // A neutral message alone would be theater, because the owner's share list
+  // refreshes right after and shows the real outcome. So the fix is both
+  // halves: identical responses for found / not-found / already-shared, AND a
+  // per-account rate limit, which is what actually makes walking a list of
+  // addresses impractical. The owner still learns the true result from the
+  // share list — that's the feature working. What's gone is the cheap oracle.
+  const SHARE_ATTEMPT_WINDOW_MS = 10 * 60 * 1000;
+  const SHARE_ATTEMPTS_PER_WINDOW = 20; // generous: real use is a few teammates
+  const shareAttempts = new Map<number, number[]>();
+
+  function shareAttemptExceeded(userId: number): boolean {
+    const now = Date.now();
+    const cutoff = now - SHARE_ATTEMPT_WINDOW_MS;
+    const recent = (shareAttempts.get(userId) ?? []).filter((t) => t > cutoff);
+    recent.push(now);
+    shareAttempts.set(userId, recent);
+    // Keep the map from growing unbounded on a long-lived process.
+    if (shareAttempts.size > 500) {
+      for (const [uid, times] of Array.from(shareAttempts.entries())) {
+        if (times.every((t) => t <= cutoff)) shareAttempts.delete(uid);
+      }
+    }
+    return recent.length > SHARE_ATTEMPTS_PER_WINDOW;
+  }
+
+  // Same wording whether the address resolved to an account or not.
+  const SHARE_ACCEPTED_MESSAGE =
+    "If that address has an account, the watchlist is now shared with it. " +
+    "Anyone it was shared with appears in the list below.";
+
   app.post("/api/watchlists/:id/share", requireAuth, async (req, res) => {
     const watchlistId = Number(req.params.id);
     const userId = req.user!.id;
@@ -759,21 +807,36 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
       return res.status(400).json({ error: "permission must be 'view' or 'edit'" });
     }
 
+    if (shareAttemptExceeded(userId)) {
+      return res.status(429).json({
+        error: "Too many sharing attempts. Wait a few minutes and try again.",
+      });
+    }
+
     const targetUser = await storage.getUserByEmail(email);
-    if (!targetUser) return res.status(404).json({ error: "No user found with that email" });
-    if (targetUser.id === userId) return res.status(400).json({ error: "Cannot share with yourself" });
 
-    // Check if already shared
-    const existing = await storage.getShareForUser(watchlistId, targetUser.id);
-    if (existing) return res.status(409).json({ error: "Already shared with this user" });
+    // Sharing with yourself is safe to name: the caller already knows their
+    // own address, so saying so leaks nothing.
+    if (targetUser && targetUser.id === userId) {
+      return res.status(400).json({ error: "Cannot share with yourself" });
+    }
 
-    const share = await storage.createShare({
-      watchlistId,
-      sharedWithUserId: targetUser.id,
-      permission: permission || "view",
-      createdAt: new Date().toISOString(),
-    });
-    res.status(201).json(share);
+    if (targetUser) {
+      const existing = await storage.getShareForUser(watchlistId, targetUser.id);
+      if (!existing) {
+        await storage.createShare({
+          watchlistId,
+          sharedWithUserId: targetUser.id,
+          permission: permission || "view",
+          createdAt: new Date().toISOString(),
+        });
+      }
+    }
+
+    // Deliberately the same response for "shared", "already shared" and "no
+    // such account" — and deliberately no share object, which would itself
+    // confirm the address resolved.
+    res.status(202).json({ message: SHARE_ACCEPTED_MESSAGE });
   });
 
   app.delete("/api/watchlists/:id/share/:userId", requireAuth, async (req, res) => {

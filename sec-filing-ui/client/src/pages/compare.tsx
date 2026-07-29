@@ -93,6 +93,40 @@ function historyStartDate(): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
 
+// Pick the two filings to preselect, given one ticker's filings newest-first.
+//
+// Defaulting to the two most recent regardless of type routinely paired a
+// 10-Q with an 8-K — and an 8-K has no MD&A, Risk Factors or Legal section,
+// so the first comparison a user ran came back "Couldn't locate the
+// [section]" for everything. Pair same-type filings instead, preferring the
+// forms that actually carry comparable sections, and among those the group
+// holding the most recent filing. Only fall back to two-most-recent when no
+// same-type pair exists at all.
+//
+// Returns [older, newer] — the A/B order the diff expects.
+function defaultPair(filings: Filing[]): [string, string] | null {
+  const byType = new Map<string, Filing[]>();
+  for (const f of filings) {
+    const list = byType.get(f.filingType) ?? [];
+    list.push(f);
+    byType.set(f.filingType, list);
+  }
+
+  const pairable = Array.from(byType.entries()).filter(([, fs]) => fs.length >= 2);
+  if (pairable.length === 0) {
+    if (filings.length < 2) return null;
+    return [filings[1].accessionNumber, filings[0].accessionNumber];
+  }
+
+  const comparable = pairable.filter(([type]) => HISTORY_FORMS.includes(type));
+  const candidates = comparable.length > 0 ? comparable : pairable;
+  // `filings` arrives newest-first, so each group's [0] is its most recent.
+  const [, chosen] = candidates.sort(
+    (a, b) => (b[1][0].filingDate || "").localeCompare(a[1][0].filingDate || ""),
+  )[0];
+  return [chosen[1].accessionNumber, chosen[0].accessionNumber];
+}
+
 export default function Compare() {
   const { toast } = useToast();
   const { data: allTickers = [] } = useQuery<TickerInfo[]>({ queryKey: ["/api/all-tickers"] });
@@ -143,13 +177,9 @@ export default function Compare() {
   );
 
   useEffect(() => {
-    if (tickerFilings.length >= 2) {
-      setAccB(tickerFilings[0].accessionNumber);
-      setAccA(tickerFilings[1].accessionNumber);
-    } else {
-      setAccA("");
-      setAccB("");
-    }
+    const pair = defaultPair(tickerFilings);
+    setAccA(pair?.[0] ?? "");
+    setAccB(pair?.[1] ?? "");
     setResults([]);
     setSectionErrors([]);
   }, [ticker]); // eslint-disable-line react-hooks/exhaustive-deps
