@@ -184,6 +184,31 @@ const MIGRATIONS: Migration[] = [
     // by the single-filing chat so repeat sessions don't re-send the full text.
     sql: `ALTER TABLE filings ADD COLUMN IF NOT EXISTS filing_digest TEXT;`,
   },
+  {
+    version: 7,
+    name: "watchlist_name_unique_per_user",
+    // Watchlist names must be unique PER USER, not globally.
+    //
+    // Migration #1 tried to drop the legacy global constraint but named it
+    // `watchlists_name_unique`. Postgres names a column-level UNIQUE
+    // `<table>_<column>_key`, so the real constraint is `watchlists_name_key`
+    // and the `IF EXISTS` turned that line into a silent no-op. The global
+    // constraint therefore survived every migration run, and production shows
+    // exactly what that implies: the S&P 500 seed failed for users 2, 3 and 4
+    // with `duplicate key value violates unique constraint "watchlists_name_key"`
+    // because user 1 already held a watchlist named "S&P 500". Any name any
+    // user has ever used is burned for everyone.
+    //
+    // Drop it under both spellings (harmless if neither is present) and replace
+    // it with the constraint that was actually intended. Users whose seed
+    // failed self-heal: ensureSP500Seeded only records success, so the next
+    // watchlist load retries.
+    sql: `
+      ALTER TABLE watchlists DROP CONSTRAINT IF EXISTS watchlists_name_key;
+      ALTER TABLE watchlists DROP CONSTRAINT IF EXISTS watchlists_name_unique;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_watchlists_user_name ON watchlists(user_id, name);
+    `,
+  },
 ];
 
 // Data-removing statements we refuse to run silently. Note these are scoped to

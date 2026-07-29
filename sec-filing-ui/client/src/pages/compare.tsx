@@ -105,6 +105,24 @@ export default function Compare() {
     [filings],
   );
 
+  // The filing library is a shared corpus — every account sees every rendered
+  // filing — but /api/all-tickers only returns tickers from YOUR watchlists.
+  // Driving the picker from that alone hides comparable filings that are
+  // already sitting in the library: anything a teammate fetched, and every
+  // Registration/IPO name, which never lands in a watchlist at all. Union the
+  // two. Watchlist entries win on collision because they carry the tracked
+  // filing types; anything else with at least one rendered filing is added
+  // from the library, using that filing's CIK so "Load history" still works.
+  const pickerTickers: TickerInfo[] = useMemo(() => {
+    const byTicker = new Map<string, TickerInfo>();
+    for (const t of allTickers) byTicker.set(t.ticker, t);
+    for (const f of completeFilings) {
+      if (byTicker.has(f.ticker)) continue;
+      byTicker.set(f.ticker, { ticker: f.ticker, cik: f.cik, filingTypes: HISTORY_FORMS });
+    }
+    return Array.from(byTicker.values()).sort((a, b) => a.ticker.localeCompare(b.ticker));
+  }, [allTickers, completeFilings]);
+
   const [ticker, setTicker] = useState<string>("");
   const [tickerOpen, setTickerOpen] = useState(false);
   const [accA, setAccA] = useState<string>("");
@@ -136,7 +154,7 @@ export default function Compare() {
     setSectionErrors([]);
   }, [ticker]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const selectedEntry = allTickers.find((t) => t.ticker === ticker);
+  const selectedEntry = pickerTickers.find((t) => t.ticker === ticker);
 
   // Load the last few years of comparable filings for this ticker into the library
   const loadHistoryMutation = useMutation({
@@ -231,7 +249,7 @@ export default function Compare() {
                 <CommandList>
                   <CommandEmpty>No ticker found.</CommandEmpty>
                   <CommandGroup>
-                    {allTickers.map((t) => (
+                    {pickerTickers.map((t) => (
                       <CommandItem
                         key={t.ticker}
                         value={t.ticker}

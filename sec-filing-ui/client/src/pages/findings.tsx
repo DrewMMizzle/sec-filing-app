@@ -360,6 +360,13 @@ export default function Findings() {
   const initialFiled = initialTicker ? { from: "", to: "" } : defaultFiledRange();
   const [filedFrom, setFiledFrom] = useState(initialFiled.from);
   const [filedTo, setFiledTo] = useState(initialFiled.to);
+  // Whether the default 7-day window was dropped automatically because it hid
+  // every finding — see the auto-widen effect below.
+  const [autoWidened, setAutoWidened] = useState(false);
+  // Cleared the moment the user touches the date filter themselves, which
+  // switches the auto-widen off for good: past that point an empty result is
+  // the range they asked for, not a default getting in their way.
+  const defaultRangeUntouched = useRef(!initialTicker);
   const [confirmReview, setConfirmReview] = useState(false);
   const [askFiling, setAskFiling] = useState<{
     accession: string;
@@ -428,6 +435,37 @@ export default function Findings() {
         ),
     [filings, statusMap],
   );
+
+  // The 7-day default is the right lens on a library that's being fed
+  // continuously. It's the wrong one on arrival: a new or returning user
+  // whose findings are all older than a week lands on the flagship view
+  // completely empty, with nothing on screen pointing at the date filter as
+  // the reason. So if the untouched default window hides every finding while
+  // findings do exist, drop the date bound once and say so in the banner
+  // below. Fires only for the default range, only once, and never after the
+  // user has set dates of their own.
+  const anyRowInFiledRange = useMemo(
+    () =>
+      allRows.some((r) => {
+        const d = r.filing.filingDate || "";
+        if (!d) return false;
+        if (filedFrom && d < filedFrom) return false;
+        if (filedTo && d > filedTo) return false;
+        return true;
+      }),
+    [allRows, filedFrom, filedTo],
+  );
+
+  useEffect(() => {
+    if (!defaultRangeUntouched.current) return;
+    if (!filedFrom && !filedTo) return;
+    if (allRows.length === 0) return; // nothing to show at any range
+    if (anyRowInFiledRange) return;
+    defaultRangeUntouched.current = false;
+    setFiledFrom("");
+    setFiledTo("");
+    setAutoWidened(true);
+  }, [allRows.length, anyRowInFiledRange, filedFrom, filedTo]);
 
   // If the query exactly matches a known ticker, filter by that ticker rather
   // than substring-matching it inside finding text (so "BA" → ticker BA, not
@@ -952,6 +990,8 @@ export default function Findings() {
             from={filedFrom}
             to={filedTo}
             onChange={(from, to) => {
+              defaultRangeUntouched.current = false;
+              setAutoWidened(false);
               setFiledFrom(from);
               setFiledTo(to);
             }}
@@ -967,6 +1007,13 @@ export default function Findings() {
           </Button>
         </div>
       </Card>
+
+      {autoWidened && (
+        <div className="mb-3 text-sm text-muted-foreground" data-testid="text-auto-widened">
+          No findings were filed in the last 7 days, so the date filter was
+          cleared — showing all dates.
+        </div>
+      )}
 
       <div className="mb-3 text-sm text-muted-foreground">
         {rows.length} finding{rows.length !== 1 ? "s" : ""}

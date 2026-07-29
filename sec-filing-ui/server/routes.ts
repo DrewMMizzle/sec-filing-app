@@ -2,6 +2,7 @@ import type { Express } from "express";
 import type { Server } from "http";
 import { storage, initDatabase, parseFilingTypesSafe } from "./storage";
 import { insertWatchlistSchema } from "@shared/schema";
+import { z } from "zod";
 import { spawn } from "child_process";
 import path from "path";
 import fs from "fs";
@@ -19,7 +20,7 @@ import {
   logAuthConfig,
 } from "./auth";
 import { ensureSP500Seeded } from "./seed-sp500";
-import { getSecTickerIndex } from "./sec-index";
+import { getSecTickerIndex, searchSecTickerIndexByName } from "./sec-index";
 import { isReviewEnabled, kickReviewProcessor, reviewCostUsd, requestCancelReview, isReviewProcessing, claudeHttpError } from "./review";
 import {
   lookupCikSubmissions,
@@ -635,16 +636,57 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     res.json({ ...wl, tickers, access, ownerName });
   });
 
+  // Watchlist tickers are managed through /api/watchlists/:id/tickers — this
+  // route only takes a name. Parsing strictly is the point: zod strips unknown
+  // keys by default, so a client that posted `{ name, tickers: [...] }` used to
+  // get a 201 and an empty watchlist, with nothing anywhere saying the tickers
+  // had been thrown away. Same for the rename route below. Silently discarding
+  // half a request is worse than refusing it.
+  const createWatchlistBodySchema = z
+    .object({ name: z.string().trim().min(1, "name is required") })
+    .strict();
+
+  // Drizzle wraps the driver error, so the Postgres SQLSTATE sits on the cause
+  // chain while the top-level message is just "Failed query: insert into …".
+  // The old `message.includes("unique")` check therefore never matched, and a
+  // duplicate name came back as a 500 with the raw SQL and parameters in the
+  // response body. Match on 23505 (unique_violation) instead.
+  function isUniqueViolation(err: unknown): boolean {
+    let e: any = err;
+    for (let depth = 0; e && depth < 5; depth++) {
+      if (e.code === "23505") return true;
+      e = e.cause;
+    }
+    return false;
+  }
+
+  function unknownKeyError(err: z.ZodError): string | null {
+    const keys = err.issues
+      .filter((i) => i.code === "unrecognized_keys")
+      .flatMap((i) => (i as z.ZodIssue & { keys: string[] }).keys);
+    if (keys.length === 0) return null;
+    return (
+      `Unsupported field(s): ${keys.join(", ")}. A watchlist is created with a name only — ` +
+      "add tickers with POST /api/watchlists/:id/tickers."
+    );
+  }
+
   app.post("/api/watchlists", requireAuth, async (req, res) => {
     const userId = req.user!.id;
-    const parsed = insertWatchlistSchema.safeParse({ ...req.body, userId });
+    const body = createWatchlistBodySchema.safeParse(req.body);
+    if (!body.success) {
+      const unknown = unknownKeyError(body.error);
+      if (unknown) return res.status(400).json({ error: unknown });
+      return res.status(400).json({ error: body.error.flatten() });
+    }
+    const parsed = insertWatchlistSchema.safeParse({ name: body.data.name, userId });
     if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
     try {
       const wl = await storage.createWatchlist(parsed.data);
       res.status(201).json(wl);
     } catch (e: any) {
-      if (e.message?.includes("unique") || e.message?.includes("duplicate")) {
-        return res.status(409).json({ error: "A watchlist with that name already exists" });
+      if (isUniqueViolation(e)) {
+        return res.status(409).json({ error: "You already have a watchlist with that name" });
       }
       throw e;
     }
@@ -658,13 +700,23 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     if (!access) return res.status(404).json({ error: "Watchlist not found" });
     if (access !== "owner") return res.status(403).json({ error: "Only the owner can rename a watchlist" });
 
-    const { name } = req.body;
-    if (!name || typeof name !== "string") {
+    const body = createWatchlistBodySchema.safeParse(req.body);
+    if (!body.success) {
+      const unknown = unknownKeyError(body.error);
+      if (unknown) return res.status(400).json({ error: unknown });
       return res.status(400).json({ error: "name is required" });
     }
-    const updated = await storage.renameWatchlist(id, name.trim());
-    if (!updated) return res.status(404).json({ error: "Watchlist not found" });
-    res.json(updated);
+
+    try {
+      const updated = await storage.renameWatchlist(id, body.data.name);
+      if (!updated) return res.status(404).json({ error: "Watchlist not found" });
+      res.json(updated);
+    } catch (e: any) {
+      if (isUniqueViolation(e)) {
+        return res.status(409).json({ error: "You already have a watchlist with that name" });
+      }
+      throw e;
+    }
   });
 
   app.delete("/api/watchlists/:id", requireAuth, async (req, res) => {
@@ -1777,11 +1829,22 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
         const sub = await lookupCikSubmissions(q);
         if (sub) push({ cik: sub.cik, name: sub.name, ticker: sub.tickers[0] });
       } else {
-        // 2. Alpha → try the tickered-companies index first.
-        const idx = await getSecTickerIndex();
-        const tickerHit = idx.get(q.toUpperCase());
-        if (tickerHit) {
-          push({ cik: tickerHit.cik, name: tickerHit.name, ticker: q.toUpperCase() });
+        // 2. Alpha → try the tickered-companies index first, by symbol AND by
+        //    company name. Name matching matters: the index is keyed on
+        //    ticker, so "Honeywell" used to miss it completely and fall
+        //    through to EDGAR full-text search, which indexes filing bodies
+        //    rather than filers and therefore answers a company-name query
+        //    with whoever happened to mention that name.
+        try {
+          const idx = await getSecTickerIndex();
+          const tickerHit = idx.get(q.toUpperCase());
+          if (tickerHit) {
+            push({ cik: tickerHit.cik, name: tickerHit.name, ticker: q.toUpperCase() });
+          }
+          for (const m of await searchSecTickerIndexByName(q)) push(m);
+        } catch (err) {
+          // The SEC index is a nice-to-have here; EDGAR search below still runs.
+          console.warn("SEC ticker index lookup failed:", err);
         }
       }
 
