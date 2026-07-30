@@ -613,6 +613,26 @@ export class DatabaseStorage {
     return rows[0]?.value ?? null;
   }
 
+  // Atomically claim a marker: set `key` to `value` and report whether THIS
+  // call is the one that set it. Returns false if the key already held that
+  // value.
+  //
+  // Done as a single conditional upsert rather than read-then-write so two
+  // callers racing on the same value can't both believe they won. The
+  // scheduler uses it to make "already ran today" survive a process restart.
+  async claimSettingOnce(key: string, value: string): Promise<boolean> {
+    const rows = await db
+      .insert(settings)
+      .values({ key, value })
+      .onConflictDoUpdate({
+        target: settings.key,
+        set: { value },
+        where: sql`${settings.value} IS DISTINCT FROM ${value}`,
+      })
+      .returning({ key: settings.key });
+    return rows.length > 0;
+  }
+
   async setSetting(key: string, value: string | null): Promise<void> {
     // Atomic upsert so concurrent first-time writes to the same key can't both
     // INSERT and trip the primary-key constraint.

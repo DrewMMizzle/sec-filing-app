@@ -19,6 +19,8 @@ import { isAdminEmail } from "./auth";
 // — someone has to opt in by setting the hour.
 
 const CHECK_INTERVAL_MS = 5 * 60 * 1000; // 5 min; the hour is the granularity
+// UTC date of the last nightly run, persisted so restarts can't re-fire it.
+const LAST_RUN_KEY = "scheduler_last_nightly_fetch_date";
 const DEFAULT_LOOKBACK_DAYS = 3;
 const DEFAULT_LIMIT_PER_TICKER = 5;
 
@@ -122,16 +124,35 @@ export function startScheduler(): void {
 
   // Poll rather than compute a single long timeout: a setTimeout hours out
   // silently loses its schedule across a container restart, and Railway
-  // restarts often. `lastRunDate` makes the tick idempotent, so waking up
-  // repeatedly inside the target hour still fires exactly once a day.
-  let lastRunDate: string | null = null;
+  // restarts often.
+  //
+  // The "already ran today" marker lives in the settings table, not in a
+  // variable, precisely because those restarts are frequent. With it in
+  // memory, a restart at 03:30 after a 03:02 run would reset the guard, see
+  // the hour still matching, and fire a second time — harmless money-wise
+  // (dedup skips everything already rendered) but a full extra round of SEC
+  // polling, one request per ticker, against a rate-limited API.
+  //
+  // Claiming is a single conditional upsert, so the claim and the check can't
+  // interleave. `running` additionally stops two ticks overlapping if the DB
+  // is slow, and the run slot in startFetchRun is the final backstop.
+  let running = false;
 
   setInterval(() => {
+    if (running) return;
     const now = new Date();
     if (now.getUTCHours() !== hour) return;
-    const today = ymd(now);
-    if (lastRunDate === today) return;
-    lastRunDate = today;
-    runNightlyFetch().catch((err) => console.error("[scheduler] Nightly fetch failed:", err));
+
+    running = true;
+    void (async () => {
+      try {
+        const claimed = await storage.claimSettingOnce(LAST_RUN_KEY, ymd(now));
+        if (claimed) await runNightlyFetch();
+      } catch (err) {
+        console.error("[scheduler] Nightly fetch failed:", err);
+      } finally {
+        running = false;
+      }
+    })();
   }, CHECK_INTERVAL_MS).unref();
 }
