@@ -77,13 +77,34 @@ function nextItemIndex(text: string, from: number): number {
 
 const SECTION_MAX_CHARS = 80_000;
 
+// How many times a section's heading appears in the text. A filing normally
+// has two: the table-of-contents entry and the section itself. Exactly one
+// usually means the body is missing from the extracted text — which is a very
+// different problem from a heading the pattern failed to match, and worth
+// telling them apart in an error message.
+export function countSectionHeadings(text: string, key: SectionKey): number {
+  const heading = new RegExp(SECTION_HEADINGS[key].source, "gi");
+  let n = 0;
+  while (heading.exec(text) !== null) n++;
+  return n;
+}
+
 // Extract a named section from filing text. Heuristic: find each occurrence of
 // the heading, capture to the next line-leading "Item N" header, and keep the
 // longest capture (the real section, not the short table-of-contents entry).
+//
+// `minBody` lets a caller reject captures that are too short to be that
+// section's real body. A table of contents lists the items consecutively, so
+// the capture from a TOC entry runs only to the next TOC line — a heading plus
+// a page number, and nothing else. Callers that know their section is always
+// substantial (MD&A) pass a floor so those TOC-shaped captures are skipped
+// rather than returned as the answer. Defaults to 0 because Risk Factors and
+// Legal Proceedings in a 10-Q legitimately can be a single line.
 export function extractSection(
   text: string,
   key: SectionKey,
   maxChars: number = SECTION_MAX_CHARS,
+  minBody = 0,
 ): string | null {
   const heading = new RegExp(SECTION_HEADINGS[key].source, "gi");
   let best = "";
@@ -93,6 +114,7 @@ export function extractSection(
     const next = nextItemIndex(text, from + 40);
     const end = next === -1 ? Math.min(text.length, from + maxChars) : next;
     const body = text.slice(from, end).trim();
+    if (body.length < minBody) continue; // TOC-shaped capture, not the section
     if (body.length > best.length) best = body;
   }
   // The longest candidate filters out short table-of-contents matches; this

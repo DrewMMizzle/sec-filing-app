@@ -1,6 +1,6 @@
 import type { Filing } from "@shared/schema";
 import { MODEL, getAnthropicClient, resolvePdfPath, extractPdfText } from "./review";
-import { extractSection } from "./compare";
+import { extractSection, countSectionHeadings } from "./compare";
 import { UNTRUSTED_CONTENT_GUIDANCE, wrapUntrustedFiling, extractModelText } from "./prompt-safety";
 
 // The MD&A digest is for stock-research analysts: it pulls the operating story
@@ -160,9 +160,37 @@ export async function analyzeMdna(filing: Filing): Promise<MdnaResult> {
     );
   }
   const fullText = await extractPdfText(pdfPath);
-  const section = extractSection(fullText, "mdna", MDNA_MAX_CHARS);
+  // Every 10-K and 10-Q carries a substantial MD&A — that's what isMdnaEligible
+  // gates on — so anything shorter than MDNA_MIN_CHARS is a table-of-contents
+  // entry or a stray cross-reference rather than the section. Passing the floor
+  // to extractSection makes it skip those occurrences instead of returning the
+  // longest one, so a TOC line can't masquerade as the body.
+  const section = extractSection(fullText, "mdna", MDNA_MAX_CHARS, MDNA_MIN_CHARS);
   if (!section) {
-    throw new Error("Could not locate an MD&A section in this filing's text.");
+    // Say which failure this is. The three causes need different responses and
+    // are indistinguishable from "could not locate an MD&A section":
+    //   headings 0        -> the heading spelling isn't matched (a pattern bug)
+    //   headings 1        -> only the TOC entry is present; the body never made
+    //                        it into the PDF, so this is a render problem
+    //   headings 2+, short-> the body is there but the section boundary is
+    //                        landing in the wrong place (an extractor bug)
+    // The character counts are here so a screenshot of the error is enough to
+    // tell them apart without production access.
+    const headings = countSectionHeadings(fullText, "mdna");
+    const loose = extractSection(fullText, "mdna", MDNA_MAX_CHARS);
+    const detail =
+      headings === 0
+        ? "the MD&A heading was not found anywhere in the text"
+        : headings === 1
+          ? "the MD&A heading appears only once — likely the table-of-contents entry, " +
+            "with the section body missing from the rendered PDF"
+          : `the MD&A heading appears ${headings} times but the longest section body ` +
+            `found was only ${loose?.length ?? 0} characters`;
+    throw new Error(
+      `Could not extract an MD&A section from this filing: ${detail}. ` +
+        `The filing's extracted text is ${fullText.length.toLocaleString()} characters. ` +
+        "Re-render the filing and try again.",
+    );
   }
   // Every 10-K and 10-Q carries a substantial MD&A — that's what isMdnaEligible
   // gates on — so a capture this short means extraction latched onto a table-of
