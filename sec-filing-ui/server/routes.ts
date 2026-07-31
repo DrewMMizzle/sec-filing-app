@@ -1789,6 +1789,18 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     await storage.setFilingMdnaStatus(accession, "analyzing");
     try {
       const result = await analyzeMdna(filing);
+      // available=false is the model telling us the text it received wasn't an
+      // MD&A. On a 10-K/10-Q that is an extraction failure, not a finished
+      // analysis — recording it as one gave the filing a green "Analyzed"
+      // badge, a charge, and a flat "No MD&A operational detail was found",
+      // with nothing to say the pipeline had failed or that retrying was worth
+      // it. Surface it as the error it is.
+      if (!result.digest.available) {
+        throw new Error(
+          "Claude received the extracted text but it wasn't an MD&A section — " +
+            "extraction picked up the wrong part of the filing. Re-render the filing and try again.",
+        );
+      }
       await storage.setFilingMdnaResult(accession, result.digest, result.usage);
       res.json({
         digest: result.digest,

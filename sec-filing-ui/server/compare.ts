@@ -20,15 +20,60 @@ export const SECTION_LABELS: Record<SectionKey, string> = {
 // since 10-K and 10-Q number these items differently.
 const SECTION_HEADINGS: Record<SectionKey, RegExp> = {
   risk_factors: /risk\s+factors/i,
-  mdna: /management[’'`]s\s+discussion\s+and\s+analysis/i,
+  // The possessive in "Management's" survives PDF text extraction in several
+  // shapes: a curly quote, a straight quote, an acute accent, a LEFT curly
+  // quote (some renderers flip it), a space on either side, or nothing at all
+  // ("Managements"). Matching only ’ ' ` meant four common spellings failed to
+  // match at all, and the section came back null — surfaced to the user as
+  // "Could not locate an MD&A section in this filing's text."
+  mdna: /management[\s’'`´‘]*s\s+discussion\s+and\s+analysis/i,
   legal: /legal\s+proceedings/i,
 };
 
-// A section-ending "Item N" header. Anchored to the start of a line so an
-// inline cross-reference (e.g. "...the financial statements in Part I, Item 1
-// of this report...") — which a 10-Q's MD&A almost always opens with — is NOT
-// mistaken for the next section, which would truncate the capture to one line.
-const NEXT_ITEM = /\n[^\S\r\n]*item\s+\d+[a-z]?\b[.:)\s]/gi;
+// A section-ending "Item N" header.
+//
+// Line-anchoring alone is NOT enough, and the previous comment here had it
+// backwards. A 10-Q's MD&A almost always opens with a cross-reference like
+// "...the financial statements included in Part I, Item 1 of this Quarterly
+// Report..." — and because PDF text extraction hard-wraps at the visual line,
+// that reference regularly lands with "Item 1" at the START of a line. The
+// line anchor then matched the cross-reference and truncated the whole MD&A
+// to its opening clause.
+//
+// Two things separate a real section header from a wrapped cross-reference:
+// a header is followed by a Capitalized title, and a header line contains the
+// title and nothing else. Prose keeps running past it. Require the capital
+// here; the line-length check is applied in nextItemIndex below.
+// Group 1 spans everything up to where the title would begin, so the caller
+// can inspect that character. The capital check has to happen in code: this
+// regex is case-insensitive (headers appear as "Item" and "ITEM"), and under
+// the /i flag a `[A-Z]` lookahead would happily match a lowercase "of".
+const NEXT_ITEM = /\n([^\S\r\n]*item\s+\d+[a-z]?[.:)\-–—]?[^\S\r\n]+)/gi;
+
+// Longest a line may be and still be treated as a section header rather than
+// wrapped body text. Real headers ("Item 3. Quantitative and Qualitative
+// Disclosures About Market Risk") run well under this.
+const MAX_HEADER_LINE_CHARS = 140;
+
+// Index of the next real "Item N" section header at or after `from`, or -1.
+// Skips candidates whose line is too long to be a heading — that's a sentence
+// that happens to begin with a cross-reference.
+function nextItemIndex(text: string, from: number): number {
+  NEXT_ITEM.lastIndex = from;
+  let m: RegExpExecArray | null;
+  while ((m = NEXT_ITEM.exec(text)) !== null) {
+    const lineStart = m.index + 1; // skip the leading \n the match includes
+    const lineEnd = text.indexOf("\n", lineStart);
+    const line = (lineEnd === -1 ? text.slice(lineStart) : text.slice(lineStart, lineEnd)).trim();
+    // A wrapped cross-reference continues the sentence in lowercase ("Item 1
+    // of this Quarterly Report"); a real header is followed by its title.
+    const titleStart = text[m.index + 1 + m[1].length];
+    if (titleStart && titleStart >= "A" && titleStart <= "Z" && line.length <= MAX_HEADER_LINE_CHARS) {
+      return m.index;
+    }
+  }
+  return -1;
+}
 
 const SECTION_MAX_CHARS = 80_000;
 
@@ -45,9 +90,8 @@ export function extractSection(
   let m: RegExpExecArray | null;
   while ((m = heading.exec(text)) !== null) {
     const from = m.index;
-    NEXT_ITEM.lastIndex = from + 40;
-    const next = NEXT_ITEM.exec(text);
-    const end = next ? next.index : Math.min(text.length, from + maxChars);
+    const next = nextItemIndex(text, from + 40);
+    const end = next === -1 ? Math.min(text.length, from + maxChars) : next;
     const body = text.slice(from, end).trim();
     if (body.length > best.length) best = body;
   }
