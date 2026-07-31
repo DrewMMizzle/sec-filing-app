@@ -9,6 +9,10 @@ import { UNTRUSTED_CONTENT_GUIDANCE, wrapUntrustedFiling, extractModelText } fro
 // guidance — which the editorial "gotcha" review deliberately ignores.
 
 const MDNA_MAX_CHARS = 150_000; // ~37k tokens — comfortably fits a full MD&A.
+// Floor for a plausible MD&A body. extractSection's own floor is 80 chars,
+// which is deliberately permissive because a 10-Q's Risk Factors legitimately
+// can be one line ("no material changes"). An MD&A never is.
+const MDNA_MIN_CHARS = 1_500;
 const MDNA_TIMEOUT_MS = 5 * 60 * 1000;
 
 // Forms that carry an MD&A section.
@@ -159,6 +163,18 @@ export async function analyzeMdna(filing: Filing): Promise<MdnaResult> {
   const section = extractSection(fullText, "mdna", MDNA_MAX_CHARS);
   if (!section) {
     throw new Error("Could not locate an MD&A section in this filing's text.");
+  }
+  // Every 10-K and 10-Q carries a substantial MD&A — that's what isMdnaEligible
+  // gates on — so a capture this short means extraction latched onto a table-of
+  // -contents line or a cross-reference, not the section. Fail here rather than
+  // spending a Claude call to be told the same thing: the old behaviour sent
+  // the fragment anyway, got available=false back, and billed the user for it.
+  if (section.length < MDNA_MIN_CHARS) {
+    throw new Error(
+      `Only ${section.length} characters of MD&A text could be extracted from this filing, ` +
+        "which is too little to analyze — the section heading was found but its body wasn't. " +
+        "Re-render the filing and try again.",
+    );
   }
 
   const userContent =
