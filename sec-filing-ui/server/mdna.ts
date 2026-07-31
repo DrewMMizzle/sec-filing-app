@@ -1,6 +1,6 @@
 import type { Filing } from "@shared/schema";
 import { MODEL, getAnthropicClient, resolvePdfPath, extractPdfText } from "./review";
-import { extractSection, countSectionHeadings } from "./compare";
+import { extractSection, countSectionHeadings, normalizeFilingText } from "./compare";
 import { UNTRUSTED_CONTENT_GUIDANCE, wrapUntrustedFiling, extractModelText } from "./prompt-safety";
 
 // The MD&A digest is for stock-research analysts: it pulls the operating story
@@ -147,6 +147,35 @@ const EMPTY_DIGEST: MdnaDigest = {
   other: [],
 };
 
+// When the heading pattern fails, report what weaker signals DO appear so the
+// next failure identifies itself instead of costing another round trip. Each
+// probe strips one more requirement off the full heading, so the first one
+// that fires says which part of the spelling is the problem — and the sample
+// shows the surrounding text verbatim, which beats guessing at characters.
+function probeMdnaHeadings(raw: string): string {
+  const text = normalizeFilingText(raw);
+  const count = (re: RegExp) => (text.match(new RegExp(re.source, "gi")) ?? []).length;
+  const probes: Array<[string, RegExp]> = [
+    ["'discussion and/& analysis'", /discussion\s*(?:and|&)\s*analysis/],
+    ["'discussion'", /discussion/],
+    ["line-leading 'Item 2'", /\n[^\S\r\n]*item\s+2\b/],
+  ];
+  const counts = probes.map(([label, re]) => `${label} x${count(re)}`).join(", ");
+
+  // A window around the last 'discussion' occurrence — the body header, if it
+  // is there at all, is far more likely to be the last one than the TOC entry.
+  const all = Array.from(text.matchAll(/discussion/gi));
+  const last = all[all.length - 1];
+  const sample =
+    last === undefined
+      ? ""
+      : ` Text near the last 'discussion': "${text
+          .slice(Math.max(0, last.index - 70), last.index + 90)
+          .replace(/\s+/g, " ")
+          .trim()}".`;
+  return `Probes: ${counts}.${sample}`;
+}
+
 // Run the MD&A digest for one filing. Throws on hard failures (missing PDF, no
 // MD&A section, Claude error) so the caller can persist an error state.
 export async function analyzeMdna(filing: Filing): Promise<MdnaResult> {
@@ -183,24 +212,13 @@ export async function analyzeMdna(filing: Filing): Promise<MdnaResult> {
         ? "the MD&A heading was not found anywhere in the text"
         : headings === 1
           ? "the MD&A heading appears only once — likely the table-of-contents entry, " +
-            "with the section body missing from the rendered PDF"
+            "with the body header spelled differently or the body missing"
           : `the MD&A heading appears ${headings} times but the longest section body ` +
             `found was only ${loose?.length ?? 0} characters`;
     throw new Error(
       `Could not extract an MD&A section from this filing: ${detail}. ` +
         `The filing's extracted text is ${fullText.length.toLocaleString()} characters. ` +
-        "Re-render the filing and try again.",
-    );
-  }
-  // Every 10-K and 10-Q carries a substantial MD&A — that's what isMdnaEligible
-  // gates on — so a capture this short means extraction latched onto a table-of
-  // -contents line or a cross-reference, not the section. Fail here rather than
-  // spending a Claude call to be told the same thing: the old behaviour sent
-  // the fragment anyway, got available=false back, and billed the user for it.
-  if (section.length < MDNA_MIN_CHARS) {
-    throw new Error(
-      `Only ${section.length} characters of MD&A text could be extracted from this filing, ` +
-        "which is too little to analyze — the section heading was found but its body wasn't. " +
+        `${probeMdnaHeadings(fullText)} ` +
         "Re-render the filing and try again.",
     );
   }

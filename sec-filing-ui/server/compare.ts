@@ -16,17 +16,30 @@ export const SECTION_LABELS: Record<SectionKey, string> = {
   legal: "Legal Proceedings",
 };
 
+// Fold the lookalike characters PDF text extraction produces so heading
+// matching doesn't have to enumerate them. Chasing these one at a time is a
+// losing game — a TMUS 10-Q matched the table-of-contents entry and nothing
+// else across 221,552 characters, because the body header was spelled
+// differently from the entry that pointed at it.
+//
+// Newlines are preserved deliberately: section boundaries are line-anchored.
+const APOSTROPHES = /[‘’‚‛ʼ´`′]/g;
+const INVISIBLES = /[­​‌‍﻿]/g;
+const ODD_SPACES = /[  -   　]/g;
+
+export function normalizeFilingText(text: string): string {
+  return text.replace(INVISIBLES, "").replace(APOSTROPHES, "'").replace(ODD_SPACES, " ");
+}
+
 // Heading text used to locate each section. Matched by name (not item number),
-// since 10-K and 10-Q number these items differently.
+// since 10-K and 10-Q number these items differently. Run against normalized
+// text, so these only need to handle real spelling variation:
+//   - the possessive may be an apostrophe, a space, or absent ("Managements")
+//   - "and" is written "&" at least as often, especially in body headers —
+//     this app's own UI calls the page "Management's Discussion & Analysis"
 const SECTION_HEADINGS: Record<SectionKey, RegExp> = {
   risk_factors: /risk\s+factors/i,
-  // The possessive in "Management's" survives PDF text extraction in several
-  // shapes: a curly quote, a straight quote, an acute accent, a LEFT curly
-  // quote (some renderers flip it), a space on either side, or nothing at all
-  // ("Managements"). Matching only ’ ' ` meant four common spellings failed to
-  // match at all, and the section came back null — surfaced to the user as
-  // "Could not locate an MD&A section in this filing's text."
-  mdna: /management[\s’'`´‘]*s\s+discussion\s+and\s+analysis/i,
+  mdna: /management['\s]*s?\s*discussion\s*(?:and|&|and\/or)\s*analysis/i,
   legal: /legal\s+proceedings/i,
 };
 
@@ -82,7 +95,8 @@ const SECTION_MAX_CHARS = 80_000;
 // usually means the body is missing from the extracted text — which is a very
 // different problem from a heading the pattern failed to match, and worth
 // telling them apart in an error message.
-export function countSectionHeadings(text: string, key: SectionKey): number {
+export function countSectionHeadings(raw: string, key: SectionKey): number {
+  const text = normalizeFilingText(raw);
   const heading = new RegExp(SECTION_HEADINGS[key].source, "gi");
   let n = 0;
   while (heading.exec(text) !== null) n++;
@@ -101,11 +115,15 @@ export function countSectionHeadings(text: string, key: SectionKey): number {
 // rather than returned as the answer. Defaults to 0 because Risk Factors and
 // Legal Proceedings in a 10-Q legitimately can be a single line.
 export function extractSection(
-  text: string,
+  raw: string,
   key: SectionKey,
   maxChars: number = SECTION_MAX_CHARS,
   minBody = 0,
 ): string | null {
+  // Normalized once here so heading matching, the line-anchored boundary scan,
+  // and the text handed to Claude all see the same string — grounding checks
+  // compare model quotes against this same section text.
+  const text = normalizeFilingText(raw);
   const heading = new RegExp(SECTION_HEADINGS[key].source, "gi");
   let best = "";
   let m: RegExpExecArray | null;
