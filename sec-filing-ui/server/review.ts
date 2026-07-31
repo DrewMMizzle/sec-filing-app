@@ -15,7 +15,15 @@ const __dirname_compat = path.dirname(__filename_compat);
 const PDF_STORAGE_DIR = process.env.PDF_STORAGE_DIR || path.resolve(__dirname_compat, "..", "pdfs");
 const PIPELINE_ROOT = process.env.PIPELINE_ROOT || path.resolve(__dirname_compat, "../../sec-pdf-pipeline");
 
-export const MODEL = "claude-opus-4-8";
+// Shared by review, compare, MD&A and chat. Opus 5 is a drop-in on Opus 4.8's
+// pricing ($5/$25 per 1M) and is stronger on exactly this workload — long
+// documents and structured extraction.
+//
+// One behavioral difference matters at every call site: thinking is ON by
+// default here, where omitting it on Opus 4.8 meant no thinking. Since
+// max_tokens caps thinking AND response text together, every call below sets
+// `thinking` explicitly rather than relying on the default.
+export const MODEL = "claude-opus-5";
 // Cap the text sent per filing to bound cost/latency on very large 10-Ks.
 const MAX_CHARS = 400_000;
 // Hard ceiling per review so one stalled call can't freeze the serial queue.
