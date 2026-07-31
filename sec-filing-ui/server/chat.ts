@@ -314,7 +314,22 @@ export async function chatAboutFindings(history: Turn[]): Promise<ChatResult> {
     const message = await getAnthropicClient().messages.create(
       {
         model: MODEL,
-        max_tokens: 4000,
+        // Chat is the one interactive path — a person is watching a spinner.
+        //
+        // On Opus 4.8 this call ran with no thinking because `thinking` was
+        // omitted; on Opus 5 omitting it turns adaptive thinking ON, and
+        // max_tokens caps thinking + answer together. Left alone, 4000 tokens
+        // would be split between the two and long answers would truncate
+        // mid-sentence. So: say what we want rather than inherit it.
+        //
+        // Thinking stays on (it earns its keep reading filings, and disabling
+        // it on Opus 5 risks `<thinking>` tags leaking into user-visible
+        // prose), but effort drops to medium — the model is unusually strong
+        // at medium, and it's the lever that keeps this path responsive now
+        // that thinking is in the budget.
+        max_tokens: 12000,
+        thinking: { type: "adaptive" },
+        output_config: { effort: "medium" },
         system: [
           { type: "text", text: CORPUS_SYSTEM_PROMPT },
           // Cache the corpus block so follow-up questions are cheap.
@@ -422,7 +437,12 @@ export async function chatAboutFiling(
     const message = await getAnthropicClient().messages.create(
       {
         model: MODEL,
-        max_tokens: 4000,
+        // Same reasoning as the findings chat above: thinking is on by default
+        // on Opus 5 and shares max_tokens with the answer, so both are set
+        // explicitly instead of inherited.
+        max_tokens: 12000,
+        thinking: { type: "adaptive" },
+        output_config: { effort: "medium" },
         system: [
           { type: "text", text: systemPrompt },
           // 1-hour cache TTL: pays off most on the large full-text body so
