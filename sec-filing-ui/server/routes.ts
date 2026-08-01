@@ -45,6 +45,7 @@ import {
 import { db } from "./storage";
 import { tickers as tickersTable, filings as filingsTable } from "@shared/schema";
 import { eq } from "drizzle-orm";
+import { createLineReader, signalPipelineGroup, stopPipeline } from "./pipeline-process";
 
 // Tracks the in-flight fetch/render pipeline child so a user cancel can kill it.
 let currentFetchChild: ChildProcess | null = null;
@@ -332,9 +333,14 @@ function runFetchPipeline(
       resolve({ success: false, events: [], completedAccessions: [], error: "Pipeline script not found." });
       return;
     }
+    // detached puts the pipeline in its OWN process group. Without it, killing
+    // the python process leaves the Chromium it spawned running — the cancel
+    // reports success while a browser keeps holding memory and the render slot.
+    // Signals are sent to -pid (the whole group) in the cancel route.
     const child = spawn("python3", [pythonScript], {
       cwd: PIPELINE_ROOT,
       env: { ...process.env, PYTHONUNBUFFERED: "1" },
+      detached: true,
     });
     currentFetchChild = child;
     child.stdin.write(input);
@@ -390,18 +396,15 @@ function runFetchPipeline(
         console.error(
           `[pipeline] No output for ${IDLE_TIMEOUT_MS / 1000}s — stopping stalled pipeline.`,
         );
-        try {
-          child.kill("SIGKILL");
-        } catch {
-          // already gone
-        }
+        // Group kill: the stalled component is usually Chromium, not python.
+        signalPipelineGroup(child, "SIGKILL");
       }
     }, 30_000);
 
-    child.stdout.on("data", (data: Buffer) => {
-      lastActivity = Date.now();
-      const lines = data.toString().split("\n").filter(Boolean);
-      for (const line of lines) {
+    // stdout arrives in arbitrary chunks and a JSONL record can be split across
+    // two of them, so lines are reassembled by createLineReader rather than by
+    // splitting each chunk on its own.
+    const handleLine = (line: string) => {
         try {
           const event = JSON.parse(line);
           events.push(event);
@@ -519,7 +522,12 @@ function runFetchPipeline(
         } catch {
           // non-JSON line from Python logging
         }
-      }
+    };
+
+    const stdoutReader = createLineReader(handleLine);
+    child.stdout.on("data", (data: Buffer) => {
+      lastActivity = Date.now();
+      stdoutReader.push(data.toString());
     });
 
     child.stderr.on("data", (data: Buffer) => {
@@ -539,6 +547,10 @@ function runFetchPipeline(
       if (settled) return;
       settled = true;
       clearInterval(watchdog);
+      // A final record with no trailing newline is still a real record — the
+      // pipeline's last "complete" arrives this way whenever the write isn't
+      // newline-terminated before exit. Process it before we settle.
+      stdoutReader.flush();
       // Wait for every copy/DB-update kicked off by stdout to finish
       // (or fail) before we report success/failure. Otherwise the
       // response could fire before the PDF is actually in app storage
@@ -1469,21 +1481,7 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
   // doesn't pick them up automatically.
   app.post("/api/run/cancel", requireAuth, requireAdmin, async (_req, res) => {
     let fetchKilled = false;
-    if (currentFetchChild) {
-      const child = currentFetchChild;
-      try {
-        child.kill("SIGTERM");
-        // Escalate if the child doesn't exit promptly on its own.
-        setTimeout(() => {
-          if (!child.killed) {
-            try { child.kill("SIGKILL"); } catch { /* already gone */ }
-          }
-        }, 3000);
-        fetchKilled = true;
-      } catch (err: any) {
-        console.error("[cancel] Failed to signal fetch child:", err?.message || err);
-      }
-    }
+    const child = currentFetchChild;
     // Mark the run canceled before the child's close handler resolves, so the
     // background task's endRun() (which refuses to patch a run that is no
     // longer "running") can't overwrite this with a spurious "error".
@@ -1494,6 +1492,18 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     }
     const { abortedInFlight } = requestCancelReview();
     const pendingCleared = await storage.clearPendingReviews();
+    if (child) {
+      // Await the actual exit rather than firing SIGTERM and replying. The
+      // run slot is only released by the pipeline's close handler, so a reply
+      // that landed before the child died told the user the run was canceled
+      // while the next fetch was still rejected as "already running".
+      try {
+        await stopPipeline(child);
+        fetchKilled = true;
+      } catch (err: any) {
+        console.error("[cancel] Failed to signal fetch child:", err?.message || err);
+      }
+    }
     res.json({ ok: true, fetchKilled, abortedInFlight, pendingCleared });
   });
 

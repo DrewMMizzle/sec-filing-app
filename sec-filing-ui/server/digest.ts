@@ -199,6 +199,16 @@ export async function ensureFilingDigest(accession: string): Promise<void> {
     await storage.setFilingDigest(accession, JSON.stringify(digest));
     const cost =
       (usage.inputTokens * DIGEST_PRICE_INPUT + usage.outputTokens * DIGEST_PRICE_OUTPUT) / 1_000_000;
+    // Digest generation was spending real money and recording none of it — it
+    // ran in the background after a chat answer, so it never appeared in any
+    // counter or against the cap. Priced here rather than through
+    // recordTokenUsage because the digest runs on its own model tier.
+    await storage.recordUsage({
+      path: "digest",
+      costUsd: cost,
+      accessionNumber: accession,
+      usage: { inputTokens: usage.inputTokens, outputTokens: usage.outputTokens },
+    });
     console.log(`[digest] ${accession}: generated (~$${cost.toFixed(4)})`);
   } catch (err: any) {
     console.error(`[digest] ${accession}: generation failed:`, err?.message || err);

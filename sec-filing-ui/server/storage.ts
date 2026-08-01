@@ -27,8 +27,11 @@ import { eq, and, gte, lte, asc, desc, inArray, sql, or, isNull } from "drizzle-
 import { runMigrations } from "./migrations";
 import { reviewCostUsd } from "./pricing";
 
-// Accumulated cents for Claude paths with no per-row token columns.
-const SPEND_LEDGER_KEY = "claude_spend_ledger_cents";
+// Every Claude call is attributed to one of these when it's recorded.
+// "review", "mdna" and "compare" are reported separately; the rest roll up
+// into otherUsd.
+export type UsagePath = "review" | "mdna" | "compare" | "chat" | "digest" | "verifier" | "other";
+const BROKEN_OUT_PATHS = new Set<UsagePath>(["review", "mdna", "compare"]);
 
 const DATABASE_URL = process.env.DATABASE_URL;
 if (!DATABASE_URL) {
@@ -531,23 +534,95 @@ export class DatabaseStorage {
         reviewedAt: new Date().toISOString(),
       })
       .where(eq(filings.accessionNumber, accession));
+    // Spend is NOT recorded here. The columns above are overwritten by the next
+    // re-review, so they can't be the ledger — and this method only runs when a
+    // review succeeded, while a refused or truncated response costs the same.
+    // reviewFiling records at the API boundary instead.
   }
 
-  // Team-wide review spend (shared corpus).
-  // Total Claude spend across every path, in USD.
+  // Append one row to the spend ledger. Every Claude call goes through here.
+  //
+  // Append-only on purpose: the numbers this feeds back a hard spend cap, and
+  // the previous scheme derived the total from mutable state (per-filing token
+  // columns overwritten on re-analysis, compare rows upserted per pair, both
+  // erased outright when a filing was deleted). The counter could therefore
+  // fall while real money had been spent. Nothing here updates or deletes.
+  //
+  // Cost is stored in micro-dollars because a typical call is ~$0.015 and
+  // whole cents would round most of them to 1 or 2.
+  //
+  // Best-effort by design: a ledger write must never fail the request the user
+  // is waiting on, so failures are logged rather than thrown.
+  async recordUsage(entry: {
+    path: UsagePath;
+    costUsd: number;
+    accessionNumber?: string | null;
+    usage?: {
+      inputTokens?: number | null;
+      outputTokens?: number | null;
+      cacheReadTokens?: number | null;
+      cacheCreationTokens?: number | null;
+    } | null;
+  }): Promise<void> {
+    const micros = Math.max(0, Math.round(entry.costUsd * 1_000_000));
+    if (micros === 0) return;
+    try {
+      await pool.query(
+        `INSERT INTO usage_events
+           (path, accession_number, cost_micros,
+            input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [
+          entry.path,
+          entry.accessionNumber ?? null,
+          micros,
+          entry.usage?.inputTokens ?? null,
+          entry.usage?.outputTokens ?? null,
+          entry.usage?.cacheReadTokens ?? null,
+          entry.usage?.cacheCreationTokens ?? null,
+        ],
+      );
+    } catch (err) {
+      console.error(`Failed to record ${entry.path} spend:`, err);
+    }
+  }
+
+  // Convenience wrapper for token-priced paths (review, MD&A, chat, digest) so
+  // callers don't each repeat the pricing call.
+  async recordTokenUsage(
+    path: UsagePath,
+    usage: {
+      inputTokens?: number | null;
+      outputTokens?: number | null;
+      cacheReadTokens?: number | null;
+      cacheCreationTokens?: number | null;
+    },
+    accessionNumber?: string | null,
+  ): Promise<void> {
+    await this.recordUsage({
+      path,
+      accessionNumber,
+      usage,
+      costUsd: reviewCostUsd({
+        inputTokens: usage.inputTokens ?? 0,
+        outputTokens: usage.outputTokens ?? 0,
+        cacheReadTokens: usage.cacheReadTokens ?? 0,
+        cacheCreationTokens: usage.cacheCreationTokens ?? 0,
+      }),
+    });
+  }
+
+  // Team-wide Claude spend across every path, in USD, from the append-only
+  // ledger.
   //
   // getReviewUsage below covers only the review columns, and the spend cap was
-  // computed from it alone — so MD&A, Compare and chat spent freely outside the
-  // cap and the counter under-reported. A coverage sweep measured $0.74 counted
-  // against $4.34 actually spent.
-  //
-  // Review and MD&A share a model and pricing, so both price through
-  // reviewCostUsd. Compare persists dollars directly as cents. Chat and the
-  // Haiku verifier have nowhere per-row to live, so they accumulate in a
-  // settings counter via addSpendCents.
+  // once computed from it alone — so MD&A, Compare and chat spent freely
+  // outside the cap and the counter under-reported. A coverage sweep measured
+  // $0.74 counted against $4.34 actually spent.
   //
   // Returned broken out, not just totalled, so the UI can show where the money
-  // went and so a cap that suddenly binds is explainable.
+  // went and so a cap that suddenly binds is explainable. Paths outside the
+  // three headline ones (chat, digest, the Haiku verifier) roll into otherUsd.
   async getClaudeSpendBreakdown(): Promise<{
     reviewUsd: number;
     mdnaUsd: number;
@@ -555,55 +630,21 @@ export class DatabaseStorage {
     otherUsd: number;
     totalUsd: number;
   }> {
-    const [tokens, compare, other] = await Promise.all([
-      pool.query(
-        `SELECT
-           COALESCE(SUM(review_input_tokens), 0)          AS r_in,
-           COALESCE(SUM(review_output_tokens), 0)         AS r_out,
-           COALESCE(SUM(review_cache_read_tokens), 0)     AS r_cr,
-           COALESCE(SUM(review_cache_creation_tokens), 0) AS r_cw,
-           COALESCE(SUM(mdna_input_tokens), 0)            AS m_in,
-           COALESCE(SUM(mdna_output_tokens), 0)           AS m_out,
-           COALESCE(SUM(mdna_cache_read_tokens), 0)       AS m_cr,
-           COALESCE(SUM(mdna_cache_creation_tokens), 0)   AS m_cw
-         FROM filings`,
-      ),
-      pool.query(`SELECT COALESCE(SUM(cost_cents), 0) AS cents FROM filing_compares`),
-      this.getSetting(SPEND_LEDGER_KEY),
-    ]);
-    const t = tokens.rows[0];
-    const price = (i: string, o: string, cr: string, cw: string) =>
-      reviewCostUsd({
-        inputTokens: parseInt(t[i], 10),
-        outputTokens: parseInt(t[o], 10),
-        cacheReadTokens: parseInt(t[cr], 10),
-        cacheCreationTokens: parseInt(t[cw], 10),
-      });
-    const reviewUsd = price("r_in", "r_out", "r_cr", "r_cw");
-    const mdnaUsd = price("m_in", "m_out", "m_cr", "m_cw");
-    const compareUsd = parseInt(compare.rows[0].cents, 10) / 100;
-    const otherUsd = (parseInt(other ?? "0", 10) || 0) / 100;
-    return {
-      reviewUsd,
-      mdnaUsd,
-      compareUsd,
-      otherUsd,
-      totalUsd: reviewUsd + mdnaUsd + compareUsd + otherUsd,
-    };
-  }
-
-  // Add to the ledger for paths with no per-row home (chat, the Haiku
-  // verifier). Atomic so concurrent calls can't lose an increment the way a
-  // read-modify-write would.
-  async addSpendCents(cents: number): Promise<void> {
-    const whole = Math.max(0, Math.round(cents));
-    if (whole === 0) return;
-    await pool.query(
-      `INSERT INTO settings (key, value) VALUES ($1, $2::text)
-       ON CONFLICT (key) DO UPDATE
-         SET value = (COALESCE(NULLIF(settings.value, '')::bigint, 0) + $2::bigint)::text`,
-      [SPEND_LEDGER_KEY, String(whole)],
+    const { rows } = await pool.query<{ path: string; micros: string }>(
+      `SELECT path, COALESCE(SUM(cost_micros), 0)::text AS micros
+         FROM usage_events GROUP BY path`,
     );
+    const out = { reviewUsd: 0, mdnaUsd: 0, compareUsd: 0, otherUsd: 0, totalUsd: 0 };
+    for (const row of rows) {
+      const usd = (parseInt(row.micros, 10) || 0) / 1_000_000;
+      out.totalUsd += usd;
+      if (BROKEN_OUT_PATHS.has(row.path as UsagePath)) {
+        out[`${row.path as "review" | "mdna" | "compare"}Usd`] += usd;
+      } else {
+        out.otherUsd += usd;
+      }
+    }
+    return out;
   }
 
   async getReviewUsage(): Promise<{
@@ -769,6 +810,9 @@ export class DatabaseStorage {
         mdnaCacheCreationTokens: usage?.cacheCreationTokens ?? null,
       })
       .where(eq(filings.accessionNumber, accession));
+    // Spend is NOT recorded here — see setFilingReviewResult. analyzeMdna
+    // records at the API boundary so re-analysis, refusals and available=false
+    // failures are all counted.
   }
 
   async setFilingMdnaError(accession: string, message: string): Promise<void> {
@@ -1067,6 +1111,16 @@ export class DatabaseStorage {
         ? [opts.accessionA, opts.accessionB]
         : [opts.accessionB, opts.accessionA];
     const costCents = Math.max(0, Math.round(opts.costUsd * 100));
+    // Ledger first, and outside the try below: the cache row is upserted per
+    // (pair, section) — a re-run replaces the earlier cost_cents, and migration
+    // #4's cache clear erased every compare charge ever made — so cost_cents
+    // can never be the record of what was spent. Recorded even if the cache
+    // write then fails, because the money is already gone either way.
+    await this.recordUsage({
+      path: "compare",
+      costUsd: opts.costUsd,
+      accessionNumber: `${low}|${high}`,
+    });
     try {
       await db
         .insert(filingCompares)

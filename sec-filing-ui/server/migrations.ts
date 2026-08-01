@@ -209,6 +209,89 @@ const MIGRATIONS: Migration[] = [
       CREATE UNIQUE INDEX IF NOT EXISTS idx_watchlists_user_name ON watchlists(user_id, name);
     `,
   },
+  {
+    version: 8,
+    name: "usage_events_ledger",
+    // Claude spend has to be CUMULATIVE, because it backs a hard cap.
+    //
+    // It wasn't. The total was derived from mutable current state:
+    //   - review_*/mdna_* token columns are OVERWRITTEN on re-analysis, so a
+    //     re-review erased the cost of the first one;
+    //   - deleting a filing deleted its spend along with it;
+    //   - filing_compares.cost_cents is upserted per (pair, section), so
+    //     re-running a compare replaced the earlier charge, and migration #4's
+    //     cache clear wiped every compare charge ever made.
+    // Every one of those makes the counter go DOWN while real money was spent,
+    // and a cap computed from a counter that can fall is not a cap.
+    //
+    // usage_events is append-only: one row per Claude call, priced when it
+    // happens. Nothing updates or deletes it, so the total only ever grows.
+    //
+    // Costs are stored in MICRO-dollars (millionths). A single MD&A call runs
+    // about $0.015, so whole cents would round most individual calls to 1 or 2
+    // and drift badly over thousands of rows.
+    //
+    // The INSERTs below preserve the history that already exists so the cap
+    // doesn't reset to zero on deploy. Prices are inlined rather than read from
+    // pricing.ts on purpose: this is a snapshot of money already spent, and
+    // repricing history at tomorrow's rates would be wrong. Per MTok at the
+    // time of writing: $5 input, $25 output, $0.50 cache read, $6.25 cache
+    // write — micros per token are those numbers exactly.
+    sql: `
+      CREATE TABLE IF NOT EXISTS usage_events (
+        id BIGSERIAL PRIMARY KEY,
+        path TEXT NOT NULL,
+        accession_number TEXT,
+        cost_micros BIGINT NOT NULL,
+        input_tokens BIGINT,
+        output_tokens BIGINT,
+        cache_read_tokens BIGINT,
+        cache_creation_tokens BIGINT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_usage_events_path ON usage_events(path);
+      CREATE INDEX IF NOT EXISTS idx_usage_events_created ON usage_events(created_at);
+
+      INSERT INTO usage_events
+        (path, accession_number, cost_micros,
+         input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens)
+      SELECT 'review', accession_number,
+        ROUND(COALESCE(review_input_tokens, 0) * 5.0
+            + COALESCE(review_output_tokens, 0) * 25.0
+            + COALESCE(review_cache_read_tokens, 0) * 0.5
+            + COALESCE(review_cache_creation_tokens, 0) * 6.25),
+        review_input_tokens, review_output_tokens,
+        review_cache_read_tokens, review_cache_creation_tokens
+      FROM filings
+      WHERE review_input_tokens IS NOT NULL OR review_output_tokens IS NOT NULL;
+
+      INSERT INTO usage_events
+        (path, accession_number, cost_micros,
+         input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens)
+      SELECT 'mdna', accession_number,
+        ROUND(COALESCE(mdna_input_tokens, 0) * 5.0
+            + COALESCE(mdna_output_tokens, 0) * 25.0
+            + COALESCE(mdna_cache_read_tokens, 0) * 0.5
+            + COALESCE(mdna_cache_creation_tokens, 0) * 6.25),
+        mdna_input_tokens, mdna_output_tokens,
+        mdna_cache_read_tokens, mdna_cache_creation_tokens
+      FROM filings
+      WHERE mdna_input_tokens IS NOT NULL OR mdna_output_tokens IS NOT NULL;
+
+      INSERT INTO usage_events (path, cost_micros)
+      SELECT 'compare', cost_cents::bigint * 10000
+      FROM filing_compares WHERE cost_cents > 0;
+
+      -- Chat and the Haiku verifier previously accumulated in a settings
+      -- counter. Carry its running total across as a single opening balance;
+      -- new calls append their own rows and the counter is no longer read.
+      INSERT INTO usage_events (path, cost_micros)
+      SELECT 'other', COALESCE(NULLIF(value, ''), '0')::bigint * 10000
+      FROM settings
+      WHERE key = 'claude_spend_ledger_cents'
+        AND COALESCE(NULLIF(value, ''), '0')::bigint > 0;
+    `,
+  },
 ];
 
 // Data-removing statements we refuse to run silently. Note these are scoped to

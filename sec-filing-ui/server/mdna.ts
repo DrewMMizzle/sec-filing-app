@@ -2,6 +2,7 @@ import type { Filing } from "@shared/schema";
 import { MODEL, getAnthropicClient, resolvePdfPath, extractPdfText } from "./review";
 import { extractSection, countSectionHeadings, normalizeFilingText } from "./compare";
 import { UNTRUSTED_CONTENT_GUIDANCE, wrapUntrustedFiling, extractModelText } from "./prompt-safety";
+import { storage } from "./storage";
 
 // The MD&A digest is for stock-research analysts: it pulls the operating story
 // out of Management's Discussion & Analysis (10-K Item 7 / 10-Q Item 2) —
@@ -258,6 +259,23 @@ export async function analyzeMdna(filing: Filing): Promise<MdnaResult> {
   } finally {
     clearTimeout(timer);
   }
+
+  // Record spend the moment the call returns, before anything can throw on the
+  // response. extractModelText rejects a refusal or a max_tokens truncation,
+  // and the route rejects available=false — all three are failures the user
+  // sees, and all three were already paid for. Recording only on the success
+  // path let the most expensive failures (a truncated 32k-token response)
+  // escape the counter and the cap entirely.
+  await storage.recordTokenUsage(
+    "mdna",
+    {
+      inputTokens: message.usage?.input_tokens ?? 0,
+      outputTokens: message.usage?.output_tokens ?? 0,
+      cacheReadTokens: message.usage?.cache_read_input_tokens ?? 0,
+      cacheCreationTokens: message.usage?.cache_creation_input_tokens ?? 0,
+    },
+    filing.accessionNumber,
+  );
 
   const parsed = JSON.parse(extractModelText(message, "MD&A analysis")) as Partial<MdnaDigest>;
   const digest: MdnaDigest = {
