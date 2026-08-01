@@ -118,6 +118,69 @@ IMAGE_FETCH_CONCURRENCY = 4
 
 
 
+# CP1252 byte <-> character map, straight from the codec.
+_CP1252_CHAR_TO_BYTE: dict[str, int] = {}
+for _b in range(0x80, 0x100):
+    try:
+        _CP1252_CHAR_TO_BYTE[bytes([_b]).decode("cp1252")] = _b
+    except UnicodeDecodeError:
+        pass
+
+
+def repair_mojibake(text: str) -> str:
+    """Undo UTF-8-read-as-CP1252 corruption.
+
+    Coverage testing showed a freshly rendered filing still carrying "\u00e2\u20ac\u2122"
+    where an apostrophe belongs, even after decoding the response as UTF-8. So
+    the corruption is not (only) ours: filer agents ship HTML that is already
+    double-encoded, and SEC serves those bytes faithfully. Decoding them
+    correctly still yields mojibake, because the mojibake IS the content.
+
+    The app repairs this when it reads filing text, so extraction works either
+    way. Repairing here as well is about the PDF itself — a human opening it in
+    the library should not see "Management\u00e2\u20ac\u2122s".
+
+    Only runs that begin with a UTF-8 lead byte and re-decode cleanly are
+    touched, so genuinely Latin-1 content is left alone.
+    """
+    if not any("\u00c2" <= c <= "\u00f4" for c in text):
+        return text
+
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        lead = _CP1252_CHAR_TO_BYTE.get(text[i])
+        if lead is None or lead < 0xC2 or lead > 0xF4:
+            out.append(text[i])
+            i += 1
+            continue
+        run: list[int] = []
+        j = i
+        while j < n:
+            b = _CP1252_CHAR_TO_BYTE.get(text[j])
+            if b is None or b < 0x80:
+                break
+            run.append(b)
+            j += 1
+        decoded = None
+        used = 0
+        for length in range(len(run), 1, -1):
+            try:
+                decoded = bytes(run[:length]).decode("utf-8")
+                used = length
+                break
+            except UnicodeDecodeError:
+                continue
+        if decoded is None:
+            out.append(text[i])
+            i += 1
+        else:
+            out.append(decoded)
+            i += used
+    return "".join(out)
+
+
 def decode_filing_html(response) -> str:
     """Decode a filing document, preferring UTF-8 over the declared charset.
 
@@ -134,13 +197,13 @@ def decode_filing_html(response) -> str:
     """
     raw = response.content
     try:
-        return raw.decode("utf-8")
+        return repair_mojibake(raw.decode("utf-8"))
     except UnicodeDecodeError:
         logger.warning(
             "Filing bytes are not valid UTF-8; falling back to declared encoding %s",
             response.encoding,
         )
-        return response.text
+        return repair_mojibake(response.text)
 
 
 async def embed_images_as_base64(html: str, base_url: str) -> str:

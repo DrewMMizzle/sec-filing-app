@@ -37,10 +37,13 @@ const ODD_SPACES = /[  -   　]/g;
 // for "Management's Discussion" could not find it — the text really does not
 // contain an apostrophe there.
 //
-// preprocess.py now decodes as UTF-8 first, which fixes new renders. But
-// thousands of PDFs already carry this baked in, and re-rendering the corpus
-// to recover an apostrophe is not the trade. Repairing here fixes them in
-// place.
+// Repairing here is the fix, not a stopgap. Coverage testing showed a FRESHLY
+// rendered filing still carrying the corruption after the pipeline was changed
+// to decode as UTF-8 — so it isn't only our decoding: filer agents ship HTML
+// that is already double-encoded, and SEC serves those bytes faithfully.
+// Decoding them correctly still yields mojibake, because the mojibake is the
+// content. preprocess.py repairs it too, but only so the PDF looks right to a
+// human; every filing already in the library is recovered right here.
 //
 // CP1252 bytes 0x80-0x9F map to the code points below; 0xA0-0xFF are identity.
 const CP1252_HIGH =
@@ -190,11 +193,26 @@ export function countSectionHeadings(raw: string, key: SectionKey): number {
 // substantial (MD&A) pass a floor so those TOC-shaped captures are skipped
 // rather than returned as the answer. Defaults to 0 because Risk Factors and
 // Legal Proceedings in a 10-Q legitimately can be a single line.
+// Smallest plausible body per section, applied unless a caller overrides it.
+//
+// This is a default rather than a caller's choice because the two callers
+// disagreeing is a bug: compare passed 0 while the MD&A page passed 1500, and
+// at 0 a table-of-contents entry (~91 characters, and line-anchored like a real
+// header) satisfies the strict pass and suppresses the fallback that would have
+// found the body. Compare could then diff two contents lines and call it a
+// section. Risk Factors and Legal Proceedings stay at 0 — a 10-Q's "no material
+// changes" really is one line.
+const SECTION_MIN_BODY: Record<SectionKey, number> = {
+  risk_factors: 0,
+  mdna: 1_500,
+  legal: 0,
+};
+
 export function extractSection(
   raw: string,
   key: SectionKey,
   maxChars: number = SECTION_MAX_CHARS,
-  minBody = 0,
+  minBody: number = SECTION_MIN_BODY[key],
 ): string | null {
   // Normalized once here so heading matching, the line-anchored boundary scan,
   // and the text handed to Claude all see the same string — grounding checks
