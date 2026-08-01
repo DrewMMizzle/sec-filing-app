@@ -117,6 +117,32 @@ def fix_image_references(html: str, base_url: str) -> str:
 IMAGE_FETCH_CONCURRENCY = 4
 
 
+
+def decode_filing_html(response) -> str:
+    """Decode a filing document, preferring UTF-8 over the declared charset.
+
+    SEC serves many filing documents as ISO-8859-1 while the bytes filer agents
+    produced are actually UTF-8. Trusting the declared charset (which is what
+    ``response.text`` does) turns every curly apostrophe into "\u00e2\u20ac\u2122"
+    and every non-breaking space into "\u00c2\u00a0" — mojibake that Chromium
+    then renders into the PDF as those literal glyphs, so it survives into the
+    extracted text and breaks anything matching on real punctuation.
+
+    UTF-8 is self-validating: a clean decode is strong evidence the bytes really
+    were UTF-8. Only when that fails do we fall back to the declared encoding,
+    which is the right answer for a genuinely Latin-1 document.
+    """
+    raw = response.content
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        logger.warning(
+            "Filing bytes are not valid UTF-8; falling back to declared encoding %s",
+            response.encoding,
+        )
+        return response.text
+
+
 async def embed_images_as_base64(html: str, base_url: str) -> str:
     """Download all ``<img>`` sources and embed them as base64 data URIs.
 
@@ -204,7 +230,7 @@ async def preprocess_filing(url: str) -> str:
     async def _do() -> str:
         logger.info("Fetching filing HTML: %s", url)
         response = await sec_get(url)
-        raw_html = response.text
+        raw_html = decode_filing_html(response)
 
         logger.debug("Stripping XBRL tags")
         html = strip_xbrl_tags(raw_html)

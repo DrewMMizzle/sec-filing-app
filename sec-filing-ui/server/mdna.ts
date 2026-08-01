@@ -234,7 +234,11 @@ export async function analyzeMdna(filing: Filing): Promise<MdnaResult> {
     const stream = getAnthropicClient().messages.stream(
       {
         model: MODEL,
-        max_tokens: 8000,
+        // Thinking and the response share this budget on Opus 5. At 8000 the
+        // model spent it thinking and the JSON came back cut off mid-string,
+        // surfacing as "Unterminated string in JSON" and "no text block in
+        // model response". Streaming, so a large ceiling costs nothing.
+        max_tokens: 32000,
         thinking: { type: "adaptive" },
         output_config: {
           effort: "high",
