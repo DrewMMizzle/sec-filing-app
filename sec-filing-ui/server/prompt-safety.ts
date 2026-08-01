@@ -139,6 +139,17 @@ export function extractModelText(message: MessageLike, context: string): string 
         `This can happen when document text trips a safety classifier; re-fetch or skip this filing.`,
     );
   }
+  // A response cut off at max_tokens leaves truncated JSON behind, which the
+  // caller then fails to parse — surfacing as "Unterminated string in JSON at
+  // position N" with no hint that the token budget was the cause. On Opus 5
+  // thinking shares that budget, so this became reachable at ceilings that had
+  // been comfortable before. Name it here rather than downstream.
+  if (message.stop_reason === "max_tokens") {
+    throw new Error(
+      `${context}: the model hit its output token limit before finishing, so the ` +
+        "response is incomplete. Raise max_tokens for this call.",
+    );
+  }
   const textBlock = message.content.find((b) => b.type === "text");
   if (!textBlock || textBlock.type !== "text" || typeof textBlock.text !== "string") {
     throw new Error(`${context}: no text block in model response`);

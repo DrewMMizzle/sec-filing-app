@@ -27,8 +27,84 @@ const APOSTROPHES = /[‘’‚‛ʼ´`′]/g;
 const INVISIBLES = /[­​‌‍﻿]/g;
 const ODD_SPACES = /[  -   　]/g;
 
+// ─── Mojibake repair ────────────────────────────────────────
+//
+// SEC serves many filing documents as ISO-8859-1 while the bytes are actually
+// UTF-8, so the pipeline decoded them through CP1252 and the wrong glyphs were
+// rendered into the PDF. Text extraction then faithfully returns the
+// corruption: an apostrophe comes back as U+00E2 U+20AC U+2122, a
+// non-breaking space as U+00C2 U+00A0. That is why a heading pattern looking
+// for "Management's Discussion" could not find it — the text really does not
+// contain an apostrophe there.
+//
+// preprocess.py now decodes as UTF-8 first, which fixes new renders. But
+// thousands of PDFs already carry this baked in, and re-rendering the corpus
+// to recover an apostrophe is not the trade. Repairing here fixes them in
+// place.
+//
+// CP1252 bytes 0x80-0x9F map to the code points below; 0xA0-0xFF are identity.
+const CP1252_HIGH =
+  "\u20AC\u0081\u201A\u0192\u201E\u2026\u2020\u2021\u02C6\u2030\u0160\u2039\u0152\u008D\u017D\u008F" +
+  "\u0090\u2018\u2019\u201C\u201D\u2022\u2013\u2014\u02DC\u2122\u0161\u203A\u0153\u009D\u017E\u0178";
+const CP1252_TO_BYTE = new Map<string, number>();
+for (let i = 0; i < CP1252_HIGH.length; i++) CP1252_TO_BYTE.set(CP1252_HIGH[i], 0x80 + i);
+for (let b = 0xa0; b <= 0xff; b++) CP1252_TO_BYTE.set(String.fromCharCode(b), b);
+
+const utf8Strict = new TextDecoder("utf-8", { fatal: true });
+
+export function repairMojibake(text: string): string {
+  // A mojibake run always begins with a UTF-8 lead byte (0xC2-0xF4). No such
+  // character means there is nothing to repair, which keeps this scan off
+  // every clean filing.
+  if (!/[\u00C2-\u00F4]/.test(text)) return text;
+
+  let out = "";
+  let i = 0;
+  while (i < text.length) {
+    const lead = CP1252_TO_BYTE.get(text[i]);
+    if (lead === undefined || lead < 0xc2 || lead > 0xf4) {
+      out += text[i];
+      i += 1;
+      continue;
+    }
+    // Collect the consecutive high characters, then decode the longest prefix
+    // that is valid UTF-8. Demanding a clean decode is what leaves genuinely
+    // Latin-1 text — an accented name that was never mis-decoded — alone.
+    const bytes: number[] = [];
+    let j = i;
+    while (j < text.length) {
+      const b = CP1252_TO_BYTE.get(text[j]);
+      if (b === undefined || b < 0x80) break;
+      bytes.push(b);
+      j += 1;
+    }
+    let decoded: string | null = null;
+    let used = 0;
+    for (let len = bytes.length; len >= 2; len--) {
+      try {
+        decoded = utf8Strict.decode(new Uint8Array(bytes.slice(0, len)));
+        used = len;
+        break;
+      } catch {
+        // not valid UTF-8 at this length — try a shorter prefix
+      }
+    }
+    if (decoded === null) {
+      out += text[i];
+      i += 1;
+    } else {
+      out += decoded;
+      i += used;
+    }
+  }
+  return out;
+}
+
 export function normalizeFilingText(text: string): string {
-  return text.replace(INVISIBLES, "").replace(APOSTROPHES, "'").replace(ODD_SPACES, " ");
+  return repairMojibake(text)
+    .replace(INVISIBLES, "")
+    .replace(APOSTROPHES, "'")
+    .replace(ODD_SPACES, " ");
 }
 
 // Heading text used to locate each section. Matched by name (not item number),
@@ -308,7 +384,11 @@ async function claudeCompare(
 
   const stream = getAnthropicClient().messages.stream({
     model: MODEL,
-    max_tokens: 8000,
+    // Thinking and the response share this budget on Opus 5. At 8000 the
+    // model spent it thinking and the JSON came back cut off mid-string,
+    // surfacing as "Unterminated string in JSON" and "no text block in
+    // model response". Streaming, so a large ceiling costs nothing.
+    max_tokens: 32000,
     thinking: { type: "adaptive" },
     output_config: { effort: "high", format: { type: "json_schema", schema: COMPARE_SCHEMA } },
     system: [{ type: "text", text: COMPARE_SYSTEM, cache_control: { type: "ephemeral" } }],
@@ -507,7 +587,11 @@ export async function compareRegistrationFilingsFromPdfs(
   const stream = getAnthropicClient().messages.stream(
     {
       model: MODEL,
-      max_tokens: 8000,
+      // Thinking and the response share this budget on Opus 5. At 8000 the
+      // model spent it thinking and the JSON came back cut off mid-string,
+      // surfacing as "Unterminated string in JSON" and "no text block in
+      // model response". Streaming, so a large ceiling costs nothing.
+      max_tokens: 32000,
       thinking: { type: "adaptive" },
       output_config: { effort: "high", format: { type: "json_schema", schema: COMPARE_SCHEMA } },
       system: [{ type: "text", text: REGISTRATION_COMPARE_SYSTEM, cache_control: { type: "ephemeral" } }],
