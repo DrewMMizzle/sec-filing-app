@@ -306,9 +306,17 @@ async function verifyFindings(
       1_000_000;
     // Haiku has no per-filing columns of its own, so its cost goes to the
     // ledger; otherwise one verifier call per review spends outside the cap.
-    void storage
-      .addSpendCents(cost * 100)
-      .catch((err) => console.error("Failed to record verifier spend:", err));
+    // Priced here rather than via recordTokenUsage because the verifier runs on
+    // Haiku, not the review model.
+    void storage.recordUsage({
+      path: "verifier",
+      costUsd: cost,
+      accessionNumber: filing.accessionNumber,
+      usage: {
+        inputTokens: u?.input_tokens ?? 0,
+        outputTokens: u?.output_tokens ?? 0,
+      },
+    });
     console.log(
       `[verify] ${filing.accessionNumber}: kept ${kept.length}/${findings.length} finding(s), ~$${cost.toFixed(4)}`,
     );
@@ -384,9 +392,24 @@ async function callClaude(filing: Filing, text: string): Promise<ReviewResult> {
     if (currentReviewAbort === controller) currentReviewAbort = null;
   }
 
+  const u = message.usage;
+  // Record spend at the API boundary, not on the success path: a refusal or a
+  // max_tokens truncation makes extractModelText throw below, and that response
+  // was paid for just the same. Recording after parsing let exactly the most
+  // expensive failures escape the counter and the cap.
+  await storage.recordTokenUsage(
+    "review",
+    {
+      inputTokens: u?.input_tokens ?? 0,
+      outputTokens: u?.output_tokens ?? 0,
+      cacheReadTokens: u?.cache_read_input_tokens ?? 0,
+      cacheCreationTokens: u?.cache_creation_input_tokens ?? 0,
+    },
+    filing.accessionNumber,
+  );
+
   const parsed = JSON.parse(extractModelText(message, "Review")) as Partial<ReviewResult>;
   const findings = Array.isArray(parsed.findings) ? parsed.findings : [];
-  const u = message.usage;
 
   // Sprint 3: faithfulness pass — drop findings the verifier can't ground in
   // the source (against the same truncated body the reviewer saw).
