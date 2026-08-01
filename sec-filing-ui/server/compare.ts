@@ -200,11 +200,46 @@ export function extractSection(
   // and the text handed to Claude all see the same string — grounding checks
   // compare model quotes against this same section text.
   const text = normalizeFilingText(raw);
+
+  // Two passes. The first only accepts headings that START a line (optionally
+  // behind an "Item 7." style prefix), because that is what a real section
+  // header looks like. The second drops that requirement.
+  //
+  // The order matters: filings reference their own MD&A mid-sentence — "see
+  // Management's Discussion and Analysis of Financial Condition..." inside a
+  // note or Item 7A — and capturing from there runs to the next Item header,
+  // producing thousands of characters of the wrong section. That is long
+  // enough to beat the real section on the longest-capture rule and long
+  // enough to clear minBody, so it reaches the model, which then correctly
+  // reports it is not an MD&A. Preferring line-anchored headings removes the
+  // whole class; falling back keeps filings whose header PDF extraction ran
+  // onto the tail of a previous line.
+  const strict = collectSection(text, key, maxChars, minBody, true);
+  if (strict) return strict;
+  return collectSection(text, key, maxChars, minBody, false);
+}
+
+// True when the heading match at `index` begins its line, allowing only
+// whitespace and an optional "Item 7." / "ITEM 2 -" style prefix before it.
+function startsLine(text: string, index: number): boolean {
+  const lineStart = text.lastIndexOf("\n", index - 1) + 1;
+  const before = text.slice(lineStart, index);
+  return /^[^\S\r\n]*(?:item\s+\d+[a-z]?[.:)\-–—]?[^\S\r\n]*)?$/i.test(before);
+}
+
+function collectSection(
+  text: string,
+  key: SectionKey,
+  maxChars: number,
+  minBody: number,
+  requireLineStart: boolean,
+): string | null {
   const heading = new RegExp(SECTION_HEADINGS[key].source, "gi");
   let best = "";
   let m: RegExpExecArray | null;
   while ((m = heading.exec(text)) !== null) {
     const from = m.index;
+    if (requireLineStart && !startsLine(text, from)) continue;
     const next = nextItemIndex(text, from + 40);
     const end = next === -1 ? Math.min(text.length, from + maxChars) : next;
     const body = text.slice(from, end).trim();

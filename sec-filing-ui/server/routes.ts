@@ -1438,8 +1438,20 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
   // because that cap has been hit.
   app.get("/api/review/usage", requireAuth, async (_req, res) => {
     const u = await storage.getReviewUsage();
-    const rawCost = reviewCostUsd(u);
+    // costUsd is now every Claude path, not just review. It used to be review
+    // alone, which is why a measured $4.34 of activity showed as $0.74 — MD&A,
+    // Compare and chat spent entirely outside both the counter and the cap.
+    // Broken out so the UI can show where it went.
+    const spend = await storage.getClaudeSpendBreakdown();
+    const rawCost = spend.totalUsd;
     const costUsd = Math.round(rawCost * 100) / 100;
+    const round2 = (n: number) => Math.round(n * 100) / 100;
+    const spendByPath = {
+      reviewUsd: round2(spend.reviewUsd),
+      mdnaUsd: round2(spend.mdnaUsd),
+      compareUsd: round2(spend.compareUsd),
+      otherUsd: round2(spend.otherUsd),
+    };
     const budgetUsd = await storage.getReviewBudgetUsd();
     const pendingCount = await storage.getPendingReviewCount();
     const paused = budgetUsd !== null && rawCost >= budgetUsd && pendingCount > 0;
@@ -1448,7 +1460,7 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     // from the moment it's accepted, including the window before the Python
     // child has actually spawned.
     const fetching = runIsActive();
-    res.json({ ...u, costUsd, budgetUsd, pendingCount, paused, processing, fetching });
+    res.json({ ...u, costUsd, spendByPath, budgetUsd, pendingCount, paused, processing, fetching });
   });
 
   // Cancel an in-flight fetch+render+review run. Kills the Python pipeline

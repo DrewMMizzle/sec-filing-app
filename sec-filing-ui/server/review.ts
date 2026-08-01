@@ -39,28 +39,8 @@ const VERIFIER_TIMEOUT_MS = 2 * 60 * 1000;
 const VERIFIER_PRICE_INPUT = 1; // USD per 1M tokens
 const VERIFIER_PRICE_OUTPUT = 5;
 
-// Opus 4.7 / 4.8 pricing (USD per 1M tokens) — identical across the two
-// generations, so the model bump didn't change the spend-cap math.
-const PRICE_INPUT = 5;
-const PRICE_OUTPUT = 25;
-const PRICE_CACHE_READ = 0.5;
-const PRICE_CACHE_WRITE = 6.25;
-
-// Dollar cost of a set of token counts.
-export function reviewCostUsd(u: {
-  inputTokens: number;
-  outputTokens: number;
-  cacheReadTokens: number;
-  cacheCreationTokens: number;
-}): number {
-  return (
-    (u.inputTokens * PRICE_INPUT +
-      u.outputTokens * PRICE_OUTPUT +
-      u.cacheReadTokens * PRICE_CACHE_READ +
-      u.cacheCreationTokens * PRICE_CACHE_WRITE) /
-    1_000_000
-  );
-}
+import { reviewCostUsd } from "./pricing";
+export { reviewCostUsd };
 
 export function isReviewEnabled(): boolean {
   return !!process.env.ANTHROPIC_API_KEY;
@@ -324,6 +304,11 @@ async function verifyFindings(
     const cost =
       ((u?.input_tokens ?? 0) * VERIFIER_PRICE_INPUT + (u?.output_tokens ?? 0) * VERIFIER_PRICE_OUTPUT) /
       1_000_000;
+    // Haiku has no per-filing columns of its own, so its cost goes to the
+    // ledger; otherwise one verifier call per review spends outside the cap.
+    void storage
+      .addSpendCents(cost * 100)
+      .catch((err) => console.error("Failed to record verifier spend:", err));
     console.log(
       `[verify] ${filing.accessionNumber}: kept ${kept.length}/${findings.length} finding(s), ~$${cost.toFixed(4)}`,
     );
@@ -502,7 +487,10 @@ export async function kickReviewProcessor(): Promise<void> {
         break;
       }
       const budget = await storage.getReviewBudgetUsd();
-      if (budget !== null && reviewCostUsd(await storage.getReviewUsage()) >= budget) {
+      // Total across review, MD&A, Compare and the ledger — not review alone.
+      // Capping one path while the others spent freely is what let a measured
+      // $4.34 session register as $0.74.
+      if (budget !== null && (await storage.getClaudeSpendBreakdown()).totalUsd >= budget) {
         console.log(`[review] Spend cap of $${budget} reached — pausing review queue.`);
         break;
       }
