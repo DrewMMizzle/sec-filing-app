@@ -1,5 +1,6 @@
 import { storage } from "./storage";
 import { getAnthropicClient, MODEL, resolvePdfPath, extractPdfText } from "./review";
+import { reviewCostUsd } from "./pricing";
 import { getSecTickerIndex } from "./sec-index";
 import type { Filing } from "@shared/schema";
 import {
@@ -341,6 +342,18 @@ export async function chatAboutFindings(history: Turn[]): Promise<ChatResult> {
     );
     const answer = extractModelText(message, "Findings chat");
     const u = message.usage;
+    // Chat has no per-filing columns to hold its tokens, so it goes to the
+    // spend ledger — otherwise it spends entirely outside the cap.
+    void storage
+      .addSpendCents(
+        reviewCostUsd({
+          inputTokens: u?.input_tokens ?? 0,
+          outputTokens: u?.output_tokens ?? 0,
+          cacheReadTokens: u?.cache_read_input_tokens ?? 0,
+          cacheCreationTokens: u?.cache_creation_input_tokens ?? 0,
+        }) * 100,
+      )
+      .catch((err) => console.error("Failed to record chat spend:", err));
     return {
       answer,
       usage: {
@@ -456,6 +469,18 @@ export async function chatAboutFiling(
     );
     const answer = extractModelText(message, "Filing chat");
     const u = message.usage;
+    // Chat has no per-filing columns to hold its tokens, so it goes to the
+    // spend ledger — otherwise it spends entirely outside the cap.
+    void storage
+      .addSpendCents(
+        reviewCostUsd({
+          inputTokens: u?.input_tokens ?? 0,
+          outputTokens: u?.output_tokens ?? 0,
+          cacheReadTokens: u?.cache_read_input_tokens ?? 0,
+          cacheCreationTokens: u?.cache_creation_input_tokens ?? 0,
+        }) * 100,
+      )
+      .catch((err) => console.error("Failed to record chat spend:", err));
     return {
       answer,
       usage: {

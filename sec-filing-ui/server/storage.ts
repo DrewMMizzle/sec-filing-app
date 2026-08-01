@@ -25,6 +25,10 @@ import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
 import { eq, and, gte, lte, asc, desc, inArray, sql, or, isNull } from "drizzle-orm";
 import { runMigrations } from "./migrations";
+import { reviewCostUsd } from "./pricing";
+
+// Accumulated cents for Claude paths with no per-row token columns.
+const SPEND_LEDGER_KEY = "claude_spend_ledger_cents";
 
 const DATABASE_URL = process.env.DATABASE_URL;
 if (!DATABASE_URL) {
@@ -530,6 +534,78 @@ export class DatabaseStorage {
   }
 
   // Team-wide review spend (shared corpus).
+  // Total Claude spend across every path, in USD.
+  //
+  // getReviewUsage below covers only the review columns, and the spend cap was
+  // computed from it alone — so MD&A, Compare and chat spent freely outside the
+  // cap and the counter under-reported. A coverage sweep measured $0.74 counted
+  // against $4.34 actually spent.
+  //
+  // Review and MD&A share a model and pricing, so both price through
+  // reviewCostUsd. Compare persists dollars directly as cents. Chat and the
+  // Haiku verifier have nowhere per-row to live, so they accumulate in a
+  // settings counter via addSpendCents.
+  //
+  // Returned broken out, not just totalled, so the UI can show where the money
+  // went and so a cap that suddenly binds is explainable.
+  async getClaudeSpendBreakdown(): Promise<{
+    reviewUsd: number;
+    mdnaUsd: number;
+    compareUsd: number;
+    otherUsd: number;
+    totalUsd: number;
+  }> {
+    const [tokens, compare, other] = await Promise.all([
+      pool.query(
+        `SELECT
+           COALESCE(SUM(review_input_tokens), 0)          AS r_in,
+           COALESCE(SUM(review_output_tokens), 0)         AS r_out,
+           COALESCE(SUM(review_cache_read_tokens), 0)     AS r_cr,
+           COALESCE(SUM(review_cache_creation_tokens), 0) AS r_cw,
+           COALESCE(SUM(mdna_input_tokens), 0)            AS m_in,
+           COALESCE(SUM(mdna_output_tokens), 0)           AS m_out,
+           COALESCE(SUM(mdna_cache_read_tokens), 0)       AS m_cr,
+           COALESCE(SUM(mdna_cache_creation_tokens), 0)   AS m_cw
+         FROM filings`,
+      ),
+      pool.query(`SELECT COALESCE(SUM(cost_cents), 0) AS cents FROM filing_compares`),
+      this.getSetting(SPEND_LEDGER_KEY),
+    ]);
+    const t = tokens.rows[0];
+    const price = (i: string, o: string, cr: string, cw: string) =>
+      reviewCostUsd({
+        inputTokens: parseInt(t[i], 10),
+        outputTokens: parseInt(t[o], 10),
+        cacheReadTokens: parseInt(t[cr], 10),
+        cacheCreationTokens: parseInt(t[cw], 10),
+      });
+    const reviewUsd = price("r_in", "r_out", "r_cr", "r_cw");
+    const mdnaUsd = price("m_in", "m_out", "m_cr", "m_cw");
+    const compareUsd = parseInt(compare.rows[0].cents, 10) / 100;
+    const otherUsd = (parseInt(other ?? "0", 10) || 0) / 100;
+    return {
+      reviewUsd,
+      mdnaUsd,
+      compareUsd,
+      otherUsd,
+      totalUsd: reviewUsd + mdnaUsd + compareUsd + otherUsd,
+    };
+  }
+
+  // Add to the ledger for paths with no per-row home (chat, the Haiku
+  // verifier). Atomic so concurrent calls can't lose an increment the way a
+  // read-modify-write would.
+  async addSpendCents(cents: number): Promise<void> {
+    const whole = Math.max(0, Math.round(cents));
+    if (whole === 0) return;
+    await pool.query(
+      `INSERT INTO settings (key, value) VALUES ($1, $2::text)
+       ON CONFLICT (key) DO UPDATE
+         SET value = (COALESCE(NULLIF(settings.value, '')::bigint, 0) + $2::bigint)::text`,
+      [SPEND_LEDGER_KEY, String(whole)],
+    );
+  }
+
   async getReviewUsage(): Promise<{
     reviewedCount: number;
     inputTokens: number;
