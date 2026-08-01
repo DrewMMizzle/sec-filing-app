@@ -46,6 +46,15 @@ import { db } from "./storage";
 import { tickers as tickersTable, filings as filingsTable } from "@shared/schema";
 import { eq } from "drizzle-orm";
 import { createLineReader, signalPipelineGroup, stopPipeline } from "./pipeline-process";
+import {
+  PDF_STORAGE_DIR,
+  PIPELINE_ROOT,
+  isUnder,
+  resolveStoredPdf,
+  resolveUnder,
+  safeDownloadFilename,
+  safeSegment,
+} from "./pdf-paths";
 
 // Tracks the in-flight fetch/render pipeline child so a user cancel can kill it.
 let currentFetchChild: ChildProcess | null = null;
@@ -132,10 +141,7 @@ const SEC_USER_AGENT = process.env.SEC_USER_AGENT || "DotAdda ameister@dotadda.c
 // Works in both ESM (dev via tsx) and CJS (prod via esbuild)
 const __filename_compat = typeof __filename !== "undefined" ? __filename : fileURLToPath(import.meta.url);
 const __dirname_compat = path.dirname(__filename_compat);
-const PIPELINE_ROOT = process.env.PIPELINE_ROOT || path.resolve(__dirname_compat, "../../sec-pdf-pipeline");
 
-// App-managed PDF storage directory
-const PDF_STORAGE_DIR = process.env.PDF_STORAGE_DIR || path.resolve(__dirname_compat, "..", "pdfs");
 if (!fs.existsSync(PDF_STORAGE_DIR)) {
   fs.mkdirSync(PDF_STORAGE_DIR, { recursive: true });
 }
@@ -179,10 +185,69 @@ function countStoredPdfs(dir: string): number {
 // "complete" while the file is gone (e.g. ephemeral storage wiped on redeploy),
 // so callers verify the file before treating a filing as available.
 function pdfExistsOnDisk(pdfPath: string | null | undefined): boolean {
-  if (!pdfPath) return false;
-  const appPath = path.resolve(PDF_STORAGE_DIR, "..", pdfPath);
-  const pipelinePath = path.join(PIPELINE_ROOT, pdfPath);
-  return fs.existsSync(appPath) || fs.existsSync(pipelinePath);
+  return resolveStoredPdf(pdfPath) !== null;
+}
+
+// ─── Ticker input validation ──────────────────────────────────────────────
+//
+// The fetch body was previously forwarded to the Python pipeline as-is. Ticker
+// and CIK come back out of the pipeline's events and are used to build the
+// PDF's path on disk and the SEC URLs it fetches, so they are constrained to
+// what SEC actually issues rather than trusted as free text.
+//
+// Real tickers are short and alphanumeric with dots or hyphens for share
+// classes (BRK-B, BF.B). Pre-IPO rows use a name-derived label from
+// nameToLabel, which is already [A-Z0-9]{1,8}.
+const TICKER_RE = /^[A-Za-z0-9][A-Za-z0-9.\-]{0,11}$/;
+const CIK_RE = /^\d{1,10}$/;
+// Form types as EDGAR writes them: "10-K", "10-Q/A", "DEF 14A", "S-1/A".
+const FORM_RE = /^[A-Za-z0-9][A-Za-z0-9 .\-/]{0,19}$/;
+const MAX_TICKERS_PER_RUN = 1000;
+const MAX_FORMS_PER_TICKER = 40;
+
+type TickerRequest = { ticker: string; cik: string; filing_types: string[] };
+
+export function isSafeTickerRequest(t: unknown): t is TickerRequest {
+  if (!t || typeof t !== "object") return false;
+  const r = t as Record<string, unknown>;
+  if (typeof r.ticker !== "string" || !TICKER_RE.test(r.ticker)) return false;
+  // CIK is optional in some internal callers (a filings row can lack one), but
+  // when present it must be digits — it is interpolated into SEC URLs.
+  if (r.cik !== undefined && r.cik !== null && r.cik !== "") {
+    if (typeof r.cik !== "string" || !CIK_RE.test(r.cik)) return false;
+  }
+  if (!Array.isArray(r.filing_types)) return false;
+  if (r.filing_types.length > MAX_FORMS_PER_TICKER) return false;
+  return r.filing_types.every((f) => typeof f === "string" && FORM_RE.test(f));
+}
+
+// Strict parse for request bodies: one bad entry rejects the request, so a
+// caller finds out rather than silently getting a different fetch than it asked
+// for.
+function parseTickerList(raw: unknown[]): { tickers: TickerRequest[] } | { error: string } {
+  if (raw.length > MAX_TICKERS_PER_RUN) {
+    return { error: `Too many tickers (max ${MAX_TICKERS_PER_RUN}).` };
+  }
+  const tickers: TickerRequest[] = [];
+  for (const entry of raw) {
+    if (!isSafeTickerRequest(entry)) {
+      const label =
+        entry && typeof entry === "object" && typeof (entry as any).ticker === "string"
+          ? (entry as any).ticker
+          : "(unnamed)";
+      return {
+        error:
+          `Invalid ticker entry "${label}". Each entry needs a ticker (letters, digits, ` +
+          `"." or "-"), a numeric cik, and an array of filing types.`,
+      };
+    }
+    tickers.push({
+      ticker: entry.ticker,
+      cik: entry.cik ?? "",
+      filing_types: entry.filing_types,
+    });
+  }
+  return { tickers };
 }
 
 // Start a fetch/render run in the background and hand back the run record, or
@@ -207,7 +272,19 @@ export async function startFetchRun(opts: {
   // way, so the scheduler still reviews everything genuinely new.
   queueBacklogReview: boolean;
 }): Promise<PipelineRun | null> {
-  const { kind, userId, tickerList, dateFrom, dateTo, limitPerTicker } = opts;
+  const { kind, userId, dateFrom, dateTo, limitPerTicker } = opts;
+
+  // Backstop for the callers that build their list from stored rows rather than
+  // a request body (the scheduler, render-missing). Those rows can already hold
+  // a hostile ticker written before this was validated, and this is the one
+  // place every run goes through. Invalid entries are dropped and logged rather
+  // than failing the run, since the rest of the batch is still legitimate.
+  const tickerList = opts.tickerList.filter((t) => {
+    if (isSafeTickerRequest(t)) return true;
+    console.warn(`[fetch] Dropping unsafe ticker entry: ${JSON.stringify(t)}`);
+    return false;
+  });
+  if (tickerList.length === 0) return null;
 
   // ── Dedup: skip filings already complete AND whose PDF still exists on disk.
   // (A redeploy can wipe ephemeral PDF storage while the DB row persists, so a
@@ -438,14 +515,28 @@ function runFetchPipeline(
                 console.error("Failed to clear filing digest:", err),
               );
           } else if (event.event === "complete") {
-            const pipelinePdf = path.join(PIPELINE_ROOT, event.path);
-            const ticker = event.ticker || "UNKNOWN";
+            // Every component of the destination path comes from the pipeline's
+            // JSON, which echoes back what the fetch request supplied. A ticker
+            // of "../../../../tmp/pwned" wrote the rendered PDF outside the
+            // storage root and stored a pdfPath that resolved there, so every
+            // later read, download and delete followed it out too. Each segment
+            // is sanitized, and the assembled path is re-checked below — the
+            // route validates the request as well, but the sink must not depend
+            // on that.
+            const ticker = safeSegment(event.ticker, "UNKNOWN");
             // Collapse whitespace and "/" so forms like "S-1/A" become
             // "S-1_A" instead of an awkward nested subdirectory or filename.
-            const safeType = (event.filing_type || "filing").replace(/[\s/]+/g, "_");
+            const safeType = safeSegment(
+              String(event.filing_type || "filing").replace(/[\s/]+/g, "_"),
+              "filing",
+            );
             const destDir = path.join(PDF_STORAGE_DIR, ticker, safeType);
-            const destFile = path.join(destDir, `${event.accession}.pdf`);
+            const destFile = path.join(destDir, `${safeSegment(event.accession, "filing")}.pdf`);
             const appRelPath = path.relative(path.resolve(PDF_STORAGE_DIR, ".."), destFile);
+            // The source is pipeline-supplied too: without this, a manipulated
+            // `path` would copy an arbitrary file into app storage and then
+            // serve it to any authenticated user as a filing PDF.
+            const pipelinePdf = resolveUnder(PIPELINE_ROOT, String(event.path ?? ""));
             // Async fs + DB so a 10-K-sized copy doesn't stall the event loop
             // and starve other API requests / event handling. We track the
             // task in persistenceTasks so the close handler can await all
@@ -457,6 +548,16 @@ function runFetchPipeline(
             const size: number | undefined = event.size;
             const task = (async () => {
               try {
+                if (!pipelinePdf) {
+                  throw new Error(
+                    `Pipeline reported a rendered file outside its output directory (${event.path}).`,
+                  );
+                }
+                if (!isUnder(PDF_STORAGE_DIR, destFile)) {
+                  throw new Error(
+                    `Refusing to write outside PDF storage (ticker=${event.ticker}, accession=${event.accession}).`,
+                  );
+                }
                 await fs.promises.mkdir(destDir, { recursive: true });
                 await fs.promises.copyFile(pipelinePdf, destFile);
                 // The pipeline's copy under output/ has done its job the
@@ -1312,16 +1413,25 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
   // Trigger fetch+render for selected tickers + date range
   app.post("/api/filings/fetch", requireAuth, async (req, res) => {
     const userId = req.user!.id;
-    const { tickers: tickerList, dateFrom, dateTo, limitPerTicker } = req.body as {
-      tickers: Array<{ ticker: string; cik: string; filing_types: string[] }>;
+    const { tickers: rawTickers, dateFrom, dateTo, limitPerTicker } = req.body as {
+      tickers?: unknown;
       dateFrom?: string;
       dateTo?: string;
       limitPerTicker?: number;
     };
 
-    if (!tickerList || tickerList.length === 0) {
+    if (!Array.isArray(rawTickers) || rawTickers.length === 0) {
       return res.status(400).json({ error: "tickers array is required" });
     }
+    // This body was previously passed through untouched. Every field reaches
+    // the Python pipeline, and ticker/cik come back out in the events that
+    // build the PDF's path on disk and the SEC URLs it fetches — so it is
+    // validated here rather than only sanitized at the sinks.
+    const parsedTickers = parseTickerList(rawTickers);
+    if ("error" in parsedTickers) {
+      return res.status(400).json({ error: parsedTickers.error });
+    }
+    const tickerList = parsedTickers.tickers;
 
     const run = await startFetchRun({
       kind: "fetch",
@@ -1847,9 +1957,7 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
     if (!filing || !filing.pdfPath) {
       return res.status(404).json({ error: "PDF not found" });
     }
-    const appPath = path.resolve(PDF_STORAGE_DIR, "..", filing.pdfPath);
-    const pipelinePath = path.join(PIPELINE_ROOT, filing.pdfPath);
-    const fullPath = fs.existsSync(appPath) ? appPath : fs.existsSync(pipelinePath) ? pipelinePath : null;
+    const fullPath = resolveStoredPdf(filing.pdfPath);
     if (!fullPath) {
       return res.status(404).json({ error: "PDF file missing from disk" });
     }
@@ -1874,16 +1982,17 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
       return res.status(404).json({ error: "PDF not found" });
     }
 
-    // Try app-managed storage first, fall back to pipeline output
-    const appPath = path.resolve(PDF_STORAGE_DIR, "..", filing.pdfPath);
-    const pipelinePath = path.join(PIPELINE_ROOT, filing.pdfPath);
-    const fullPath = fs.existsSync(appPath) ? appPath : fs.existsSync(pipelinePath) ? pipelinePath : null;
-
+    // Try app-managed storage first, fall back to pipeline output.
+    const fullPath = resolveStoredPdf(filing.pdfPath);
     if (!fullPath) {
       return res.status(404).json({ error: "PDF file missing from disk" });
     }
 
-    const filename = `${filing.ticker}_${filing.filingType.replace(/[\s/]+/g, "_")}_${filing.filingDate || filing.accessionNumber}.pdf`;
+    const filename = safeDownloadFilename([
+      filing.ticker,
+      filing.filingType,
+      filing.filingDate || filing.accessionNumber,
+    ]);
     // `?inline=1` tells the browser to display the PDF in-place (used by chat
     // citation links that open in a new tab). Default stays `attachment` so
     // the PDF Library's Download button still triggers a save.
@@ -1908,9 +2017,11 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
 
     // Clean up PDF file from disk
     if (deleted.pdfPath) {
-      const appPath = path.resolve(PDF_STORAGE_DIR, "..", deleted.pdfPath);
+      // resolveStoredPdf returns null for a path that escapes the roots, so a
+      // poisoned pdfPath can't turn an admin delete into an arbitrary unlink.
+      const appPath = resolveStoredPdf(deleted.pdfPath);
       try {
-        if (fs.existsSync(appPath)) fs.unlinkSync(appPath);
+        if (appPath) fs.unlinkSync(appPath);
       } catch (e) {
         console.error("Failed to remove PDF file:", e);
       }
@@ -1934,9 +2045,9 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
 
       const filing = await storage.deleteFiling(id);
       if (filing?.pdfPath) {
-        const appPath = path.resolve(PDF_STORAGE_DIR, "..", filing.pdfPath);
+        const appPath = resolveStoredPdf(filing.pdfPath);
         try {
-          if (fs.existsSync(appPath)) fs.unlinkSync(appPath);
+          if (appPath) fs.unlinkSync(appPath);
         } catch (e) {
           console.error("Failed to remove PDF file:", e);
         }
@@ -1953,15 +2064,16 @@ export async function registerRoutes(server: Server, app: Express): Promise<void
       return res.status(404).json({ error: "PDF not found" });
     }
 
-    const appPath = path.resolve(PDF_STORAGE_DIR, "..", filing.pdfPath);
-    const pipelinePath = path.join(PIPELINE_ROOT, filing.pdfPath);
-    const fullPath = fs.existsSync(appPath) ? appPath : fs.existsSync(pipelinePath) ? pipelinePath : null;
-
+    const fullPath = resolveStoredPdf(filing.pdfPath);
     if (!fullPath) {
       return res.status(404).json({ error: "PDF file missing from disk" });
     }
 
-    const filename = `${filing.ticker}_${filing.filingType.replace(/[\s/]+/g, "_")}_${filing.filingDate || filing.accessionNumber}.pdf`;
+    const filename = safeDownloadFilename([
+      filing.ticker,
+      filing.filingType,
+      filing.filingDate || filing.accessionNumber,
+    ]);
     res.setHeader("Content-Disposition", `inline; filename="${filename}"`);
     res.setHeader("Content-Type", "application/pdf");
     res.sendFile(fullPath);

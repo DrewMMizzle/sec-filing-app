@@ -6,14 +6,12 @@ import { PDFParse } from "pdf-parse";
 import { storage } from "./storage";
 import type { Filing } from "@shared/schema";
 import { UNTRUSTED_CONTENT_GUIDANCE, wrapUntrustedFiling, extractModelText } from "./prompt-safety";
+import { resolveStoredPdf } from "./pdf-paths";
 
 // Works in both ESM (dev via tsx) and CJS (prod via esbuild)
 const __filename_compat = typeof __filename !== "undefined" ? __filename : fileURLToPath(import.meta.url);
 const __dirname_compat = path.dirname(__filename_compat);
 
-// Resolve PDFs the same way routes.ts does, so review reads the same files.
-const PDF_STORAGE_DIR = process.env.PDF_STORAGE_DIR || path.resolve(__dirname_compat, "..", "pdfs");
-const PIPELINE_ROOT = process.env.PIPELINE_ROOT || path.resolve(__dirname_compat, "../../sec-pdf-pipeline");
 
 // Shared by review, compare, MD&A and chat. Opus 5 is a drop-in on Opus 4.8's
 // pricing ($5/$25 per 1M) and is stronger on exactly this workload — long
@@ -162,10 +160,7 @@ const REVIEW_SCHEMA = {
 };
 
 export function resolvePdfPath(filing: Filing): string | null {
-  if (!filing.pdfPath) return null;
-  const appPath = path.resolve(PDF_STORAGE_DIR, "..", filing.pdfPath);
-  const pipelinePath = path.join(PIPELINE_ROOT, filing.pdfPath);
-  return fs.existsSync(appPath) ? appPath : fs.existsSync(pipelinePath) ? pipelinePath : null;
+  return resolveStoredPdf(filing.pdfPath);
 }
 
 export async function extractPdfText(absPath: string): Promise<string> {
