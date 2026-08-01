@@ -20,7 +20,7 @@ from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup, Tag
 
-from src.edgar.rate_limiter import sec_get
+from src.edgar.rate_limiter import DisallowedURLError, sec_get
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +115,30 @@ def fix_image_references(html: str, base_url: str) -> str:
 # bodies are resident in memory simultaneously while embedding — an
 # image-heavy S-1 can reference hundreds of inline charts/signatures.
 IMAGE_FETCH_CONCURRENCY = 4
+
+# An inline filing image is a chart, a logo or a signature — kilobytes, not
+# megabytes. The cap bounds both memory and the size of the base64 blob that
+# ends up inside the rendered PDF.
+MAX_IMAGE_BYTES = 8 * 1024 * 1024
+
+# Only real image types get embedded. The <img> src comes from the filing, so
+# without this check the response body of whatever URL it named was base64'd
+# into the PDF and became readable — the read-back half of the SSRF. Chromium
+# renders none of these as anything but an image anyway.
+ALLOWED_IMAGE_TYPES = frozenset(
+    {
+        "image/png",
+        "image/jpeg",
+        "image/jpg",
+        "image/gif",
+        "image/bmp",
+        "image/webp",
+        "image/tiff",
+        "image/svg+xml",
+        "image/x-icon",
+        "image/vnd.microsoft.icon",
+    }
+)
 
 
 
@@ -250,9 +274,15 @@ async def embed_images_as_base64(html: str, base_url: str) -> str:
     async def embed_one(img: Tag, src: str) -> None:
         async with sem:
             try:
-                resp = await sec_get(src)
+                resp = await sec_get(src, max_bytes=MAX_IMAGE_BYTES)
                 content = resp.content
                 content_type = resp.headers.get("content-type", "").split(";")[0].strip()
+            except DisallowedURLError as exc:
+                # The filing pointed an <img> somewhere that isn't SEC. Drop
+                # the image and keep rendering; log at warning because this is
+                # either a broken filing or someone probing.
+                logger.warning("Refusing image source %s: %s", src, exc)
+                return
             except Exception as exc:
                 # One bad image warns and continues — the rest of the filing
                 # isn't held hostage by a single 404.
@@ -260,6 +290,11 @@ async def embed_images_as_base64(html: str, base_url: str) -> str:
                 return
         if not content_type:
             content_type = mimetypes.guess_type(src)[0] or "image/png"
+        if content_type.lower() not in ALLOWED_IMAGE_TYPES:
+            logger.warning(
+                "Skipping image %s: content-type %s is not an image", src, content_type
+            )
+            return
         b64 = base64.b64encode(content).decode("ascii")
         img["src"] = f"data:{content_type};base64,{b64}"
         logger.debug("Embedded image: %s (%d bytes)", src, len(content))
