@@ -177,22 +177,64 @@ export function renderDigestBlock(digest: FilingDigest): string {
   return lines.join("\n");
 }
 
-// In-process guard so two concurrent first-chats on the same filing don't both
-// pay to generate the digest.
-const inFlight = new Set<string>();
+// In-flight digest generations, keyed by accession, so two concurrent
+// first-chats on the same filing don't both pay to generate it.
+//
+// This used to be a Set of accessions, and the guard didn't work: the `has`
+// check was followed by `await storage.getFilingDigest(...)` and two more
+// awaits BEFORE the accession was added, so both callers passed the check,
+// both yielded at the first await, and both went on to generate. Two chats
+// opening the same filing at once — the exact thing the guard was for — paid
+// twice.
+//
+// A Map of promises fixes both halves. The entry is registered in the same
+// synchronous turn as the call, before anything can yield, so there is no
+// window to slip through; and a second caller gets the SAME promise rather
+// than being told "someone else is doing it" and returning early while the
+// work is still unfinished.
+//
+// Scope: this is in-process, so it dedups within ONE instance. That is the
+// right scope today, and deliberately so rather than by oversight. Nothing in
+// railway.toml sets a replica count, and more to the point the app already
+// assumes a single instance in places where a second one would break something
+// worse than a duplicate digest: the pipeline run slot and `currentFetchChild`
+// are module-level, so two instances would run two renders at once and
+// /api/run/cancel would only ever reach the child in its own process, and the
+// review queue is an in-process serial worker. A cross-instance claim here
+// would buy one avoided ~$0.006 call while leaving those broken. If this ever
+// scales past one instance, the fix is the pattern the scheduler already uses
+// for exactly this reason — claimSettingOnce, or a pg advisory lock keyed on
+// the accession — applied to the run slot and the review queue first.
+const inFlight = new Map<string, Promise<void>>();
 
 // Generate + persist the digest if one doesn't already exist. Best-effort and
 // never throws: callers fire this in the background after answering from full
 // text, so the NEXT session can answer from the cheap cached digest.
-export async function ensureFilingDigest(accession: string): Promise<void> {
-  if (inFlight.has(accession)) return;
+//
+// Deliberately NOT `async`: the map entry has to be set before the first await
+// runs, and an async function would have already yielded by then.
+export function ensureFilingDigest(accession: string): Promise<void> {
+  const existing = inFlight.get(accession);
+  if (existing) return existing;
+  const task = generateAndStoreDigest(accession).finally(() => {
+    // Only clear the entry if it's still this run's. A later call that already
+    // replaced it must not be cancelled by an earlier one finishing.
+    if (inFlight.get(accession) === task) inFlight.delete(accession);
+  });
+  inFlight.set(accession, task);
+  return task;
+}
+
+// The body of the above. Swallows its own errors, so a failure resolves rather
+// than rejecting — which also means the map entry clears and the next call
+// retries instead of being blocked forever by a wedged entry.
+async function generateAndStoreDigest(accession: string): Promise<void> {
   try {
     if (await storage.getFilingDigest(accession)) return;
     const filing = await storage.getFilingByAccession(accession);
     if (!filing || filing.status !== "complete") return;
     const pdfPath = resolvePdfPath(filing);
     if (!pdfPath) return;
-    inFlight.add(accession);
     const text = await extractPdfText(pdfPath);
     if (!text.trim()) return;
     const { digest, usage } = await generateFilingDigest(filing, text);
@@ -212,7 +254,5 @@ export async function ensureFilingDigest(accession: string): Promise<void> {
     console.log(`[digest] ${accession}: generated (~$${cost.toFixed(4)})`);
   } catch (err: any) {
     console.error(`[digest] ${accession}: generation failed:`, err?.message || err);
-  } finally {
-    inFlight.delete(accession);
   }
 }
