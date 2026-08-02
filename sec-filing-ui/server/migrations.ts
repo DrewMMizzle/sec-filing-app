@@ -24,10 +24,23 @@ const MIGRATIONS: Migration[] = [
   {
     version: 1,
     name: "baseline",
-    // The original initDatabase DDL block. Idempotent (every statement uses
-    // IF NOT EXISTS / IF EXISTS / WHERE NOT ...) so it's a safe no-op against
-    // production databases where the schema already exists — and creates the
-    // schema cleanly on a fresh DB.
+    // The original initDatabase DDL block, plus the two base tables it assumed
+    // already existed.
+    //
+    // It opened with `ALTER TABLE watchlists ...` and `ALTER TABLE filings ...`
+    // without ever creating either, because it was extracted from an app whose
+    // first release had already created them. That made it a correct migration
+    // for every database this has ever run against and a broken one for an
+    // empty database: `relation "watchlists" does not exist` aborts the whole
+    // statement batch, so a fresh deploy could not start at all.
+    //
+    // Editing a shipped migration is normally off-limits, and the additions
+    // here are deliberately chosen so it stays a no-op where #1 already ran:
+    // both are CREATE TABLE IF NOT EXISTS, and a database that has #1 recorded
+    // never re-executes this SQL in the first place. The column sets are the
+    // PRE-migration shapes — everything #1 and later migrations add by ALTER is
+    // still added by ALTER, so a fresh database converges on exactly the schema
+    // an existing one has, rather than a second, subtly different one.
     sql: `
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
@@ -44,6 +57,32 @@ const MIGRATIONS: Migration[] = [
       );
       CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
       CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+
+      -- Base watchlists table. user_id is added by the ALTER below, exactly as
+      -- it was on existing databases, so both paths end with the same nullable
+      -- column. The legacy global UNIQUE on name is deliberately NOT created:
+      -- migration #7 drops it and replaces it with a per-user unique index, and
+      -- creating it here only to drop it later would be theatre.
+      CREATE TABLE IF NOT EXISTS watchlists (
+        id SERIAL PRIMARY KEY,
+        name TEXT NOT NULL
+      );
+
+      -- Base filings table. Review, MD&A, verifier and digest columns are all
+      -- added by ALTERs (here and in #2, #5, #6) and are not repeated.
+      CREATE TABLE IF NOT EXISTS filings (
+        id SERIAL PRIMARY KEY,
+        ticker TEXT NOT NULL,
+        cik TEXT NOT NULL,
+        accession_number TEXT NOT NULL UNIQUE,
+        filing_type TEXT NOT NULL,
+        filing_date TEXT,
+        pdf_path TEXT,
+        pdf_size INTEGER,
+        status TEXT NOT NULL DEFAULT 'pending',
+        error_message TEXT,
+        created_at TEXT NOT NULL
+      );
 
       ALTER TABLE watchlists ADD COLUMN IF NOT EXISTS user_id INTEGER REFERENCES users(id) ON DELETE CASCADE;
       ALTER TABLE watchlists DROP CONSTRAINT IF EXISTS watchlists_name_unique;
@@ -341,53 +380,118 @@ function warnDestructiveMigration(m: Migration, matched: string[]): void {
   );
 }
 
+// Serializes migration runners across every process sharing this database.
+//
+// Postgres advisory locks are keyed by an arbitrary bigint; this one is
+// specific to this app's migration runner and is not meaningful elsewhere.
+const MIGRATION_LOCK_ID = 8_675_309_001;
+
 export async function runMigrations(pool: Pool): Promise<{ applied: number[] }> {
-  // Bookkeeping table — own table so the user-facing schema stays clean.
-  await pool.query(
-    `CREATE TABLE IF NOT EXISTS schema_migrations (
-       version INTEGER PRIMARY KEY,
-       name TEXT NOT NULL,
-       applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-     )`,
-  );
-  const { rows } = await pool.query<{ version: number }>(
-    `SELECT version FROM schema_migrations`,
-  );
-  const already = new Set(rows.map((r) => r.version));
-  const newlyApplied: number[] = [];
-  const ordered = [...MIGRATIONS].sort((a, b) => a.version - b.version);
-  for (const m of ordered) {
-    if (already.has(m.version)) continue;
+  return runMigrationList(pool, MIGRATIONS);
+}
 
-    // Guard: never let a data-destructive migration run silently. Warn loudly,
-    // and refuse outright unless the author explicitly acknowledged it.
-    const destructive = findDestructiveStatements(m.sql);
-    if (destructive.length > 0) {
-      warnDestructiveMigration(m, destructive);
-      if (m.destructive !== true) {
-        throw new Error(
-          `[migrations] Refusing to apply migration #${m.version} (${m.name}): it contains ` +
-            `data-destructive statements (${destructive.join(", ")}) but is not marked ` +
-            "`destructive: true`. If the data loss is intentional, set that flag on the " +
-            "migration to acknowledge it; otherwise remove the destructive SQL.",
-        );
-      }
-    } else if (m.destructive === true) {
-      // Flagged destructive but the detector saw nothing — surface the mismatch
-      // rather than trusting a possibly-stale flag.
-      console.warn(
-        `[migrations] Migration #${m.version} (${m.name}) is marked destructive but no ` +
-          "data-removing statement was detected — double-check the flag is still warranted.",
+/**
+ * Apply `migrations` to the database behind `pool`.
+ *
+ * Exported separately from runMigrations so the test suite can drive it with a
+ * deliberately failing migration and check that nothing is left half-applied.
+ *
+ * Two properties this runner has to hold:
+ *
+ * 1. **One runner at a time.** Two instances booting together both read
+ *    schema_migrations, both see a version as unapplied, and both apply it —
+ *    at best a duplicate-key error that crashes one deploy, at worst two
+ *    concurrent DDL batches on the same tables. A session-level advisory lock
+ *    on a dedicated connection makes the second runner wait and then find the
+ *    work already done.
+ *
+ * 2. **All or nothing per migration.** The SQL and its schema_migrations row
+ *    used to be two separate statements with no transaction around them. A
+ *    failure in between left the schema changed and the version unrecorded, so
+ *    the next boot re-ran it — fine for the IF NOT EXISTS statements, not fine
+ *    for anything with an INSERT ... SELECT in it (migration #8 would have
+ *    double-counted every dollar of spend history). Both now commit together
+ *    or neither does.
+ */
+export async function runMigrationList(
+  pool: Pool,
+  migrations: Migration[],
+): Promise<{ applied: number[] }> {
+  // The lock is session-scoped, so it has to be taken and released on one
+  // specific connection rather than through the pool.
+  const client = await pool.connect();
+  try {
+    await client.query("SELECT pg_advisory_lock($1)", [MIGRATION_LOCK_ID]);
+    try {
+      // Bookkeeping table — own table so the user-facing schema stays clean.
+      await client.query(
+        `CREATE TABLE IF NOT EXISTS schema_migrations (
+           version INTEGER PRIMARY KEY,
+           name TEXT NOT NULL,
+           applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+         )`,
       );
-    }
+      const { rows } = await client.query<{ version: number }>(
+        `SELECT version FROM schema_migrations`,
+      );
+      const already = new Set(rows.map((r) => r.version));
+      const newlyApplied: number[] = [];
+      const ordered = [...migrations].sort((a, b) => a.version - b.version);
+      for (const m of ordered) {
+        if (already.has(m.version)) continue;
 
-    await pool.query(m.sql);
-    await pool.query(
-      `INSERT INTO schema_migrations (version, name) VALUES ($1, $2)`,
-      [m.version, m.name],
-    );
-    newlyApplied.push(m.version);
-    console.log(`[migrations] Applied #${m.version} (${m.name}).`);
+        // Guard: never let a data-destructive migration run silently. Warn
+        // loudly, and refuse outright unless the author explicitly
+        // acknowledged it.
+        const destructive = findDestructiveStatements(m.sql);
+        if (destructive.length > 0) {
+          warnDestructiveMigration(m, destructive);
+          if (m.destructive !== true) {
+            throw new Error(
+              `[migrations] Refusing to apply migration #${m.version} (${m.name}): it contains ` +
+                `data-destructive statements (${destructive.join(", ")}) but is not marked ` +
+                "`destructive: true`. If the data loss is intentional, set that flag on the " +
+                "migration to acknowledge it; otherwise remove the destructive SQL.",
+            );
+          }
+        } else if (m.destructive === true) {
+          // Flagged destructive but the detector saw nothing — surface the
+          // mismatch rather than trusting a possibly-stale flag.
+          console.warn(
+            `[migrations] Migration #${m.version} (${m.name}) is marked destructive but no ` +
+              "data-removing statement was detected — double-check the flag is still warranted.",
+          );
+        }
+
+        await client.query("BEGIN");
+        try {
+          await client.query(m.sql);
+          await client.query(
+            `INSERT INTO schema_migrations (version, name) VALUES ($1, $2)`,
+            [m.version, m.name],
+          );
+          await client.query("COMMIT");
+        } catch (err) {
+          // Undo the SQL as well as the bookkeeping row — either both landed
+          // or neither did.
+          await client.query("ROLLBACK").catch((rollbackErr) => {
+            console.error("[migrations] ROLLBACK failed:", rollbackErr);
+          });
+          console.error(`[migrations] #${m.version} (${m.name}) failed and was rolled back.`);
+          throw err;
+        }
+        newlyApplied.push(m.version);
+        console.log(`[migrations] Applied #${m.version} (${m.name}).`);
+      }
+      return { applied: newlyApplied };
+    } finally {
+      // Release even when a migration threw, or the lock outlives the failure
+      // and every later boot blocks on a connection that is back in the pool.
+      await client
+        .query("SELECT pg_advisory_unlock($1)", [MIGRATION_LOCK_ID])
+        .catch((err) => console.error("[migrations] Failed to release advisory lock:", err));
+    }
+  } finally {
+    client.release();
   }
-  return { applied: newlyApplied };
 }
