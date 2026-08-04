@@ -1,3 +1,4 @@
+import fs from "fs";
 import type { ChildProcess } from "child_process";
 
 // Helpers for driving the spawned Python pipeline child. Kept out of routes.ts
@@ -44,24 +45,79 @@ export function createLineReader(
 }
 
 /**
+ * True if any process is still RUNNING in the group led by `pid`.
+ *
+ * A process group outlives its leader — the group id stays valid, and can't be
+ * recycled, while any member exists — so this answers "is Chromium still
+ * running?" even after python has exited.
+ *
+ * Zombies are deliberately excluded, and that distinction is the whole reason
+ * this reads /proc instead of using `kill(-pid, 0)`. A killed child sits in Z
+ * state until its parent (PID 1, once reparented) reaps it, which took ~1.4s
+ * when measured in this container. `kill(-pid, 0)` succeeds for zombies, so it
+ * reports a group as alive when everything in it is already dead — which would
+ * make every ordinary cancel wait out the full escalation window for processes
+ * that hold no memory and no browser. A zombie is exactly what we do NOT care
+ * about here.
+ *
+ * Falls back to the signal-0 probe where /proc isn't available (macOS dev
+ * machines); production is Linux, where the accurate path is the one taken.
+ */
+export function pipelineGroupIsAlive(pid: number | undefined): boolean {
+  if (pid === undefined) return false;
+  try {
+    const entries = fs.readdirSync("/proc");
+    let sawAnyProcess = false;
+    for (const entry of entries) {
+      if (!/^\d+$/.test(entry)) continue;
+      sawAnyProcess = true;
+      let stat: string;
+      try {
+        stat = fs.readFileSync(`/proc/${entry}/stat`, "utf8");
+      } catch {
+        continue; // exited between readdir and read
+      }
+      // comm (field 2) is parenthesised and may contain spaces or parens
+      // itself, so parse from the LAST ")": state, ppid, pgrp follow it.
+      const after = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+      const state = after[0];
+      const pgrp = Number(after[2]);
+      if (pgrp === pid && state !== "Z") return true;
+    }
+    if (sawAnyProcess) return false;
+  } catch {
+    // no /proc — fall through to the portable probe
+  }
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Signal the pipeline's whole process group.
  *
  * The child is spawned detached, so python and every Chromium it launches share
  * a process group whose id is the child's pid. Signalling -pid reaches all of
  * them; signalling the child alone leaves orphaned browsers holding memory
  * after a "successful" cancel.
+ *
+ * Takes a pid rather than the ChildProcess on purpose. The previous version
+ * consulted `child.exitCode` first and returned early once the child was gone,
+ * which meant it could not be used to clean up a group that OUTLIVED its
+ * leader — the one case that matters here.
  */
-export function signalPipelineGroup(child: ChildProcess, signal: NodeJS.Signals): void {
-  if (child.exitCode !== null || child.signalCode !== null) return;
-  const pid = child.pid;
+export function signalPipelineGroup(pid: number | undefined, signal: NodeJS.Signals): void {
   if (pid === undefined) return;
   try {
     process.kill(-pid, signal);
   } catch {
     // Group already reaped, or the platform refused a group signal — fall back
-    // to the child itself rather than giving up on the kill entirely.
+    // to the pid alone rather than giving up on the kill entirely.
     try {
-      child.kill(signal);
+      process.kill(pid, signal);
     } catch {
       // already gone
     }
@@ -72,21 +128,36 @@ export const PIPELINE_KILL_GRACE_MS = 3000;
 const PIPELINE_KILL_HARD_MS = 2000;
 
 /**
- * SIGTERM the pipeline group, escalate to SIGKILL if it hasn't exited, and
- * resolve once it's actually gone (or we've given up waiting).
+ * SIGTERM the pipeline group, escalate to SIGKILL if anything is still running,
+ * and resolve once the group is actually empty (or we've given up waiting).
  *
- * The escalation check must NOT use `child.killed`: that flag records only that
- * a signal was SENT, so it flips true the instant SIGTERM leaves — even for a
- * process that ignores SIGTERM entirely. The old `if (!child.killed)` guard was
- * therefore always false and SIGKILL never fired, so cancelling a wedged render
- * reported success while python and Chromium kept running. `exitCode` and
- * `signalCode` are both null until the process really exits.
+ * Two bugs live here historically, and the second was only visible in
+ * production.
+ *
+ * The first: the escalation check used `child.killed`, which records only that
+ * a signal was SENT — true the instant SIGTERM leaves, even for a process that
+ * ignores it — so SIGKILL never fired at all.
+ *
+ * The second: once that was fixed, everything still keyed off the DIRECT child.
+ * A cancel measured against the live deployment returned in 73ms, because
+ * python exits on SIGTERM immediately — and the child's `exit` event cancelled
+ * the pending SIGKILL timer. Any group member that had ignored SIGTERM was
+ * therefore never escalated against. That member is Chromium, and an orphaned
+ * Chromium holding memory is the entire reason this function exists. A fast
+ * return is correct when the group is genuinely empty; it is exactly wrong when
+ * it isn't, and nothing distinguished the two.
+ *
+ * So the wait is now on the GROUP, not the child: the child exiting only ends
+ * the wait if nothing else in its group is left.
  */
 export function stopPipeline(
   child: ChildProcess,
   graceMs = PIPELINE_KILL_GRACE_MS,
 ): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  const pid = child.pid;
+  const childGone = () => child.exitCode !== null || child.signalCode !== null;
+  if (childGone() && !pipelineGroupIsAlive(pid)) return Promise.resolve();
+
   return new Promise((resolve) => {
     let done = false;
     let hardTimer: NodeJS.Timeout | undefined;
@@ -94,22 +165,44 @@ export function stopPipeline(
       if (done) return;
       done = true;
       clearTimeout(graceTimer);
+      clearInterval(poll);
       if (hardTimer) clearTimeout(hardTimer);
-      child.removeListener("exit", finish);
+      child.removeListener("exit", onChildExit);
       resolve();
     };
-    child.once("exit", finish);
-    signalPipelineGroup(child, "SIGTERM");
+    const settledCleanly = () => childGone() && !pipelineGroupIsAlive(pid);
+    // The child exiting is only the end of the story if its group went with it.
+    const onChildExit = () => {
+      if (settledCleanly()) finish();
+    };
+    child.once("exit", onChildExit);
+    // The child's exit event can beat its siblings' teardown by a few
+    // milliseconds, so a single check at exit reports the group as alive and
+    // then waits out the entire grace window — turning every ordinary cancel
+    // into a multi-second one. Poll instead: return the moment the group is
+    // genuinely empty, which is what the sub-second cancels measured against
+    // the live deployment actually represent.
+    const poll = setInterval(() => {
+      if (settledCleanly()) finish();
+    }, 50);
+
+    signalPipelineGroup(pid, "SIGTERM");
     const graceTimer = setTimeout(() => {
-      if (child.exitCode === null && child.signalCode === null) {
-        console.warn("[cancel] Pipeline ignored SIGTERM — escalating to SIGKILL.");
-        signalPipelineGroup(child, "SIGKILL");
+      if (!childGone() || pipelineGroupIsAlive(pid)) {
+        console.warn(
+          "[cancel] Pipeline group ignored SIGTERM — escalating to SIGKILL " +
+            `(child ${childGone() ? "already exited" : "still running"}).`,
+        );
+        signalPipelineGroup(pid, "SIGKILL");
       }
-      // SIGKILL can't be blocked, but don't hold the request open forever if
-      // the exit event never arrives.
+      // SIGKILL can't be blocked, but the child's `exit` may already have fired,
+      // so there is no event left to wait on — resolve on a short timer instead
+      // of holding the request open indefinitely.
+      // NOT unref'd: resolving this promise depends on these firing. An
+      // unref'd timer lets the process exit before the escalation completes,
+      // which is how the fix could quietly do nothing. Both are cleared in
+      // finish(), and the worst case is a bounded 5s.
       hardTimer = setTimeout(finish, PIPELINE_KILL_HARD_MS);
-      hardTimer.unref?.();
     }, graceMs);
-    graceTimer.unref?.();
   });
 }

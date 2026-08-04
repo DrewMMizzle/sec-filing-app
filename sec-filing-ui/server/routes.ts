@@ -474,7 +474,7 @@ function runFetchPipeline(
           `[pipeline] No output for ${IDLE_TIMEOUT_MS / 1000}s — stopping stalled pipeline.`,
         );
         // Group kill: the stalled component is usually Chromium, not python.
-        signalPipelineGroup(child, "SIGKILL");
+        signalPipelineGroup(child.pid, "SIGKILL");
       }
     }, 30_000);
 
